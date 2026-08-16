@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>漫畫廚房</title>
+    <link rel="stylesheet" href="./css/app.css">
+  </head>
+  <body>
+    <header class="app-bar">
+      <div class="brand">
+        <span class="brand-mark">M</span>
+        <strong data-i18n="appTitle">漫畫廚房</strong>
+      </div>
+
+      <div class="project-switcher">
+        <label for="project-selector" data-i18n="project">專案</label>
+        <select id="project-selector" data-i18n-aria-label="currentProject" aria-label="目前專案"></select>
+        <button id="import-pages" class="icon-button" data-i18n-title="createOrOpenProject" title="建立或開啟專案">＋</button>
+      </div>
+
+      <div class="toolbar-spacer"></div>
+      <button id="open-settings" class="secondary" data-i18n="settings">設定</button>
+      <label class="interface-language" for="interface-language">
+        <span data-i18n="interfaceLanguage">介面語言</span>
+        <select id="interface-language" data-i18n-aria-label="interfaceLanguage" aria-label="介面語言">
+          <option value="auto">AUTO</option>
+          <option value="zh-Hant">繁體中文</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+        </select>
+      </label>
+      <button id="choose-output" class="secondary" data-i18n="outputDirectory">輸出目錄</button>
+      <button id="load-model" class="secondary" data-i18n="loadModel">載入模型</button>
+      <button id="process-selected" class="primary" data-i18n="processSelectedFull">完整處理選取頁</button>
+      <button id="process-all" class="secondary" data-i18n="processAllFull">完整處理全部</button>
+      <button id="cancel-processing" class="danger" data-i18n="cancelJob" disabled>取消工作</button>
+    </header>
+
+    <nav class="workflow-bar" data-i18n-aria-label="fourStepWorkflow" aria-label="四步驟工作流">
+      <button class="workflow-step active" data-step="pages"><span>1</span><span class="step-label" data-i18n="pages">頁面</span></button>
+      <button id="detect-selected" class="workflow-step" data-step="mask"><span>2</span><span class="step-label" data-i18n="mask">遮罩</span></button>
+      <button id="translate-selected" class="workflow-step" data-step="translate"><span>3</span><span class="step-label" data-i18n="translate">翻譯</span></button>
+      <button id="compose-selected" class="workflow-step" data-step="compose"><span>4</span><span class="step-label" data-i18n="output">輸出</span></button>
+      <div class="selection-summary" id="selection-summary" data-i18n="noPageSelected">尚未選取頁面</div>
+    </nav>
+
+    <main class="workspace">
+      <aside class="page-sidebar">
+        <div class="panel-heading">
+          <div>
+            <strong data-i18n="pages">頁面</strong>
+            <small id="page-count">0 頁</small>
+          </div>
+          <button id="rescan-source" class="quiet" data-i18n="rescan">重掃</button>
+        </div>
+
+        <div class="page-tools">
+          <input id="page-search" type="search" data-i18n-placeholder="searchFilename" placeholder="搜尋檔名">
+          <select id="page-filter" data-i18n-aria-label="processingStatusFilter" aria-label="處理狀態篩選">
+            <option value="all" data-i18n="allStatuses">全部狀態</option>
+            <option value="pending" data-i18n="stagePending">尚未處理</option>
+            <option value="maskReady" data-i18n="stageMaskReady">遮罩完成</option>
+            <option value="translationReady" data-i18n="stageTranslationReady">已翻譯</option>
+            <option value="completed" data-i18n="stageCompleted">已輸出</option>
+            <option value="failed" data-i18n="stageFailed">處理失敗</option>
+          </select>
+          <div class="selection-actions">
+            <button id="select-visible" class="quiet" data-i18n="selectAllResults">全選結果</button>
+            <button id="clear-selection" class="quiet" data-i18n="clearSelection">取消選取</button>
+          </div>
+        </div>
+
+        <ol id="page-list" data-i18n-aria-label="comicPages" aria-label="漫畫頁面"></ol>
+
+        <div class="models">
+          <div class="panel-heading">
+            <strong data-i18n="loadedModels">已載入模型</strong>
+          </div>
+          <ul id="model-list"></ul>
+        </div>
+      </aside>
+
+      <section class="canvas-column">
+        <div id="empty-state" class="empty-state">
+          <div class="empty-icon">▧</div>
+          <h1 data-i18n="createFirstProject">建立第一個漫畫專案</h1>
+          <p data-i18n="projectIsolationHelp">每個來源目錄會保存為獨立專案，處理設定與頁面進度不會互相混用。</p>
+          <button id="empty-create-project" class="primary" data-i18n="chooseSourceDirectory">選取來源目錄</button>
+        </div>
+
+        <div id="page-workspace" hidden>
+          <header class="canvas-toolbar">
+            <div>
+              <strong id="active-page-title" data-i18n="comicPage">漫畫頁面</strong>
+              <small id="active-page-path"></small>
+            </div>
+            <button id="reveal-output" class="secondary" data-i18n="revealOutput" disabled>在 Finder 顯示輸出</button>
+          </header>
+
+          <div class="canvas-surface">
+            <div class="previews">
+              <figure>
+                <figcaption data-i18n="sourceImage">原圖</figcaption>
+                <div class="image-stage">
+                  <img id="source-preview" data-i18n-alt="sourceComicPage" alt="原始漫畫頁面">
+                </div>
+              </figure>
+              <figure>
+                <figcaption data-i18n="translationResult">翻譯結果</figcaption>
+                <div class="image-stage">
+                  <div id="output-placeholder" data-i18n="noOutputYet">尚未產生輸出</div>
+                  <img id="output-preview" data-i18n-alt="translatedComicPage" alt="翻譯後漫畫頁面" hidden>
+                </div>
+              </figure>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="inspector">
+        <section class="inspector-section">
+          <div class="panel-heading"><strong data-i18n="projectSettings">專案設定</strong></div>
+          <label><span data-i18n="targetLanguage">目標語言</span> <input id="target-language" value="zh-Hant"></label>
+          <label><span data-i18n="readingOrder">閱讀順序</span>
+            <select id="reading-direction">
+              <option value="rightToLeft" data-i18n="rightToLeft">由右至左</option>
+              <option value="leftToRight" data-i18n="leftToRight">由左至右</option>
+              <option value="topToBottom" data-i18n="topToBottom">由上至下</option>
+            </select>
+          </label>
+          <label><span data-i18n="writingDirection">排字方向</span>
+            <select id="writing-direction">
+              <option value="automatic" data-i18n="automatic">自動</option>
+              <option value="horizontal" data-i18n="horizontal">橫排</option>
+              <option value="vertical" data-i18n="vertical">直排</option>
+            </select>
+          </label>
+          <label><span data-i18n="defaultFont">預設字型</span> <input id="font-name" value="PingFang TC"></label>
+          <label class="checkbox-label"><input id="use-image-model" type="checkbox" checked> <span data-i18n="useImageModel">使用圖生圖修補</span></label>
+        </section>
+
+        <section class="inspector-section glossary-panel">
+          <div class="panel-heading">
+            <div>
+              <strong data-i18n="glossary">專有名詞</strong>
+              <small id="glossary-count">0</small>
+            </div>
+            <small id="glossary-target-label">目標 zh-Hant</small>
+          </div>
+          <div class="glossary-add-form">
+            <input id="glossary-source" data-i18n-placeholder="sourceTermPlaceholder" placeholder="原詞，例如：王都">
+            <input id="glossary-target-term" data-i18n-placeholder="targetTermPlaceholder" placeholder="目前目標語言譯詞">
+            <button id="glossary-add" class="secondary" data-i18n="addGlossaryEntry">新增詞條</button>
+          </div>
+          <p class="section-help" data-i18n="glossaryHelp">每個詞條可保存多個 BCP-47 語言版本；翻譯時自動採用目前目標語言。</p>
+          <div id="glossary-list"></div>
+        </section>
+
+        <section class="inspector-section regions-panel">
+          <div class="panel-heading">
+            <strong data-i18n="textRegions">文字區域</strong>
+            <small id="region-count">0</small>
+          </div>
+          <div id="region-list"></div>
+        </section>
+
+        <section class="inspector-section batch-panel">
+          <div class="panel-heading">
+            <strong data-i18n="batchJobs">批次工作</strong>
+            <button id="clear-finished-jobs" class="quiet" data-i18n="clearCompleted">清除完成</button>
+          </div>
+          <div id="batch-list"></div>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="status-bar">
+      <progress id="page-progress" value="0" max="1"></progress>
+      <span id="status" data-i18n="initializing">初始化中…</span>
+      <span id="project-path"></span>
+    </footer>
+
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <div class="settings-dialog-shell">
+        <header class="settings-dialog-header">
+          <div>
+            <h2 id="settings-title" data-i18n="settings">設定</h2>
+            <p data-i18n="settingsHelp">全域設定會套用至所有漫畫專案。</p>
+          </div>
+          <button id="close-settings-icon" type="button" class="quiet settings-close-icon" data-i18n-title="close" data-i18n-aria-label="close" title="關閉" aria-label="關閉">×</button>
+        </header>
+
+        <div class="settings-dialog-body">
+          <nav class="settings-tabs" data-i18n-aria-label="settingsSections" aria-label="設定分類">
+            <button type="button" class="settings-tab active" data-settings-tab="general" data-i18n="settingsGeneral">一般</button>
+            <button type="button" class="settings-tab" data-settings-tab="advanced" data-i18n="settingsAdvanced">進階</button>
+            <button type="button" class="settings-tab" data-settings-tab="models" data-i18n="settingsModels">模型</button>
+            <button type="button" class="settings-tab" data-settings-tab="mcp" data-i18n="settingsMCP">MCP</button>
+            <button type="button" class="settings-tab" data-settings-tab="about" data-i18n="settingsAbout">關於</button>
+          </nav>
+
+          <div class="settings-pages">
+            <section class="settings-page active" data-settings-page="general">
+              <h3 data-i18n="settingsGeneral">一般</h3>
+              <label class="settings-field">
+                <span data-i18n="interfaceLanguage">介面語言</span>
+                <select id="settings-language">
+                  <option value="auto">AUTO</option>
+                  <option value="zh-Hant">繁體中文</option>
+                  <option value="en">English</option>
+                  <option value="ja">日本語</option>
+                  <option value="ko">한국어</option>
+                </select>
+              </label>
+              <label class="settings-field">
+                <span data-i18n="colorScheme">UI 色系</span>
+                <select id="settings-color-scheme">
+                  <option value="auto" data-i18n="followSystem">跟隨系統</option>
+                  <option value="light" data-i18n="lightTheme">淺色</option>
+                  <option value="dark" data-i18n="darkTheme">深色</option>
+                </select>
+              </label>
+            </section>
+
+            <section class="settings-page" data-settings-page="advanced" hidden>
+              <h3 data-i18n="settingsAdvanced">進階</h3>
+              <label class="settings-field">
+                <span data-i18n="dataStorageLocation">資料儲存位置</span>
+                <input id="settings-data-directory" readonly>
+              </label>
+              <div class="settings-actions">
+                <button id="choose-data-directory" type="button" class="secondary" data-i18n="chooseFolder">選取目錄</button>
+                <button id="reset-data-directory" type="button" class="quiet" data-i18n="restoreDefault">恢復預設</button>
+              </div>
+              <p id="data-directory-restart-note" class="settings-notice" data-i18n="restartRequired" hidden>重新啟動後生效。</p>
+            </section>
+
+            <section class="settings-page" data-settings-page="models" hidden>
+              <h3 data-i18n="settingsModels">模型</h3>
+              <div class="settings-path-group">
+                <label class="settings-field">
+                  <span data-i18n="imageToTextModel">圖生文模型</span>
+                  <input id="settings-image-to-text-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+                </label>
+                <div class="settings-actions">
+                  <button id="choose-image-to-text-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
+                  <button id="clear-image-to-text-model" type="button" class="quiet" data-i18n="clear">清除</button>
+                </div>
+              </div>
+              <div class="settings-path-group">
+                <label class="settings-field">
+                  <span data-i18n="imageToImageModel">圖生圖模型</span>
+                  <input id="settings-image-to-image-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+                </label>
+                <div class="settings-actions">
+                  <button id="choose-image-to-image-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
+                  <button id="clear-image-to-image-model" type="button" class="quiet" data-i18n="clear">清除</button>
+                </div>
+              </div>
+              <p class="section-help" data-i18n="modelSettingsHelp">模型目錄必須包含 mangakitchen-model.json，選取後會立即載入。</p>
+            </section>
+
+            <section class="settings-page" data-settings-page="mcp" hidden>
+              <h3 data-i18n="settingsMCP">MCP</h3>
+              <label class="settings-switch-row">
+                <span>
+                  <strong data-i18n="enableMCP">啟用 MCP</strong>
+                  <small data-i18n="enableMCPHelp">開啟後服務會在本機常駐，並顯示於 menu bar。</small>
+                </span>
+                <input id="settings-mcp-enabled" type="checkbox" role="switch">
+              </label>
+              <label class="settings-field">
+                <span data-i18n="mcpPort">連接埠</span>
+                <input id="settings-mcp-port" type="number" min="1" max="65535" value="12080">
+              </label>
+              <div class="settings-subsection">
+                <div class="settings-subsection-heading">
+                  <div>
+                    <strong data-i18n="mcpWhitelist">用戶端白名單</strong>
+                    <small data-i18n="mcpWhitelistHelp">只接受來自下列 IP 位址或 CIDR 網段的連線。</small>
+                  </div>
+                </div>
+                <div class="settings-inline-input">
+                  <input id="settings-mcp-client" data-i18n-placeholder="mcpClientPlaceholder" placeholder="例如 192.168.1.0/24">
+                  <button id="add-mcp-client" type="button" class="secondary" data-i18n="addClient">新增</button>
+                </div>
+                <div id="mcp-whitelist"></div>
+              </div>
+            </section>
+
+            <section class="settings-page settings-about" data-settings-page="about" hidden>
+              <div class="about-mark">M</div>
+              <h3 data-i18n="appTitle">漫畫廚房</h3>
+              <p><span data-i18n="version">版本</span> <span id="settings-app-version">0.1.0</span></p>
+              <p data-i18n="aboutDescription">使用 Swift、Metal 與 HTML/JavaScript 打造的本機漫畫翻譯工作台。</p>
+            </section>
+          </div>
+        </div>
+
+        <footer class="settings-dialog-footer">
+          <button id="close-settings" type="button" class="primary" data-i18n="close">關閉</button>
+        </footer>
+      </div>
+    </dialog>
+
+    <script type="module" src="./js/app.js"></script>
+  </body>
+</html>

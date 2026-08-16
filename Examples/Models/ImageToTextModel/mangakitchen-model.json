@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "example/comic-vlm",
+  "displayName": "Example Comic VLM",
+  "capability": "imageToText",
+  "backend": "coreML",
+  "modelFile": "ComicVLM.mlpackage",
+  "inputs": {
+    "image": "image",
+    "prompt": "prompt"
+  },
+  "outputs": {
+    "text": "text"
+  }
+}

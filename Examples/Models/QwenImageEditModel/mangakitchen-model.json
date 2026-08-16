@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "qwen-image-edit-2511-mlx-int4",
+  "displayName": "Qwen Image Edit 2511 MLX INT4",
+  "capability": "imageToImage",
+  "backend": "externalRuntime",
+  "externalRuntime": {
+    "kind": "qwenImageEdit2511",
+    "executableName": "MangaKitchenQwenImageEditWorker",
+    "quantization": "int4",
+    "steps": 20,
+    "trueCFGScale": 4,
+    "seed": 42,
+    "negativePrompt": "text, letters, watermark, artifacts"
+  }
+}

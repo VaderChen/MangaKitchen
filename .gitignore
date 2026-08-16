@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Swift Package Manager / Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcresult
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Editors
+.idea/
+.vscode/
+*~
+*.swp
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.mobileprovision
+
+# Local application data and generated outputs
+/Artifacts/
+/Projects/
+/Workspace/
+*.bak
+
+# Model weights and compiled model bundles
+*.safetensors
+*.gguf
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.mlmodel
+*.mlmodelc/
+*.mlpackage/
+
+# Runtime worker binaries
+/RuntimeSupport/QwenImageEditWorker/MangaKitchenQwenImageEditWorker

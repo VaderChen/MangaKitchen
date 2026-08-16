@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "lmstudio-community/Qwen3-VL-4B-Instruct-MLX-4bit",
+  "displayName": "Qwen3-VL 4B Instruct MLX 4-bit",
+  "capability": "imageToText",
+  "backend": "mlxSwift",
+  "generation": {
+    "maximumImageDimension": 1280,
+    "maxTokens": 4096,
+    "temperature": 0.2,
+    "topP": 0.9,
+    "repetitionPenalty": 1.1
+  }
+}

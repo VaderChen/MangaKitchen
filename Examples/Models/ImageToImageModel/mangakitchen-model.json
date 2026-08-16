@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "example/comic-inpaint",
+  "displayName": "Example Comic Inpainting",
+  "capability": "imageToImage",
+  "backend": "coreML",
+  "modelFile": "ComicInpaint.mlpackage",
+  "inputs": {
+    "image": "image",
+    "prompt": "prompt",
+    "mask": "mask"
+  },
+  "outputs": {
+    "image": "image"
+  }
+}
