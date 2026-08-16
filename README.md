@@ -12,6 +12,12 @@ MangaKitchen 的目的，是輔助已取得授權的翻譯人員、在地化團�
 
 請勿使用 MangaKitchen 製作或散布盜版、未授權翻譯、破解內容，或規避 DRM、浮水印及其他權利保護措施。開發者不鼓勵也不支持任何侵害著作權的用途。請透過合法平台購買正版單行本、電子書、訂閱或授權商品，以實際行動支持作者、譯者、出版社及整個創作產業。
 
+## 軟體授權
+
+MangaKitchen 採雙軌授權。此 repository 中由 MangaKitchen 著作權人擁有且未另行標示的程式碼，預設依 [GNU General Public License version 3 only](LICENSE)（`GPL-3.0-only`）提供；需要閉源整合、專有散布或其他條款者，可另行洽談[商業授權](COMMERCIAL-LICENSE.md)。
+
+GPLv3 本身允許商業使用及收費散布，但必須履行其原始碼與 copyleft 義務。商業授權是另一個可選方案，不會限制已依 GPLv3 取得的權利。第三方套件、模型與權重、字型及漫畫內容不包含在 MangaKitchen 的雙軌授權內，仍適用各自的授權條款。
+
 ## 目前完成
 
 - macOS 14+ SwiftUI / WKWebView 應用程式殼。

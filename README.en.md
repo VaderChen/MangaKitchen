@@ -12,6 +12,12 @@ MangaKitchen is intended to help authorized translators, localization teams, and
 
 Do not use MangaKitchen to create or distribute pirated copies, unauthorized scanlations, cracked content, or material that circumvents DRM, watermarks, or other rights-protection measures. The developers do not encourage or support copyright infringement. Please purchase official print editions, ebooks, subscriptions, and licensed merchandise through legitimate channels to support authors, translators, publishers, and the wider creative community.
 
+## Software Licensing
+
+MangaKitchen uses a dual-licensing model. Code in this repository that is owned by the MangaKitchen copyright holder and does not state otherwise is offered by default under the [GNU General Public License version 3 only](LICENSE) (`GPL-3.0-only`). A separate [commercial license](COMMERCIAL-LICENSE.md) is available for closed-source integration, proprietary distribution, or different contractual terms.
+
+GPLv3 itself permits commercial use and paid distribution, subject to its source-code and copyleft obligations. Commercial licensing is an alternative and does not restrict rights already received under GPLv3. Third-party packages, models and weights, fonts, and comic content are outside MangaKitchen's dual license and remain subject to their own terms.
+
 ## Current Features
 
 - macOS 14+ SwiftUI / WKWebView application shell.
