@@ -77,12 +77,18 @@ public actor ModelRuntimeHub: ModelManaging, ImageToTextGenerating, ImageToImage
     public func generateText(
         imageURL: URL,
         prompt: String,
+        maximumOutputTokens: Int?,
         progress: @escaping InferenceProgress
     ) async throws -> String {
         guard let runtime = imageToTextRuntime else {
             throw ModelRuntimeError.capabilityNotLoaded(.imageToText)
         }
-        return try await runtime.generateText(imageURL: imageURL, prompt: prompt, progress: progress)
+        return try await runtime.generateText(
+            imageURL: imageURL,
+            prompt: prompt,
+            maximumOutputTokens: maximumOutputTokens,
+            progress: progress
+        )
     }
 
     public func generateImage(

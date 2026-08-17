@@ -25,11 +25,14 @@ DerivedData/
 *.pem
 *.p12
 *.mobileprovision
+/Cert/
 
 # Local application data and generated outputs
 /Artifacts/
+/Dist/
 /Projects/
 /Workspace/
+/packDMG.command
 *.bak
 
 # Model weights and compiled model bundles

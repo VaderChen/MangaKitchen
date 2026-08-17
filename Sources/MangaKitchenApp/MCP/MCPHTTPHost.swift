@@ -217,14 +217,23 @@ private final class MCPHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         case .end:
             guard let state = requestState else { return }
             requestState = nil
+            let remoteAddress = context.channel.remoteAddress?.ipAddress
             nonisolated(unsafe) let context = context
             Task { @MainActor in
-                await self.process(state: state, context: context)
+                await self.process(
+                    state: state,
+                    remoteAddress: remoteAddress,
+                    context: context
+                )
             }
         }
     }
 
-    private func process(state: RequestState, context: ChannelHandlerContext) async {
+    private func process(
+        state: RequestState,
+        remoteAddress: String?,
+        context: ChannelHandlerContext
+    ) async {
         var headers: [String: String] = [:]
         for (name, value) in state.head.headers {
             if let existing = headers[name] {
@@ -252,7 +261,7 @@ private final class MCPHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         )
         let response = await host.handle(
             request,
-            remoteAddress: context.channel.remoteAddress?.ipAddress
+            remoteAddress: remoteAddress
         )
         await write(response, version: state.head.version, context: context)
     }

@@ -57,4 +57,33 @@ public struct NormalizedRect: Codable, Hashable, Sendable {
             height: height + vertical * 2
         ).clamped()
     }
+
+    public func union(with other: NormalizedRect) -> NormalizedRect {
+        let left = min(minX, other.minX)
+        let top = min(minY, other.minY)
+        let right = max(maxX, other.maxX)
+        let bottom = max(maxY, other.maxY)
+        return NormalizedRect(
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top
+        ).clamped()
+    }
+
+    public func intersection(with other: NormalizedRect) -> NormalizedRect {
+        let left = max(minX, other.minX)
+        let top = max(minY, other.minY)
+        let right = min(maxX, other.maxX)
+        let bottom = min(maxY, other.maxY)
+        guard right > left, bottom > top else {
+            return NormalizedRect(x: left, y: top, width: 0, height: 0).clamped()
+        }
+        return NormalizedRect(
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top
+        ).clamped()
+    }
 }

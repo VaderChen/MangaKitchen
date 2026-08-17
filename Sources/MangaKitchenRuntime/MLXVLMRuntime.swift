@@ -44,6 +44,7 @@ actor MLXVLMRuntime: ImageToTextGenerating {
     func generateText(
         imageURL: URL,
         prompt: String,
+        maximumOutputTokens: Int?,
         progress: @escaping InferenceProgress
     ) async throws -> String {
         guard FileManager.default.fileExists(atPath: imageURL.path) else {
@@ -70,7 +71,10 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         let prepared = try await container.prepare(input: input)
         progress(0.55)
 
-        let maxTokens = min(max(generation.maxTokens, 128), 8_192)
+        let requestedMaxTokens = maximumOutputTokens.map {
+            min($0, generation.maxTokens)
+        } ?? generation.maxTokens
+        let maxTokens = min(max(requestedMaxTokens, 128), 8_192)
         let parameters = GenerateParameters(
             maxTokens: maxTokens,
             temperature: min(max(generation.temperature, 0), 2),

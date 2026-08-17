@@ -13,16 +13,35 @@ public struct WorkflowPagePaths: Hashable, Sendable {
 public struct WorkflowPathResolver: Sendable {
     public init() {}
 
-    public func paths(relativeSourcePath: String, outputDirectoryURL: URL) throws -> WorkflowPagePaths {
+    public func paths(
+        sourceURL: URL,
+        relativeSourcePath: String,
+        outputDirectoryURL: URL
+    ) throws -> WorkflowPagePaths {
+        WorkflowPagePaths(
+            stringTableURL: stringTableURL(for: sourceURL),
+            outputURL: try outputURL(
+                relativeSourcePath: relativeSourcePath,
+                outputDirectoryURL: outputDirectoryURL
+            )
+        )
+    }
+
+    /// `.str` 是原圖的 sidecar，永遠與原圖同目錄且共用檔名主體。
+    public func stringTableURL(for sourceURL: URL) -> URL {
+        sourceURL.deletingPathExtension().appendingPathExtension("str")
+    }
+
+    public func outputURL(
+        relativeSourcePath: String,
+        outputDirectoryURL: URL
+    ) throws -> URL {
         let safeComponents = try validatedComponents(relativeSourcePath)
         let relativeURL = safeComponents.reduce(outputDirectoryURL) {
             $0.appendingPathComponent($1)
         }
         let baseURL = relativeURL.deletingPathExtension()
-        return WorkflowPagePaths(
-            stringTableURL: baseURL.appendingPathExtension("str"),
-            outputURL: baseURL.appendingPathExtension("png")
-        )
+        return baseURL.appendingPathExtension("png")
     }
 
     private func validatedComponents(_ path: String) throws -> [String] {

@@ -124,6 +124,9 @@ public struct ModelManifest: Codable, Hashable, Sendable {
     public static func load(from directoryURL: URL) throws -> ModelManifest {
         let manifestURL = directoryURL.appendingPathComponent("mangakitchen-model.json")
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
+            if let inferredManifest = inferMLXVLMManifest(from: directoryURL) {
+                return inferredManifest
+            }
             throw ModelRuntimeError.manifestNotFound(manifestURL)
         }
         let manifest = try JSONDecoder().decode(ModelManifest.self, from: Data(contentsOf: manifestURL))
@@ -131,6 +134,55 @@ public struct ModelManifest: Codable, Hashable, Sendable {
             throw ModelRuntimeError.unsupportedManifestVersion(manifest.schemaVersion)
         }
         return manifest
+    }
+
+    private static func inferMLXVLMManifest(from directoryURL: URL) -> ModelManifest? {
+        let fileManager = FileManager.default
+        let configURL = directoryURL.appendingPathComponent("config.json")
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ),
+        fileManager.fileExists(atPath: configURL.path),
+        entries.contains(where: { $0.pathExtension.lowercased() == "safetensors" }),
+        entries.contains(where: {
+            $0.lastPathComponent == "tokenizer.json"
+                || $0.lastPathComponent == "tokenizer_config.json"
+        }),
+        let configData = try? Data(contentsOf: configURL),
+        let configObject = try? JSONSerialization.jsonObject(with: configData),
+        let config = configObject as? [String: Any]
+        else {
+            return nil
+        }
+
+        let architectureNames = config["architectures"] as? [String] ?? []
+        let modelType = config["model_type"] as? String ?? ""
+        let imageCapabilityDescriptors = Array(config.keys) + architectureNames + [modelType]
+        let hasImageCapability = imageCapabilityDescriptors.contains { descriptor in
+            let normalized = descriptor.lowercased()
+            return normalized.contains("vision") || normalized.contains("image")
+        }
+        guard hasImageCapability else { return nil }
+
+        let configuredID = (config["_name_or_path"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let directoryName = directoryURL.lastPathComponent
+        let modelID: String
+        if let configuredID, !configuredID.isEmpty {
+            modelID = configuredID
+        } else {
+            modelID = directoryName
+        }
+
+        return ModelManifest(
+            id: modelID,
+            displayName: directoryName,
+            capability: .imageToText,
+            backend: .mlxSwift,
+            generation: Generation()
+        )
     }
 }
 

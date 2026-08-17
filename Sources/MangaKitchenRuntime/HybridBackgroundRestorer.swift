@@ -3,11 +3,22 @@ import MangaKitchenCore
 
 public actor HybridBackgroundRestorer: PageBackgroundRestoring {
     private let models: ModelRuntimeHub
-    private let fallback: MetalBubbleCleaner
+    private let gpuFallback: MetalBubbleCleaner
+    private let cpuFallback = CPUBubbleCleaner()
+    private var compositingBackend: ImageCompositingBackend
 
-    public init(models: ModelRuntimeHub, metal: MetalContext) throws {
+    public init(
+        models: ModelRuntimeHub,
+        metal: MetalContext,
+        compositingBackend: ImageCompositingBackend = .cpu
+    ) throws {
         self.models = models
-        self.fallback = try MetalBubbleCleaner(metal: metal)
+        self.gpuFallback = try MetalBubbleCleaner(metal: metal)
+        self.compositingBackend = compositingBackend
+    }
+
+    public func setCompositingBackend(_ backend: ImageCompositingBackend) {
+        compositingBackend = backend
     }
 
     public func restoreBackground(
@@ -18,6 +29,7 @@ public actor HybridBackgroundRestorer: PageBackgroundRestoring {
         preferGenerativeModel: Bool,
         progress: @escaping InferenceProgress
     ) async throws -> [String] {
+        var warnings: [String] = []
         if preferGenerativeModel, await models.isLoaded(.imageToImage) {
             do {
                 try await models.generateImage(
@@ -31,25 +43,44 @@ public actor HybridBackgroundRestorer: PageBackgroundRestoring {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                try await fallback.clean(
+                warnings.append("圖生圖背景修復失敗：\(error.localizedDescription)")
+            }
+        } else if preferGenerativeModel {
+            warnings.append("未載入圖生圖模型。")
+        }
+
+        switch compositingBackend {
+        case .cpu:
+            try await cpuFallback.clean(
+                sourceURL: sourceURL,
+                maskURL: maskURL,
+                outputURL: outputURL,
+                progress: progress
+            )
+            warnings.append("本頁已使用 CPU 主色修補。")
+
+        case .gpu:
+            do {
+                try await gpuFallback.clean(
                     sourceURL: sourceURL,
                     maskURL: maskURL,
                     outputURL: outputURL,
                     progress: progress
                 )
-                return ["圖生圖背景修復失敗，已改用 Metal 鄰域修補：\(error.localizedDescription)"]
+                warnings.append("本頁已使用 GPU／Metal 鄰域修補。")
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try await cpuFallback.clean(
+                    sourceURL: sourceURL,
+                    maskURL: maskURL,
+                    outputURL: outputURL,
+                    progress: progress
+                )
+                warnings.append("GPU 合成失敗，已自動改用 CPU：\(error.localizedDescription)")
             }
         }
-
-        try await fallback.clean(
-            sourceURL: sourceURL,
-            maskURL: maskURL,
-            outputURL: outputURL,
-            progress: progress
-        )
-        return preferGenerativeModel
-            ? ["未載入圖生圖模型，本頁已使用 Metal 鄰域修補。"]
-            : []
+        return warnings
     }
 
     private static let inpaintingPrompt = """

@@ -1,5 +1,4 @@
 import CoreGraphics
-import CoreImage
 import Foundation
 @preconcurrency import Metal
 import MangaKitchenCore
@@ -38,30 +37,21 @@ public actor MetalBubbleCleaner {
             throw ImageProcessingError.cannotCreateBitmap
         }
 
-        let sourceTexture = try makeTexture(width: width, height: height, usage: [.shaderRead])
-        let maskTexture = try makeTexture(width: width, height: height, usage: [.shaderRead])
-        let outputTexture = try makeTexture(width: width, height: height, usage: [.shaderRead, .shaderWrite])
-        let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        let sourceTexture = try makeReadTexture(from: sourceImage)
+        let maskTexture = try makeReadTexture(from: maskImage)
+        let outputTexture = try makeTexture(
+            width: width,
+            height: height,
+            usage: [.shaderRead, .shaderWrite],
+            storageMode: .shared
+        )
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-
-        metal.coreImageContext.render(
-            CIImage(cgImage: sourceImage),
-            to: sourceTexture,
-            commandBuffer: nil,
-            bounds: bounds,
-            colorSpace: colorSpace
-        )
-        metal.coreImageContext.render(
-            CIImage(cgImage: maskImage),
-            to: maskTexture,
-            commandBuffer: nil,
-            bounds: bounds,
-            colorSpace: colorSpace
-        )
+        guard let commandBuffer = metal.commandQueue.makeCommandBuffer() else {
+            throw ImageProcessingError.metalCommandFailed
+        }
         progress(0.2)
 
-        guard let commandBuffer = metal.commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw ImageProcessingError.metalCommandFailed
         }
         encoder.setComputePipelineState(pipeline)
@@ -86,33 +76,106 @@ public actor MetalBubbleCleaner {
         try Task.checkCancellation()
         progress(0.85)
 
-        guard let outputImage = CIImage(
-            mtlTexture: outputTexture,
-            options: [.colorSpace: colorSpace]
-        ) else {
-            throw ImageProcessingError.metalTextureCreation
-        }
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        try writePNG(
+            from: outputTexture,
+            width: width,
+            height: height,
+            colorSpace: colorSpace,
+            to: outputURL
         )
-        do {
-            try metal.coreImageContext.writePNGRepresentation(
-                of: outputImage,
-                to: outputURL,
-                format: .RGBA8,
-                colorSpace: colorSpace
-            )
-        } catch {
-            throw ImageProcessingError.cannotCreateOutput(outputURL)
-        }
         progress(1)
+    }
+
+    private func writePNG(
+        from texture: any MTLTexture,
+        width: Int,
+        height: Int,
+        colorSpace: CGColorSpace,
+        to outputURL: URL
+    ) throws {
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        pixels.withUnsafeMutableBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+            texture.getBytes(
+                baseAddress,
+                bytesPerRow: bytesPerRow,
+                from: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0
+            )
+        }
+        let data = Data(pixels) as CFData
+        guard let provider = CGDataProvider(data: data),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(
+                    rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                ).union(.byteOrder32Big),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw ImageProcessingError.cannotCreateBitmap
+        }
+        try CGImageIO.writePNG(image, to: outputURL)
+    }
+
+    private func makeReadTexture(from image: CGImage) throws -> any MTLTexture {
+        let width = image.width
+        let height = image.height
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+        ).union(.byteOrder32Big)
+        let imageWasDrawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo.rawValue
+            ) else {
+                return false
+            }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard imageWasDrawn else {
+            throw ImageProcessingError.cannotCreateBitmap
+        }
+        let texture = try makeTexture(
+            width: width,
+            height: height,
+            usage: .shaderRead,
+            storageMode: .shared
+        )
+        pixels.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+            texture.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: baseAddress,
+                bytesPerRow: bytesPerRow
+            )
+        }
+        return texture
     }
 
     private func makeTexture(
         width: Int,
         height: Int,
-        usage: MTLTextureUsage
+        usage: MTLTextureUsage,
+        storageMode: MTLStorageMode = .private
     ) throws -> any MTLTexture {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm,
@@ -121,7 +184,7 @@ public actor MetalBubbleCleaner {
             mipmapped: false
         )
         descriptor.usage = usage
-        descriptor.storageMode = .private
+        descriptor.storageMode = storageMode
         guard let texture = metal.device.makeTexture(descriptor: descriptor) else {
             throw ImageProcessingError.metalTextureCreation
         }
@@ -133,39 +196,81 @@ public actor MetalBubbleCleaner {
     using namespace metal;
 
     kernel void clean_dialogue_pixels(
-        texture2d<float, access::sample> source [[texture(0)]],
-        texture2d<float, access::sample> mask [[texture(1)]],
+        texture2d<float, access::read> source [[texture(0)]],
+        texture2d<float, access::read> mask [[texture(1)]],
         texture2d<float, access::write> output [[texture(2)]],
         constant uint &searchRadius [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= source.get_width() || gid.y >= source.get_height()) return;
         float4 original = source.read(gid);
-        if (mask.read(gid).r < 0.5f) {
+        if (mask.read(gid).r <= 0.0f) {
             output.write(original, gid);
             return;
         }
 
-        constexpr sampler pointSampler(coord::pixel, address::clamp_to_edge, filter::linear);
-        float4 sum = float4(0.0f);
-        float weight = 0.0f;
+        uint luminanceHistogram[16] = {};
+        uint sampleCount = 0;
+        uint sampledRings = 0;
+        int2 maximumPoint = int2(source.get_width() - 1, source.get_height() - 1);
         const uint directions = 24;
-        const uint rings = 4;
+        const uint rings = 8;
         for (uint ring = 1; ring <= rings; ++ring) {
-            float radius = max(3.0f, float(searchRadius) * float(ring) / float(rings));
+            float radius = min(float(searchRadius), exp2(float(ring)));
+            uint ringSampleCount = 0;
             for (uint index = 0; index < directions; ++index) {
                 float angle = 6.28318530718f * float(index) / float(directions);
-                float2 point = float2(gid) + float2(cos(angle), sin(angle)) * radius;
-                float maskValue = mask.sample(pointSampler, point).r;
-                if (maskValue < 0.35f) {
-                    float localWeight = 1.0f / float(ring);
-                    sum += source.sample(pointSampler, point) * localWeight;
-                    weight += localWeight;
+                int2 point = int2(round(float2(gid) + float2(cos(angle), sin(angle)) * radius));
+                uint2 coordinate = uint2(clamp(point, int2(0), maximumPoint));
+                float maskValue = mask.read(coordinate).r;
+                if (maskValue <= 0.0f) {
+                    float3 color = source.read(coordinate).rgb;
+                    float luminance = dot(color, float3(0.299f, 0.587f, 0.114f));
+                    uint bin = min(15u, uint(clamp(luminance, 0.0f, 1.0f) * 15.999f));
+                    luminanceHistogram[bin] += 1;
+                    sampleCount += 1;
+                    ringSampleCount += 1;
                 }
+            }
+            sampledRings = ring;
+            if (ringSampleCount >= 6 || radius >= float(searchRadius)) break;
+        }
+
+        if (sampleCount == 0) {
+            output.write(original, gid);
+            return;
+        }
+
+        uint dominantBin = 0;
+        uint dominantCount = 0;
+        for (uint bin = 0; bin < 16; ++bin) {
+            if (luminanceHistogram[bin] >= dominantCount) {
+                dominantBin = bin;
+                dominantCount = luminanceHistogram[bin];
             }
         }
 
-        float4 replacement = weight > 0.0f ? sum / weight : original;
+        float4 replacementSum = float4(0.0f);
+        float replacementWeight = 0.0f;
+        for (uint ring = 1; ring <= sampledRings; ++ring) {
+            float radius = min(float(searchRadius), exp2(float(ring)));
+            for (uint index = 0; index < directions; ++index) {
+                float angle = 6.28318530718f * float(index) / float(directions);
+                int2 point = int2(round(float2(gid) + float2(cos(angle), sin(angle)) * radius));
+                uint2 coordinate = uint2(clamp(point, int2(0), maximumPoint));
+                if (mask.read(coordinate).r > 0.0f) continue;
+                float4 candidate = source.read(coordinate);
+                float luminance = dot(candidate.rgb, float3(0.299f, 0.587f, 0.114f));
+                uint bin = min(15u, uint(clamp(luminance, 0.0f, 1.0f) * 15.999f));
+                if (bin != dominantBin) continue;
+                float weight = 1.0f / float(ring);
+                replacementSum += candidate * weight;
+                replacementWeight += weight;
+            }
+        }
+        float4 replacement = replacementWeight > 0.0f
+            ? replacementSum / replacementWeight
+            : original;
         output.write(float4(replacement.rgb, original.a), gid);
     }
     """

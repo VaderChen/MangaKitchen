@@ -53,6 +53,7 @@ actor CoreMLModelRuntime: ImageToTextGenerating, ImageToImageGenerating {
     func generateText(
         imageURL: URL,
         prompt: String,
+        maximumOutputTokens _: Int?,
         progress: @escaping InferenceProgress
     ) async throws -> String {
         guard manifest.capability == .imageToText else {

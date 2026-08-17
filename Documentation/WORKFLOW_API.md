@@ -7,12 +7,12 @@
 ```text
 1. scan directory
       ↓ ComicPage[]
-2. detect masks ⇄ edit mask strokes
-      ↓ DialogueRegion[] + dialogue-mask.png + page.str
-3. translate ⇄ edit text/style
-      ↓ page.str
-4. compose
-      ↓ background.png + translated page.png
+2. OCR + enclosed-region candidates → optional VLM merge/classification → glyph mask refinement → one-pass LLM/Agent OCR correction ⇄ edit mask strokes
+      ↓ DialogueRegion[]（raw + corrected source text）+ dialogue-mask.png + 去字校對預覽 + page.str
+3. translate + auto layout ⇄ edit text/style
+      ↓ page.str + translation preview.png
+4. save output
+      ↓ copy confirmed translation preview to translated page.png
 ```
 
 一鍵模式不是第五套流程。`runFullPage` 只依序呼叫步驟二、三、四；步驟一提供已掃描的頁面列表。
@@ -58,9 +58,17 @@
 - `NormalizedPoint` 與 `NormalizedRect` 都以原圖左上角為原點，範圍為 `0...1`。
 - 遮罩畫筆的 `diameter` 是相對於原圖短邊的比例，範圍為 `0.001...1`。
 - `MaskStroke.mode` 為 `add` 或 `erase`，筆劃依保存順序套用。
-- `DialogueStyle.fontSize == null` 表示在 `minimumFontSize...maximumFontSize` 內自動配適；指定數值則使用固定字級。
+- `rawSourceText` 保留辨識當下的原始值（GUI 為 Vision OCR，MCP 為 Agent 提交的原文）；`sourceText` 是經本機 LLM、MCP Agent 或人工校正後的翻譯輸入。
+- `ocrTextRefined == true` 才表示該區域已完成一次 OCR 校正；翻譯不會再次校正來源文字。
+- **GUI 路徑**：系統 Vision OCR 與封閉白區偵測各自獨立執行。每個 OCR 粗框只歸屬重疊率最高的封閉候選，未歸屬者作為無框文字；所有封閉候選即使沒有 OCR 命中也會送本機 VLM 分類與轉錄。VLM 不產生座標，而是與 OCR 文字／位置及封閉框幾何合併、去重；無 OCR 的直排文字可直接由 VLM 補成區域。擬聲字、頁碼、頁尾資訊、人物與空白區不進入合併清單。未載入圖生文模型時則略過語意合併，系統 OCR 仍可獨立產生區域與遮罩。OCR 校正與翻譯分批呼叫模型，且只有每個輸入 UUID 都有非空結果時才寫入完成狀態。
+- **MCP 路徑**：譯文一律由外部 Agent 提供，後端永不呼叫內建圖生文模型翻譯；區域來源以 `region_source` 切換（`agent` 連 Vision OCR 都不跑／`local` 用本機 Vision＋VLM）。後端只做像素遮罩收斂、背景修補與排版。詳見〈MCP 介面〉。
+- `maskRefinementApplied == true` 表示遮罩已由 OCR 粗框收斂成亮度／連通元件字形多邊形，產生遮罩時只再向外擴張 1～3 px。
+- `maskCoverageRatio` 是像素精修保留的前景筆畫比例；`null` 代表精確多邊形由人工／Agent 直接提供，或尚未執行自動檢查。
+- `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線，但仍回報 false，因為它也可能是範圍太窄而被截掉的文字。此時應擴大安全範圍、重算遮罩，或由 Agent／人工補入精確多邊形與畫筆。
+- `bounds` 是涵蓋完整原文的粗搜尋範圍，不直接作為最終遮罩；`bubbleBounds` 必須涵蓋整個對話框內緣，像素搜尋及多邊形都不得越界。
+- `DialogueStyle.fontSize == null` 表示先依原文字形遮罩面積／字數估算接近原稿的起始字級，再於 `minimumFontSize...maximumFontSize` 內自動配適；指定數值代表優先字級，但譯文超出安全框時仍會向下縮小。排版以原文字形中心為錨點，縮字後仍無法容納時才逐步使用更多泡泡空間；同一泡泡內相鄰且重疊的排版區會按錨點中線分割成互不重疊的欄位，最後一律裁切於各自欄位與 `bubbleBounds` 安全內框。
 - 掃描結果以來源目錄下的 `relativeSourcePath` 自然排序。
-- 輸出保留來源子目錄結構，圖片統一輸出為 PNG；例如 `chapter01/003.jpg` 對應 `chapter01/003.png` 與 `chapter01/003.str`。
+- `.str` 是原圖 sidecar，固定放在原圖旁並使用相同檔名主體；例如來源 `chapter01/003.jpg` 對應來源側的 `chapter01/003.str`。輸出目錄只按相同子目錄結構保存 `chapter01/003.png`。
 - 輸出目錄不得等於來源目錄，也不得位於來源目錄內，避免重新掃描輸出檔或覆寫原圖。
 
 ## 頁面狀態
@@ -84,6 +92,7 @@
 ```swift
 let pages = try ComicDirectoryScanner().scan(sourceDirectoryURL)
 let paths = try WorkflowPathResolver().paths(
+    sourceURL: page.sourceURL,
     relativeSourcePath: page.relativeSourcePath!,
     outputDirectoryURL: outputDirectoryURL
 )
@@ -96,6 +105,15 @@ let paths = try WorkflowPathResolver().paths(
 ```swift
 let detection = try await pipeline.detectMasks(
     page: page,
+    options: options,
+    refineOCRText: true,
+    progress: progress
+)
+
+// 已有遮罩時，只補做尚未完成的 OCR 校正，不覆寫人工遮罩。
+let correctedRegions = try await pipeline.refineOCRText(
+    page: page,
+    regions: editedRegions,
     options: options,
     progress: progress
 )
@@ -159,8 +177,11 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
       "id": "REGION-UUID",
       "order": 0,
       "bounds": { "x": 0.62, "y": 0.08, "width": 0.24, "height": 0.18 },
+      "rawSourceText": "原妏",
       "sourceText": "原文",
+      "ocrTextRefined": true,
       "translatedText": "譯文",
+      "translationAnchor": { "x": 0.74, "y": 0.17 },
       "confidence": 0.94,
       "style": {
         "fontName": "PingFang TC",
@@ -171,6 +192,7 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
         "textColorHex": "#111111"
       },
       "automaticMaskEnabled": true,
+      "maskRefinementApplied": true,
       "maskStrokes": [
         {
           "id": "STROKE-UUID",
@@ -197,17 +219,19 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `updateGlobalSettings(settings)` | 更新完整全域設定；包含色系、資料位置、偏好模型與 MCP 網路設定 |
 | `chooseDataDirectory()` | 開啟原生資料目錄選擇面板；回傳 `{ path }`，套用後需重新啟動 |
 | `choosePreferredModelDirectory(capability)` | 選取並驗證 `imageToText` 或 `imageToImage` 模型目錄 |
+| `chooseModelDownloadDirectory(capability)` | 選取模型儲存根目錄；若直接選到支援的既有模型，會回傳其版本 |
+| `downloadPreferredModel(capability, variantID)` | 從 Hugging Face 下載所選圖生文模型；已存在時不重複下載 |
 | `createProject()`／`chooseSourceDirectory()` | 以來源目錄建立專案；既有目錄則切換並重掃 |
 | `switchProject(projectID)` | 切換目前專案 |
 | `renameProject(name)` | 修改目前專案顯示名稱 |
 | `rescanSourceDirectory()` | 重新掃描目前來源 |
-| `chooseOutputDirectory()` | 選取輸出目錄並同步 `.str` |
+| `chooseOutputDirectory()` | 選取只存放最終 PNG 的輸出目錄；`.str` 不會隨之移動 |
 | `setPageSelection(pageIDs, activePageID)` | 同時設定批次選取與中央畫布頁面 |
 | `selectAllPages()`／`clearPageSelection()` | 全選或清除批次選取 |
 | `runBatch(operation, pageIDs)` | 將明確的頁面集合加入遮罩、翻譯、合成或完整處理佇列 |
 | `detectMasks(scope)` | `selected` 或 `all` 的步驟二 |
 | `translate(scope)` | `selected` 或 `all` 的步驟三 |
-| `compose(scope)` | `selected` 或 `all` 的步驟四 |
+| `compose(scope)` | `selected` 或 `all` 的步驟四；只儲存步驟三已完成的翻譯預覽 |
 | `runFullPage(scope)` | 保留的一鍵完整頁／全部頁面 |
 | `retryFailedBatchJob(jobID)` | 以原操作重新排入該工作的失敗頁面 |
 | `clearFinishedBatchJobs()` | 清除已完成、失敗或取消的工作紀錄 |
@@ -217,9 +241,11 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `appendMaskStroke(pageID, regionID, mode, diameter, points)` | 添加或擦除遮罩 |
 | `undoMaskStroke(pageID, regionID)` | 復原該區域最後一筆遮罩 |
 | `removeRegion(pageID, regionID)` | 移除區域 |
-| `updateRegion(pageID, regionID, changes)` | 更新文字、位置、字型、字級及排字設定 |
+| `updateRegion(pageID, regionID, changes)` | 更新文字、`translationAnchor` 譯文中心點、字型、字級及排字設定 |
 
 命令 Promise 代表 Native 已接受命令。長工序的實際狀態、進度及結果由 `window.MangaKitchenNative.receiveState` 持續推送。
+
+`translationAnchor` 使用左上角原點的 0...1 正規化座標，只改變譯文 Layer 與最終排版位置，不會改動 OCR `bounds`、對話框或遮罩。像素遮罩覆蓋檢查只提供警告；人工遮罩或目前自動遮罩仍可繼續翻譯與合成，不會作為硬性阻擋條件。
 
 介面語言與專案的 `targetLanguageCode` 是兩個獨立設定。改變介面語言只影響 WebUI、原生目錄選擇面板與 MCP menu bar，不會修改譯文語言或專有名詞的對照目標。
 
@@ -253,7 +279,9 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `mangakitchen.glossary.upsert` | 新增詞條或以 `entry_id` 更新完整映射 |
 | `mangakitchen.glossary.remove` | 移除指定詞條 |
 | `mangakitchen.model.load` | 載入本機模型 manifest 目錄 |
+| `mangakitchen.workspace.pages` | 取得檔案工作清單與每頁 `next_action`，供 Agent 迴圈處理 |
 | `mangakitchen.page.detect_masks` | 步驟二 |
+| `mangakitchen.page.supplement_regions` | 外部 Agent 批次補入遺漏文字，並由後端精修與重建遮罩 |
 | `mangakitchen.page.translate` | 步驟三 |
 | `mangakitchen.page.compose` | 步驟四 |
 | `mangakitchen.page.run_full` | 一鍵完整頁或批次完整處理 |
@@ -264,6 +292,91 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `mangakitchen.mask.undo_stroke` | 復原最後一筆遮罩 |
 
 四個頁面工具的 `page_ids` 可省略；省略或傳空陣列代表工作區全部頁面。長工序若收到 MCP `_meta.progressToken`，會發送 `notifications/progress`。MCP 的 request cancellation 會傳遞至 Swift Task 與模型 Pipeline。
+
+**MCP 的譯文一律由 Agent 提供。** 後端永遠不會呼叫內建圖生文（imageToText）模型翻譯 —— 這不是靠旗標控制，而是兩條管線的 translator 位置都固定是 `AgentDrivenTranslator`，結構上就無法退回本機翻譯。實務上 Agent 的翻譯品質也遠勝可在本機執行的小模型。
+
+**區域來源可切換**，用 `workspace.configure` 的 `region_source` 設定（工作區層級，隨 session 保存）：
+
+| `region_source` | 區域（文字位置與原文） | 翻譯 | 適用情境 |
+| --- | --- | --- | --- |
+| `agent`（預設） | 由 Agent 提交；後端連 Vision OCR 都不跑 | Agent | 沒有本機模型，或 Agent 的版面判讀較準 |
+| `local` | 本機 Vision OCR 與封閉區域偵測；已載入 imageToText 模型時合併 VLM 分類／轉錄並校正 OCR | Agent | 想使用本機穩定幾何與缺漏區域補完，只把翻譯交給 Agent |
+
+`agent` 模式的四個位置全部換成替身（`AgentDrivenTextRecognizer`／`AgentDrivenRegionDetector`／`AgentDrivenOCRTextRefiner`／`AgentDrivenTranslator`）；`local` 模式只換 translator，前三者用回 `VisionOCRService`／`VLMSupplementalRegionDetector`／`VLMOCRTextRefinementService`。
+
+兩種模式下後端共用像素級遮罩收斂、背景修補與排版。`model.load` 可載入 imageToImage 模型供 `page.compose` 的生成式背景修補使用；imageToText 模型只有在 `region_source: local` 時才會被使用。`local` 模式未載入 imageToText 模型時只執行 Vision OCR；模型已載入時才把 Vision OCR、VLM 與封閉候選合併，因此模型是補強而不是系統 OCR 的必要條件。
+
+⚠️ 切到 `local` 後，`page.detect_masks` 會**重新產生區域並覆寫**該頁既有結果（含已寫入的譯文）；`agent` 模式則保證不覆寫。
+
+標準流程：
+
+`region_source: agent`（預設）：
+
+1. `page.detect_masks` —— 不做辨識，只把目前已提交的區域收斂成像素級遮罩並輸出遮罩圖，**不會覆寫**既有區域。頁面還沒有區域時輸出空白遮罩。
+2. 讀取 `mangakitchen://page/{page_id}` 與 `/source`，由 Agent 自行辨識。
+3. `page.supplement_regions` 批次提交區域與原文。
+4. `region.update` 寫入 `translated_text`。
+5. `page.compose` 輸出。
+
+`region_source: local`：
+
+1. `page.detect_masks` —— 本機產生區域、原文與遮罩；有 imageToText 模型時合併 Vision OCR、VLM 與封閉候選，沒有模型時使用 Vision OCR 獨立完成。
+2. 讀取 `mangakitchen://page/{page_id}` 取得各區域的 `sourceText`。
+3. `region.update` 寫入 `translated_text`（步驟 2、3 是這個模式下 Agent 唯一要做的事）。
+4. `page.compose` 輸出。
+
+`page.translate` 在此模式下不可用，呼叫會回傳可操作的錯誤訊息，指引改用 `region.update` 寫入譯文。`page.run_full` 只有在所有區域都已有譯文時才會成功，否則會停在同一個錯誤。
+
+### 整批處理：由 Agent 自行迴圈
+
+全自動與否取決於使用者的指令，後端不會自己啟動批次。使用者要求整批處理時，Agent 以 `mangakitchen.workspace.pages` 取得檔案工作清單，依每頁的 `nextAction` 逐頁執行：
+
+| `nextAction` | 意義 | Agent 該做的事 |
+| --- | --- | --- |
+| `submitRegions` | 這一頁還沒有任何區域 | 讀 `sourceURI` 原圖辨識，`page.supplement_regions` 提交 |
+| `writeSourceText` | 有區域但原文不完整 | `region.update` 寫回 `source_text` |
+| `writeTranslation` | 原文齊全但缺譯文 | `region.update` 寫入 `translated_text` |
+| `compose` | 譯文齊全但尚未輸出 | `page.compose` |
+| `done` | 已輸出 | 略過 |
+
+清單另含 `stage`、`regionCount`、`regionsMissingSourceText`、`regionsMissingTranslation`、`regionsWithIncompleteMask`、`hasMask`、`hasOutput` 與 `errorMessage`（輸出沿用 Codable 的 camelCase；只有工具**輸入**參數是 snake_case，例如 `pending_only`），可據此判斷是否需要回頭補遮罩。輸入參數 `pending_only` 預設 `true`，只回傳還有待辦的頁面；完成一頁後重新取清單即可續跑，因此中斷後可以安全接續。
+
+這份清單**刻意不含 `regions` 內容**：`ComicPage` 內嵌完整 `DialogueRegion`（含數千點的 `maskPolygons`），整個專案列出來會是巨大的 payload。需要單頁細節時再讀 `mangakitchen://page/{page_id}`。同一份資料也以 `mangakitchen://workspace/current/pages` 資源提供（該資源一律回傳全部頁面）。
+
+專案（工作區）層級的列表則用 `mangakitchen.workspace.list` 或 `mangakitchen://workspace/list`。
+
+`page.supplement_regions` 是 Agent 提交區域的主要入口。每筆候選需要涵蓋完整原文的粗 `bounds` 與校正後的 `source_text`，也可提供 `writing_direction` 或精確 `mask_polygons`。`bounds` 要貼著文字本身，它同時決定譯文落點與字級推估；`bubble_bounds` 只在文字確實被封閉對話框、旁白框或標題框包住時提供，代表遮罩與譯文都不得越界。無框台詞（直接排在畫面或放射線上的字）請**省略** `bubble_bounds`：省略代表沒有硬邊界，遮罩改為只依 `maskExpansion` 由文字外擴；為無框文字或整格分鏡杜撰一個框，會把譯文推到分鏡中央。既有區域若帶著錯誤的框，可用 `region.update` 傳 `"bubble_bounds": null` 清除。未提供多邊形時，Swift 後端先分析粗框；若對話框內緣仍有可信前景，就擴大搜尋區重算，最終只保存字形級多邊形。覆蓋率不足或文字碰到搜尋邊界時會在 `warnings` 說明，不會以擴大的矩形冒充精確遮罩。候選若與既有或同批區域重疊超過一半就略過，因此同一請求可以安全重送。接受的區域會標記 `ocrTextRefined: true`、合併至頁面、重建完整 mask 並同步 `.str`。
+
+對已存在但尚未校正的 OCR 區域，純 Agent 仍使用 `region.update` 寫回校正後的 `source_text`；寫回來源文字會自動設為已校正。修改來源文字而未同時提供譯文時，既有譯文會清空，避免沿用失效翻譯。
+
+`region.update` 對「nil 本身就是有效狀態」的欄位採三態語意：**省略＝維持原值，`null`＝清除回預設，帶值＝設定**。適用欄位與清除後的行為：
+
+| 欄位 | 傳 `null` 的意義 |
+| --- | --- |
+| `bubble_bounds` | 這個區域沒有對話框；遮罩與譯文改為只依 `maskExpansion` 由文字外擴，不設硬邊界 |
+| `translation_anchor` | 譯文落點還原成預設（對話框中心／原文位置） |
+| `font_size` | 恢復自動配適字級，等同 `automatic_font_size: true` |
+
+其餘欄位維持「省略＝不變」。`mask_polygons` 傳空陣列 `[]` 即可清除並讓後端重新精修。
+
+`page.supplement_regions` 的 `regions` 格式如下，座標皆為左上原點的 0...1 正規化值：
+
+```json
+{
+  "workspace_id": "<uuid>",
+  "page_id": "<uuid>",
+  "regions": [
+    {
+      "bounds": { "x": 0.82, "y": 0.305, "width": 0.06, "height": 0.16 },
+      "source_text": "欲しいの？",
+      "bubble_bounds": { "x": 0.76, "y": 0.285, "width": 0.17, "height": 0.19 },
+      "writing_direction": "vertical"
+    }
+  ]
+}
+```
+
+`page.translate` 若發現既有區域尚未校正，會先以已載入的本機圖生文模型補做校正，且不重跑 OCR 或遮罩。`page.compose` 與 `page.run_full` 會檢查遮罩、OCR 校正、譯文與輸出產物，缺少時才逐級回到必要的前一步；已完成資料不會被重做。
 
 ### Resources
 

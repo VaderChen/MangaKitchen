@@ -8,6 +8,8 @@ struct MCPWorkspaceState: Codable, Sendable {
     var sourceDirectoryURL: URL?
     var outputDirectoryURL: URL?
     var options: ProcessingOptions
+    /// 區域來源；翻譯永遠由 Agent 負責，不受此設定影響。
+    var regionSource: MCPRegionSource
     var glossary: ProjectGlossary
     var pages: [ComicPage]
     var loadedModels: [LoadedModelInfo]
@@ -21,6 +23,66 @@ private struct MCPWorkspaceContext: Sendable {
     var options: ProcessingOptions
     var glossary: ProjectGlossary
     var pages: [ComicPage]
+    var regionSource: MCPRegionSource
+}
+
+/// Agent 自行迴圈處理時的工作清單項目。
+///
+/// 刻意不含 regions：`ComicPage` 內嵌完整 `DialogueRegion`（含數千點的
+/// maskPolygons），整個專案列出來會是巨大的 payload。這裡只給「還差什麼」，
+/// Agent 依 nextAction 決定要不要進一步讀取該頁的詳細資源。
+struct MCPPageTask: Codable, Sendable {
+    var pageID: UUID
+    var index: Int
+    var title: String
+    var relativeSourcePath: String?
+    var stage: PageProcessingStage
+    var pixelWidth: Int
+    var pixelHeight: Int
+    var regionCount: Int
+    /// 尚未寫入原文或尚未標記校正完成的區域數。
+    var regionsMissingSourceText: Int
+    /// 尚未寫入譯文的區域數。
+    var regionsMissingTranslation: Int
+    /// 像素遮罩覆蓋檢查未通過的區域數。
+    var regionsWithIncompleteMask: Int
+    var hasMask: Bool
+    var hasOutput: Bool
+    /// Agent 對這一頁應該做的下一件事。
+    var nextAction: MCPPageNextAction
+    var sourceURI: String
+    var pageURI: String
+    var errorMessage: String?
+}
+
+/// 工作流只有這幾種待辦狀態；Agent 可直接依此分派，不必自行推導。
+enum MCPPageNextAction: String, Codable, Sendable {
+    /// 這一頁還沒有任何區域：讀原圖後用 page.supplement_regions 提交。
+    case submitRegions
+    /// 有區域但原文不完整：用 region.update 寫回 source_text。
+    case writeSourceText
+    /// 原文齊全但缺譯文：用 region.update 寫入 translated_text。
+    case writeTranslation
+    /// 譯文齊全但尚未輸出：執行 page.compose。
+    case compose
+    /// 已輸出，無待辦。
+    case done
+}
+
+struct MCPWorkspacePageList: Codable, Sendable {
+    var workspaceID: UUID
+    var name: String
+    var sourceDirectoryURL: URL
+    var outputDirectoryURL: URL?
+    var totalPageCount: Int
+    var pendingPageCount: Int
+    var pages: [MCPPageTask]
+}
+
+struct MCPWorkspaceConfiguration: Codable, Sendable {
+    var options: ProcessingOptions
+    /// 區域來源；翻譯永遠由 Agent 負責，不受此設定影響。
+    var regionSource: MCPRegionSource
 }
 
 struct MCPWorkflowResult: Codable, Sendable {
@@ -28,6 +90,21 @@ struct MCPWorkflowResult: Codable, Sendable {
     var operation: String
     var processedPageIDs: [UUID]
     var pages: [ComicPage]
+}
+
+struct MCPAgentRegionProposal: Sendable {
+    var bounds: NormalizedRect
+    var sourceText: String
+    var bubbleBounds: NormalizedRect?
+    var maskPolygons: [[NormalizedPoint]]?
+    var writingDirection: WritingDirection?
+}
+
+struct MCPAgentSupplementResult: Codable, Sendable {
+    var page: ComicPage
+    var acceptedRegionIDs: [UUID]
+    var skippedCount: Int
+    var warnings: [String]
 }
 
 enum MCPWorkflowStep: String, Sendable {
@@ -46,7 +123,17 @@ actor MCPWorkflowService {
     typealias Progress = @Sendable (_ completed: Double, _ message: String) -> Void
 
     private let models: ModelRuntimeHub
-    private let pipeline: ComicTranslationPipeline
+    /// 區域也交給 Agent：辨識與語意判讀全部封死。
+    private let agentPipeline: ComicTranslationPipeline
+    /// 區域由本機計算：Vision OCR ＋ 本機 VLM 語意分類／OCR 校正。
+    /// 翻譯位置同樣是 AgentDrivenTranslator —— 兩條管線都不會用本機模型翻譯。
+    private let localDetectionPipeline: ComicTranslationPipeline
+    private var pipeline: ComicTranslationPipeline {
+        switch regionSource {
+        case .agent: agentPipeline
+        case .local: localDetectionPipeline
+        }
+    }
     private let scanner = ComicDirectoryScanner()
     private let stringTables = ComicStringTableRepository()
     private let pathResolver = WorkflowPathResolver()
@@ -56,21 +143,54 @@ actor MCPWorkflowService {
     private var sourceDirectoryURL: URL?
     private var outputDirectoryURL: URL?
     private var options = ProcessingOptions()
+    /// 區域從哪裡來。翻譯在兩種模式下都固定由 Agent 負責。
+    private var regionSource: MCPRegionSource = .agent
     private var glossary = ProjectGlossary()
     private var pages: [ComicPage] = []
     private var workspaces: [UUID: MCPWorkspaceContext] = [:]
 
-    init(dataDirectoryPath: String?) throws {
+    init(
+        dataDirectoryPath: String?,
+        imageCompositingBackend: ImageCompositingBackend = .cpu
+    ) throws {
         let metal = try MetalContext()
         let models = ModelRuntimeHub(metal: metal)
         let root = try Self.makeWorkspaceRoot(dataDirectoryPath: dataDirectoryPath)
         self.models = models
         self.workspaceRoot = root
-        self.pipeline = ComicTranslationPipeline(
+        let maskGenerator = DialogueMaskGenerator()
+        let typesetter = CoreTextDialogueTypesetter()
+        let backgroundRestorer = try HybridBackgroundRestorer(
+            models: models,
+            metal: metal,
+            compositingBackend: imageCompositingBackend
+        )
+        let artifactsRoot = root.appendingPathComponent("Artifacts", isDirectory: true)
+        // 翻譯位置在兩條管線都是 AgentDrivenTranslator：MCP 永遠不會用
+        // 內建圖生文模型翻譯，這一點不隨模式改變。
+        self.agentPipeline = ComicTranslationPipeline(
+            recognizer: AgentDrivenTextRecognizer(),
+            regionDetector: AgentDrivenRegionDetector(),
+            ocrTextRefiner: AgentDrivenOCRTextRefiner(),
+            maskRefiner: MangaTextMaskRefiner(),
+            translator: AgentDrivenTranslator(),
+            maskGenerator: maskGenerator,
+            backgroundRestorer: backgroundRestorer,
+            typesetter: typesetter,
+            outputRoot: artifactsRoot
+        )
+        self.localDetectionPipeline = ComicTranslationPipeline(
             recognizer: VisionOCRService(),
-            translator: VLMRegionTranslationService(model: models),
+            regionDetector: VLMSupplementalRegionDetector(model: models),
+            ocrTextRefiner: VLMOCRTextRefinementService(model: models),
+            maskRefiner: MangaTextMaskRefiner(),
+            translator: AgentDrivenTranslator(),
             maskGenerator: DialogueMaskGenerator(),
-            backgroundRestorer: try HybridBackgroundRestorer(models: models, metal: metal),
+            backgroundRestorer: try HybridBackgroundRestorer(
+                models: models,
+                metal: metal,
+                compositingBackend: imageCompositingBackend
+            ),
             typesetter: CoreTextDialogueTypesetter(),
             outputRoot: root.appendingPathComponent("Artifacts", isDirectory: true)
         )
@@ -97,6 +217,7 @@ actor MCPWorkflowService {
             self.sourceDirectoryURL = sourceDirectoryURL.standardizedFileURL
             self.outputDirectoryURL = outputDirectoryURL?.standardizedFileURL
             options = ProcessingOptions()
+            regionSource = .agent
             glossary = ProjectGlossary()
             pages = []
         }
@@ -158,6 +279,7 @@ actor MCPWorkflowService {
                     sourceDirectoryURL: context.sourceDirectoryURL,
                     outputDirectoryURL: context.outputDirectoryURL,
                     options: context.options,
+                    regionSource: context.regionSource,
                     glossary: context.glossary,
                     pages: context.pages,
                     loadedModels: loadedModels
@@ -174,29 +296,54 @@ actor MCPWorkflowService {
         try requireWorkspace(workspaceID)
         defer { saveActiveWorkspace() }
         guard let sourceDirectoryURL else { throw MCPServiceError.workspaceNotOpen }
+        let previousPages = pages
         let oldPages = Dictionary(
-            uniqueKeysWithValues: pages.map { ($0.sourceURL.standardizedFileURL.path, $0) }
+            uniqueKeysWithValues: previousPages.map { ($0.sourceURL.standardizedFileURL.path, $0) }
         )
+        let fingerprint: (String, Int, Int) -> String = { title, width, height in
+            "\(title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current))|\(width)x\(height)"
+        }
+        let relocationGroups = Dictionary(grouping: previousPages) {
+            fingerprint($0.title, $0.pixelWidth, $0.pixelHeight)
+        }
+        let relocated = relocationGroups.compactMapValues { $0.count == 1 ? $0[0] : nil }
+        var reusedPageIDs: Set<UUID> = []
         let scanner = self.scanner
         let scanned = try await Task.detached {
             try scanner.scan(sourceDirectoryURL)
         }.value
-        pages = scanned.enumerated().map { offset, item in
-            var page = oldPages[item.sourceURL.path] ?? ComicPage(
+        var rescanned: [ComicPage] = []
+        for (offset, item) in scanned.enumerated() {
+            let title = item.sourceURL.deletingPathExtension().lastPathComponent
+            let movedPage = relocated[fingerprint(title, item.pixelWidth, item.pixelHeight)].flatMap {
+                reusedPageIDs.contains($0.id) ? nil : $0
+            }
+            var page = oldPages[item.sourceURL.path] ?? movedPage ?? ComicPage(
                 index: offset + 1,
-                title: item.sourceURL.deletingPathExtension().lastPathComponent,
+                title: title,
                 sourceURL: item.sourceURL,
                 relativeSourcePath: item.relativePath,
                 pixelWidth: item.pixelWidth,
                 pixelHeight: item.pixelHeight,
                 stage: .scanned
             )
+            reusedPageIDs.insert(page.id)
             page.index = offset + 1
+            page.sourceURL = item.sourceURL
             page.relativeSourcePath = item.relativePath
             page.pixelWidth = item.pixelWidth
             page.pixelHeight = item.pixelHeight
-            return page
+            let tableURL = pathResolver.stringTableURL(for: item.sourceURL)
+            if let table = try await stringTables.load(from: tableURL) {
+                page.regions = table.regions
+                page.stringTableURL = tableURL
+                page.stage = table.entries.contains(where: { !$0.translatedText.isEmpty })
+                    ? .translationReady
+                    : .maskReady
+            }
+            rescanned.append(page)
         }
+        pages = rescanned
         return await state()
     }
 
@@ -207,9 +354,6 @@ actor MCPWorkflowService {
         try validateOutputDirectory(directoryURL, sourceDirectoryURL: sourceDirectoryURL)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         outputDirectoryURL = directoryURL.standardizedFileURL
-        for page in pages where !page.regions.isEmpty {
-            try await persistStringTable(pageID: page.id)
-        }
         return await state()
     }
 
@@ -219,8 +363,10 @@ actor MCPWorkflowService {
         readingDirection: ReadingDirection?,
         writingDirection: WritingDirection?,
         fontName: String?,
-        useImageToImageRestoration: Bool?
-    ) throws -> ProcessingOptions {
+        maskExpansion: Double?,
+        useImageToImageRestoration: Bool?,
+        regionSource: MCPRegionSource?
+    ) throws -> MCPWorkspaceConfiguration {
         try requireWorkspace(workspaceID)
         defer { saveActiveWorkspace() }
         if let targetLanguageCode {
@@ -231,10 +377,12 @@ actor MCPWorkflowService {
         if let readingDirection { options.readingDirection = readingDirection }
         if let writingDirection { options.defaultStyle.writingDirection = writingDirection }
         if let fontName, !fontName.isEmpty { options.defaultStyle.fontName = fontName }
-        if let useImageToImageRestoration {
-            options.useImageToImageRestoration = useImageToImageRestoration
+        if let maskExpansion, maskExpansion.isFinite {
+            options.maskExpansion = min(max(maskExpansion, 0), 0.75)
         }
-        return options
+        options.useImageToImageRestoration = false
+        if let regionSource { self.regionSource = regionSource }
+        return MCPWorkspaceConfiguration(options: options, regionSource: self.regionSource)
     }
 
     func loadModel(directoryURL: URL) async throws -> LoadedModelInfo {
@@ -293,17 +441,13 @@ actor MCPWorkflowService {
     ) async throws -> MCPWorkflowResult {
         try requireWorkspace(workspaceID)
         defer { saveActiveWorkspace() }
-        if step == .translate || step == .fullPage {
-            let loaded = await models.loadedModels()
-            guard loaded.contains(where: { $0.capability == .imageToText }) else {
-                throw MCPServiceError.textModelRequired
-            }
-        }
+        let targetIDs = try resolvePageIDs(requestedPageIDs)
+        // 純 Agent 模式沒有任何步驟會用到 imageToText，因此不再檢查該模型。
+        // 需要譯文的步驟改由 AgentDrivenTranslator 拋出可操作的錯誤說明。
         if step == .compose || step == .fullPage {
             guard outputDirectoryURL != nil else { throw MCPServiceError.outputDirectoryRequired }
         }
 
-        let targetIDs = try resolvePageIDs(requestedPageIDs)
         for (offset, pageID) in targetIDs.enumerated() {
             try Task.checkCancellation()
             let base = Double(offset) / Double(max(targetIDs.count, 1))
@@ -316,13 +460,28 @@ actor MCPWorkflowService {
             case .detectMasks:
                 try await detect(pageID: pageID, progress: pageProgress)
             case .translate:
+                if !hasMaskData(pageID: pageID) {
+                    try await detect(pageID: pageID, progress: pageProgress)
+                }
                 try await translate(pageID: pageID, progress: pageProgress)
             case .compose:
+                if !hasMaskData(pageID: pageID) {
+                    try await detect(pageID: pageID, progress: pageProgress)
+                }
+                if !hasTranslationData(pageID: pageID) {
+                    try await translate(pageID: pageID, progress: pageProgress)
+                }
                 try await compose(pageID: pageID, progress: pageProgress)
             case .fullPage:
-                try await detect(pageID: pageID, progress: pageProgress)
-                try await translate(pageID: pageID, progress: pageProgress)
-                try await compose(pageID: pageID, progress: pageProgress)
+                if !hasMaskData(pageID: pageID) {
+                    try await detect(pageID: pageID, progress: pageProgress)
+                }
+                if !hasTranslationData(pageID: pageID) {
+                    try await translate(pageID: pageID, progress: pageProgress)
+                }
+                if !hasCompletedOutput(pageID: pageID) {
+                    try await compose(pageID: pageID, progress: pageProgress)
+                }
             }
             progress(Double(offset + 1) / Double(targetIDs.count), "完成頁面：\(pageID.uuidString)")
         }
@@ -334,15 +493,217 @@ actor MCPWorkflowService {
         )
     }
 
+    private func hasMaskData(pageID: UUID) -> Bool {
+        guard let regions = pages.first(where: { $0.id == pageID })?.regions,
+              !regions.isEmpty else { return false }
+        return regions.allSatisfy(Self.hasUsableMask)
+    }
+
+    private static func hasUsableMask(_ region: DialogueRegion) -> Bool {
+        if region.maskStrokes.contains(where: { $0.mode == .add }) { return true }
+        return region.automaticMaskEnabled
+    }
+
+    private func hasTranslationData(pageID: UUID) -> Bool {
+        guard let page = pages.first(where: { $0.id == pageID }),
+              !page.regions.isEmpty else { return false }
+        return page.regions.allSatisfy {
+            $0.ocrTextRefined
+                && !$0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    private func hasCompletedOutput(pageID: UUID) -> Bool {
+        guard let page = pages.first(where: { $0.id == pageID }),
+              page.stage == .completed,
+              let outputURL = page.outputURL else { return false }
+        return FileManager.default.fileExists(atPath: outputURL.path)
+    }
+
+    /// 讓外部 MCP Agent 一次補入遺漏文字。Agent 可只提供粗框，後端會再做像素級遮罩精修。
+    /// 與既有區域高度重疊的候選會略過，使同一批資料可安全重送。
+    /// 專案的檔案工作清單，讓 Agent 收到使用者指令後可以自行迴圈處理。
+    /// `pendingOnly` 預設為 true，只回傳還有待辦的頁面。
+    func pageTasks(
+        workspaceID: UUID,
+        pendingOnly: Bool
+    ) async throws -> MCPWorkspacePageList {
+        try requireWorkspace(workspaceID)
+        guard let context = workspaces[workspaceID] else {
+            throw MCPServiceError.workspaceNotFound
+        }
+        let allTasks = context.pages.map(Self.makePageTask)
+        let pending = allTasks.filter { $0.nextAction != .done }
+        return MCPWorkspacePageList(
+            workspaceID: workspaceID,
+            name: context.name,
+            sourceDirectoryURL: context.sourceDirectoryURL,
+            outputDirectoryURL: context.outputDirectoryURL,
+            totalPageCount: allTasks.count,
+            pendingPageCount: pending.count,
+            pages: pendingOnly ? pending : allTasks
+        )
+    }
+
+    private static func makePageTask(_ page: ComicPage) -> MCPPageTask {
+        let missingSourceText = page.regions.reduce(into: 0) { count, region in
+            let text = region.sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty || !region.ocrTextRefined { count += 1 }
+        }
+        let missingTranslation = page.regions.reduce(into: 0) { count, region in
+            if region.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                count += 1
+            }
+        }
+        let incompleteMask = page.regions.reduce(into: 0) { count, region in
+            if !region.maskCoverageComplete { count += 1 }
+        }
+        let hasOutput = page.outputURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
+        let identifier = page.id.uuidString.lowercased()
+
+        let nextAction: MCPPageNextAction
+        if page.regions.isEmpty {
+            nextAction = .submitRegions
+        } else if missingSourceText > 0 {
+            nextAction = .writeSourceText
+        } else if missingTranslation > 0 {
+            nextAction = .writeTranslation
+        } else if !hasOutput {
+            nextAction = .compose
+        } else {
+            nextAction = .done
+        }
+
+        return MCPPageTask(
+            pageID: page.id,
+            index: page.index,
+            title: page.title,
+            relativeSourcePath: page.relativeSourcePath,
+            stage: page.stage,
+            pixelWidth: page.pixelWidth,
+            pixelHeight: page.pixelHeight,
+            regionCount: page.regions.count,
+            regionsMissingSourceText: missingSourceText,
+            regionsMissingTranslation: missingTranslation,
+            regionsWithIncompleteMask: incompleteMask,
+            hasMask: page.maskURL != nil,
+            hasOutput: hasOutput,
+            nextAction: nextAction,
+            sourceURI: "mangakitchen://page/\(identifier)/source",
+            pageURI: "mangakitchen://page/\(identifier)",
+            errorMessage: page.errorMessage
+        )
+    }
+
+    func supplementRegions(
+        workspaceID: UUID,
+        pageID: UUID,
+        proposals: [MCPAgentRegionProposal]
+    ) async throws -> MCPAgentSupplementResult {
+        try requireWorkspace(workspaceID)
+        defer { saveActiveWorkspace() }
+        guard !proposals.isEmpty, proposals.count <= 64 else {
+            throw MCPServiceError.invalidArguments("regions 每次必須包含 1...64 個候選區域。")
+        }
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw MCPServiceError.pageNotFound
+        }
+
+        var occupiedBounds = pages[pageIndex].regions.map(\.bounds)
+        var accepted: [DialogueRegion] = []
+        var skippedCount = 0
+
+        for (offset, proposal) in proposals.enumerated() {
+            let bounds = proposal.bounds.clamped()
+            guard bounds.width > 0, bounds.height > 0 else {
+                throw MCPServiceError.invalidArguments("regions[\(offset)].bounds 裁切至圖片後不可為空。")
+            }
+            let sourceText = proposal.sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sourceText.isEmpty else {
+                throw MCPServiceError.invalidArguments("regions[\(offset)].source_text 不可為空。")
+            }
+            if occupiedBounds.contains(where: { Self.isDuplicate(bounds, of: $0) }) {
+                skippedCount += 1
+                continue
+            }
+
+            let bubbleBounds = proposal.bubbleBounds?.clamped()
+            if let bubbleBounds, bubbleBounds.width <= 0 || bubbleBounds.height <= 0 {
+                throw MCPServiceError.invalidArguments("regions[\(offset)].bubble_bounds 裁切至圖片後不可為空。")
+            }
+            let polygons = proposal.maskPolygons?
+                .map { $0.map { $0.clamped() } }
+                .filter { $0.count >= 3 } ?? []
+            var style = options.defaultStyle
+            if let writingDirection = proposal.writingDirection {
+                style.writingDirection = writingDirection
+            }
+            accepted.append(DialogueRegion(
+                bounds: bounds,
+                bubbleBounds: bubbleBounds,
+                sourceText: sourceText,
+                ocrTextRefined: true,
+                confidence: 0.5,
+                style: style,
+                maskPolygons: polygons,
+                maskRefinementApplied: !polygons.isEmpty,
+                maskCoverageRatio: nil,
+                maskCoverageComplete: !polygons.isEmpty
+            ))
+            occupiedBounds.append(bounds)
+        }
+
+        guard !accepted.isEmpty else {
+            return MCPAgentSupplementResult(
+                page: pages[pageIndex],
+                acceptedRegionIDs: [],
+                skippedCount: skippedCount,
+                warnings: []
+            )
+        }
+
+        accepted = try await pipeline.refineMasks(page: pages[pageIndex], regions: accepted)
+        let warnings = accepted.compactMap { region -> String? in
+            guard !region.maskCoverageComplete else { return nil }
+            let ratio = region.maskCoverageRatio.map { String(format: "%.1f%%", $0 * 100) }
+                ?? "無法計算"
+            return "區域 \(region.id.uuidString) 的像素遮罩覆蓋檢查未通過（\(ratio)）；請擴大 bounds／bubble_bounds 後重算，或提交精確 mask_polygons。"
+        }
+        pages[pageIndex].regions.append(contentsOf: accepted)
+        let maskURL = try await pipeline.regenerateMask(
+            page: pages[pageIndex],
+            regions: pages[pageIndex].regions,
+            options: options
+        )
+        pages[pageIndex].maskURL = maskURL
+        pages[pageIndex].stage = .maskReady
+        pages[pageIndex].progress = 0.25
+        pages[pageIndex].errorMessage = nil
+        try await persistStringTable(pageID: pageID)
+
+        return MCPAgentSupplementResult(
+            page: pages[pageIndex],
+            acceptedRegionIDs: accepted.map(\.id),
+            skippedCount: skippedCount,
+            warnings: warnings
+        )
+    }
+
     func updateRegion(
         workspaceID: UUID,
         pageID: UUID,
         regionID: UUID,
         sourceText: String?,
         translatedText: String?,
+        translationAnchor: MCPFieldUpdate<NormalizedPoint>,
         bounds: NormalizedRect?,
+        bubbleBounds: MCPFieldUpdate<NormalizedRect>,
+        maskPolygons: [[NormalizedPoint]]?,
         fontName: String?,
-        fontSize: Double?,
+        fontSize: MCPFieldUpdate<Double>,
+        fontWeight: DialogueFontWeight?,
         useAutomaticFontSize: Bool?,
         writingDirection: WritingDirection?,
         automaticMaskEnabled: Bool?
@@ -353,14 +714,51 @@ actor MCPWorkflowService {
               let regionIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
             throw MCPServiceError.regionNotFound
         }
-        if let sourceText { pages[pageIndex].regions[regionIndex].sourceText = sourceText }
+        if let sourceText {
+            let previous = pages[pageIndex].regions[regionIndex].sourceText
+            pages[pageIndex].regions[regionIndex].rawSourceText =
+                pages[pageIndex].regions[regionIndex].rawSourceText ?? previous
+            pages[pageIndex].regions[regionIndex].sourceText = sourceText
+            pages[pageIndex].regions[regionIndex].ocrTextRefined = true
+            if sourceText != previous, translatedText == nil {
+                pages[pageIndex].regions[regionIndex].translatedText = ""
+            }
+        }
         if let translatedText { pages[pageIndex].regions[regionIndex].translatedText = translatedText }
+        // 明確傳 null 代表把譯文落點還原成預設（對話框中心／原文位置）。
+        if translationAnchor.isChange {
+            pages[pageIndex].regions[regionIndex].translationAnchor = translationAnchor
+                .applied(to: pages[pageIndex].regions[regionIndex].translationAnchor)?
+                .clamped()
+        }
         if let bounds { pages[pageIndex].regions[regionIndex].bounds = bounds.clamped() }
+        // 明確傳 null 代表「這個區域沒有對話框」，必須真的清掉；
+        // 遮罩與排版才會退回只依 maskExpansion 由文字外擴。
+        if bubbleBounds.isChange {
+            pages[pageIndex].regions[regionIndex].bubbleBounds = bubbleBounds
+                .applied(to: pages[pageIndex].regions[regionIndex].bubbleBounds)?
+                .clamped()
+        }
+        if let maskPolygons {
+            let sanitizedPolygons = maskPolygons
+                .map { $0.map { $0.clamped() } }
+                .filter { $0.count >= 3 }
+            pages[pageIndex].regions[regionIndex].maskPolygons = sanitizedPolygons
+            pages[pageIndex].regions[regionIndex].maskRefinementApplied = !sanitizedPolygons.isEmpty
+            pages[pageIndex].regions[regionIndex].maskCoverageRatio = nil
+            pages[pageIndex].regions[regionIndex].maskCoverageComplete = !sanitizedPolygons.isEmpty
+        }
         if let fontName, !fontName.isEmpty { pages[pageIndex].regions[regionIndex].style.fontName = fontName }
+        // automatic_font_size: true 與 font_size: null 等價，都是還原自動配適。
         if useAutomaticFontSize == true {
             pages[pageIndex].regions[regionIndex].style.fontSize = nil
-        } else if let fontSize, fontSize.isFinite {
-            pages[pageIndex].regions[regionIndex].style.fontSize = min(max(fontSize, 4), 512)
+        } else if fontSize.isChange {
+            pages[pageIndex].regions[regionIndex].style.fontSize = fontSize
+                .applied(to: pages[pageIndex].regions[regionIndex].style.fontSize)
+                .map { min(max($0, 4), 512) }
+        }
+        if let fontWeight {
+            pages[pageIndex].regions[regionIndex].style.fontWeight = fontWeight
         }
         if let writingDirection {
             pages[pageIndex].regions[regionIndex].style.writingDirection = writingDirection
@@ -368,7 +766,34 @@ actor MCPWorkflowService {
         if let automaticMaskEnabled {
             pages[pageIndex].regions[regionIndex].automaticMaskEnabled = automaticMaskEnabled
         }
-        try await refreshEditedPage(pageIndex: pageIndex)
+        let shouldRegenerateMask = bounds != nil
+            || bubbleBounds.isChange
+            || maskPolygons != nil
+            || automaticMaskEnabled != nil
+        if maskPolygons == nil, bounds != nil || bubbleBounds.isChange {
+            // 幾何範圍變更後，舊多邊形不再代表目前的粗框／對話框。
+            // 先清空，否則 pipeline 會把它視為 Agent 提供的精確遮罩而略過重算。
+            pages[pageIndex].regions[regionIndex].maskPolygons = []
+            pages[pageIndex].regions[regionIndex].maskRefinementApplied = false
+            pages[pageIndex].regions[regionIndex].maskCoverageRatio = nil
+            pages[pageIndex].regions[regionIndex].maskCoverageComplete = false
+            let refined = try await pipeline.refineMasks(
+                page: pages[pageIndex],
+                regions: [pages[pageIndex].regions[regionIndex]]
+            )
+            if let region = refined.first {
+                pages[pageIndex].regions[regionIndex] = region
+            }
+        }
+        pages[pageIndex].outputURL = nil
+        if shouldRegenerateMask {
+            try await refreshEditedPage(pageIndex: pageIndex)
+        } else {
+            pages[pageIndex].stage = pages[pageIndex].regions.contains(where: { !$0.translatedText.isEmpty })
+                ? .translationReady
+                : .maskReady
+            try await persistStringTable(pageID: pageID)
+        }
         return pages[pageIndex].regions[regionIndex]
     }
 
@@ -452,6 +877,7 @@ actor MCPWorkflowService {
             sourceDirectoryURL: sourceDirectoryURL,
             outputDirectoryURL: outputDirectoryURL,
             options: options,
+            regionSource: regionSource,
             glossary: glossary,
             pages: pages,
             loadedModels: await models.loadedModels()
@@ -468,6 +894,13 @@ actor MCPWorkflowService {
         }
         if uri == "mangakitchen://workspace/current" {
             return .text(try Self.json(await state()), mimeType: "application/json")
+        }
+        if uri == "mangakitchen://workspace/current/pages" {
+            guard let workspaceID else { throw MCPServiceError.workspaceNotOpen }
+            return .text(
+                try Self.json(await pageTasks(workspaceID: workspaceID, pendingOnly: false)),
+                mimeType: "application/json"
+            )
         }
         if uri == "mangakitchen://workspace/current/glossary" {
             return .text(try Self.json(glossary.entries), mimeType: "application/json")
@@ -505,17 +938,69 @@ actor MCPWorkflowService {
         }
     }
 
+    /// 步驟二。`regionSource` 決定區域從哪裡來；翻譯在兩種模式下都不會用本機模型。
     private func detect(pageID: UUID, progress: @escaping PagePipelineProgress) async throws {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else {
             throw MCPServiceError.pageNotFound
         }
-        let result = try await pipeline.detectMasks(page: pages[index], options: options, progress: progress)
-        pages[index].regions = result.regions
-        pages[index].maskURL = result.maskURL
-        pages[index].stage = .maskReady
-        pages[index].progress = 0.25
-        pages[index].errorMessage = nil
+        switch regionSource {
+        case .agent:
+            try await detectByAgentSuppliedRegions(pageIndex: index, progress: progress)
+        case .local:
+            try await detectByLocalPipeline(pageIndex: index, progress: progress)
+        }
         try await persistStringTable(pageID: pageID)
+    }
+
+    /// 純 Agent 模式：不呼叫內建 OCR 或圖生文模型。只把 Agent 目前提供的區域
+    /// 收斂成像素級遮罩並輸出遮罩圖；沒有區域時就產生空白遮罩，等 Agent 補齊。
+    private func detectByAgentSuppliedRegions(
+        pageIndex: Int,
+        progress: @escaping PagePipelineProgress
+    ) async throws {
+        progress(.detectingText, 0)
+        // 絕不覆寫 Agent 已提供的區域：這一步只重算遮罩，不做辨識。
+        let refined = try await pipeline.refineMasks(
+            page: pages[pageIndex],
+            regions: pages[pageIndex].regions
+        )
+        progress(.detectingText, 0.6)
+        let maskURL = try await pipeline.regenerateMask(
+            page: pages[pageIndex],
+            regions: refined,
+            options: options
+        )
+        pages[pageIndex].regions = refined
+        pages[pageIndex].maskURL = maskURL
+        pages[pageIndex].backgroundURL = nil
+        pages[pageIndex].outputURL = nil
+        pages[pageIndex].stage = .maskReady
+        pages[pageIndex].progress = 0.25
+        pages[pageIndex].errorMessage = nil
+        progress(.maskReady, 1)
+    }
+
+    /// 本機區域模式：Vision OCR 定位，已載入圖生文模型時再做語意分類與 OCR 校正。
+    /// 這一步會**重新產生區域並覆寫**該頁既有結果（含已寫入的譯文）。
+    private func detectByLocalPipeline(
+        pageIndex: Int,
+        progress: @escaping PagePipelineProgress
+    ) async throws {
+        let useLocalTextModel = await models.isLoaded(.imageToText)
+        let result = try await pipeline.detectMasks(
+            page: pages[pageIndex],
+            options: options,
+            refineOCRText: useLocalTextModel,
+            detectMissingRegions: useLocalTextModel,
+            progress: progress
+        )
+        pages[pageIndex].regions = result.regions
+        pages[pageIndex].maskURL = result.maskURL
+        pages[pageIndex].backgroundURL = nil
+        pages[pageIndex].outputURL = nil
+        pages[pageIndex].stage = .maskReady
+        pages[pageIndex].progress = 0.25
+        pages[pageIndex].errorMessage = nil
     }
 
     private func translate(pageID: UUID, progress: @escaping PagePipelineProgress) async throws {
@@ -523,6 +1008,15 @@ actor MCPWorkflowService {
             throw MCPServiceError.pageNotFound
         }
         guard !pages[index].regions.isEmpty else { throw MCPServiceError.maskRequired }
+        if pages[index].regions.contains(where: { !$0.ocrTextRefined }) {
+            pages[index].regions = try await pipeline.refineOCRText(
+                page: pages[index],
+                regions: pages[index].regions,
+                options: options,
+                progress: progress
+            )
+            try await persistStringTable(pageID: pageID)
+        }
         let translated = try await pipeline.translate(
             page: pages[index],
             regions: pages[index].regions,
@@ -543,6 +1037,7 @@ actor MCPWorkflowService {
         }
         guard let outputDirectoryURL else { throw MCPServiceError.outputDirectoryRequired }
         let paths = try pathResolver.paths(
+            sourceURL: pages[index].sourceURL,
             relativeSourcePath: pages[index].relativeSourcePath ?? pages[index].sourceURL.lastPathComponent,
             outputDirectoryURL: outputDirectoryURL
         )
@@ -556,6 +1051,7 @@ actor MCPWorkflowService {
             outputURL: paths.outputURL,
             progress: progress
         )
+        pages[index].regions = result.regions
         pages[index].maskURL = result.maskURL
         pages[index].backgroundURL = result.backgroundURL
         pages[index].outputURL = result.outputURL
@@ -579,6 +1075,15 @@ actor MCPWorkflowService {
         try await persistStringTable(pageID: pageID)
     }
 
+    private static func isDuplicate(_ candidate: NormalizedRect, of existing: NormalizedRect) -> Bool {
+        let overlap = candidate.intersection(with: existing)
+        let overlapArea = overlap.width * overlap.height
+        guard overlapArea > 0 else { return false }
+        let candidateArea = max(candidate.width * candidate.height, .leastNonzeroMagnitude)
+        let existingArea = max(existing.width * existing.height, .leastNonzeroMagnitude)
+        return overlapArea / candidateArea >= 0.5 && overlapArea / existingArea >= 0.5
+    }
+
     private func persistStringTable(pageID: UUID) async throws {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else {
             throw MCPServiceError.pageNotFound
@@ -590,14 +1095,7 @@ actor MCPWorkflowService {
     }
 
     private func stringTableURL(for page: ComicPage) throws -> URL {
-        let root = outputDirectoryURL
-            ?? workspaceRoot
-                .appendingPathComponent(workspaceID?.uuidString ?? "Unassigned", isDirectory: true)
-                .appendingPathComponent("StringTables", isDirectory: true)
-        return try pathResolver.paths(
-            relativeSourcePath: page.relativeSourcePath ?? page.sourceURL.lastPathComponent,
-            outputDirectoryURL: root
-        ).stringTableURL
+        pathResolver.stringTableURL(for: page.sourceURL)
     }
 
     private func resolvePageIDs(_ requested: [UUID]?) throws -> [UUID] {
@@ -618,7 +1116,10 @@ actor MCPWorkflowService {
         workspaceID = context.id
         sourceDirectoryURL = context.sourceDirectoryURL
         outputDirectoryURL = context.outputDirectoryURL
-        options = context.options
+        var restoredOptions = context.options
+        restoredOptions.useImageToImageRestoration = false
+        options = restoredOptions
+        regionSource = context.regionSource
         glossary = context.glossary
         pages = context.pages
     }
@@ -633,7 +1134,8 @@ actor MCPWorkflowService {
             outputDirectoryURL: outputDirectoryURL,
             options: options,
             glossary: glossary,
-            pages: pages
+            pages: pages,
+            regionSource: regionSource
         )
     }
 
@@ -696,7 +1198,7 @@ enum MCPServiceError: LocalizedError {
     case regionNotFound
     case glossaryEntryNotFound
     case maskRequired
-    case textModelRequired
+    case agentTranslationRequired
     case outputDirectoryRequired
     case outputInsideSource
     case outputWouldOverwriteSource
@@ -711,7 +1213,8 @@ enum MCPServiceError: LocalizedError {
         case .regionNotFound: "找不到指定的 region_id。"
         case .glossaryEntryNotFound: "找不到指定的 glossary entry_id。"
         case .maskRequired: "翻譯前必須先執行文字與遮罩偵測。"
-        case .textModelRequired: "翻譯前必須先載入 imageToText 模型。"
+        case .agentTranslationRequired:
+            "MCP 為純 Agent 模式，不會呼叫內建圖生文模型翻譯。請讀取頁面原圖後，以 region.update 的 translated_text 寫入譯文，再執行 page.compose。"
         case .outputDirectoryRequired: "合成前必須設定輸出目錄。"
         case .outputInsideSource: "輸出目錄不可等於來源目錄或位於來源目錄內。"
         case .outputWouldOverwriteSource: "輸出路徑會覆寫來源圖片。"

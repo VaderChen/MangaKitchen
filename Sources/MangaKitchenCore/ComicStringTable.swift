@@ -50,22 +50,40 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     public var order: Int
     public var bounds: NormalizedRect
+    public var bubbleBounds: NormalizedRect?
+    public var rawSourceText: String?
     public var sourceText: String
+    public var ocrTextRefined: Bool
     public var translatedText: String
+    public var translationAnchor: NormalizedPoint?
+    public var translationBounds: NormalizedRect?
     public var confidence: Double
     public var style: DialogueStyle
     public var automaticMaskEnabled: Bool
+    public var maskPolygons: [[NormalizedPoint]]?
+    public var maskRefinementApplied: Bool
+    public var maskCoverageRatio: Double?
+    public var maskCoverageComplete: Bool
     public var maskStrokes: [MaskStroke]
 
     public init(order: Int, region: DialogueRegion) {
         id = region.id
         self.order = order
         bounds = region.bounds
+        bubbleBounds = region.bubbleBounds
+        rawSourceText = region.rawSourceText
         sourceText = region.sourceText
+        ocrTextRefined = region.ocrTextRefined
         translatedText = region.translatedText
+        translationAnchor = region.translationAnchor
+        translationBounds = region.translationBounds
         confidence = region.confidence
         style = region.style
         automaticMaskEnabled = region.automaticMaskEnabled
+        maskPolygons = region.maskPolygons.isEmpty ? nil : region.maskPolygons
+        maskRefinementApplied = region.maskRefinementApplied
+        maskCoverageRatio = region.maskCoverageRatio
+        maskCoverageComplete = region.maskCoverageComplete
         maskStrokes = region.maskStrokes
     }
 
@@ -73,12 +91,85 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         DialogueRegion(
             id: id,
             bounds: bounds,
+            bubbleBounds: bubbleBounds,
+            rawSourceText: rawSourceText,
             sourceText: sourceText,
+            ocrTextRefined: ocrTextRefined,
             translatedText: translatedText,
+            translationAnchor: translationAnchor,
+            translationBounds: translationBounds,
             confidence: confidence,
             style: style,
             automaticMaskEnabled: automaticMaskEnabled,
+            maskPolygons: maskPolygons ?? [],
+            maskRefinementApplied: maskRefinementApplied,
+            maskCoverageRatio: maskCoverageRatio,
+            maskCoverageComplete: maskCoverageComplete,
             maskStrokes: maskStrokes
         )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case order
+        case bounds
+        case bubbleBounds
+        case rawSourceText
+        case sourceText
+        case ocrTextRefined
+        case translatedText
+        case translationAnchor
+        case translationBounds
+        case confidence
+        case style
+        case automaticMaskEnabled
+        case maskPolygons
+        case maskRefinementApplied
+        case maskCoverageRatio
+        case maskCoverageComplete
+        case maskStrokes
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        order = try values.decode(Int.self, forKey: .order)
+        bounds = try values.decode(NormalizedRect.self, forKey: .bounds)
+        bubbleBounds = try values.decodeIfPresent(NormalizedRect.self, forKey: .bubbleBounds)
+        rawSourceText = try values.decodeIfPresent(String.self, forKey: .rawSourceText)
+        sourceText = try values.decode(String.self, forKey: .sourceText)
+        ocrTextRefined = try values.decodeIfPresent(Bool.self, forKey: .ocrTextRefined) ?? false
+        translatedText = try values.decode(String.self, forKey: .translatedText)
+        translationAnchor = try values.decodeIfPresent(
+            NormalizedPoint.self,
+            forKey: .translationAnchor
+        )?.clamped()
+        translationBounds = try values.decodeIfPresent(
+            NormalizedRect.self,
+            forKey: .translationBounds
+        )?.clamped()
+        confidence = try values.decode(Double.self, forKey: .confidence)
+        style = try values.decode(DialogueStyle.self, forKey: .style)
+        automaticMaskEnabled = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .automaticMaskEnabled
+        ) ?? true
+        maskPolygons = try values.decodeIfPresent(
+            [[NormalizedPoint]].self,
+            forKey: .maskPolygons
+        )
+        maskRefinementApplied = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .maskRefinementApplied
+        ) ?? false
+        maskCoverageRatio = try values.decodeIfPresent(
+            Double.self,
+            forKey: .maskCoverageRatio
+        ).map { min(max($0, 0), 1) }
+        maskCoverageComplete = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .maskCoverageComplete
+        ) ?? false
+        maskStrokes = try values.decodeIfPresent([MaskStroke].self, forKey: .maskStrokes) ?? []
     }
 }

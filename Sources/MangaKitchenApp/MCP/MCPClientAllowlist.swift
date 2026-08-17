@@ -88,3 +88,25 @@ struct MCPClientAllowlist: Sendable {
         return nil
     }
 }
+
+/// 三態欄位更新：省略代表不變，明確 null 代表清除，帶值代表設定。
+/// 用於 nil 本身就是有效狀態的欄位，例如 bubbleBounds。
+enum MCPFieldUpdate<Value> {
+    case unchanged
+    case clear
+    case set(Value)
+
+    /// 套用到既有值上。
+    func applied(to current: Value?) -> Value? {
+        switch self {
+        case .unchanged: current
+        case .clear: nil
+        case let .set(value): value
+        }
+    }
+
+    var isChange: Bool {
+        if case .unchanged = self { return false }
+        return true
+    }
+}

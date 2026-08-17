@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import MangaKitchenCore
 
@@ -9,33 +10,73 @@ struct WebPage: Encodable {
     var pixelHeight: Int
     var sourcePreviewURL: String
     var maskPreviewURL: String?
+    var maskRevision: TimeInterval?
+    var maskAppliedPreviewURL: String?
+    var translationPreviewURL: String?
     var outputPreviewURL: String?
     var relativeSourcePath: String?
     var stringTablePath: String?
     var regions: [DialogueRegion]
+    var maskRedoRegionIDs: [UUID]
     var stage: PageProcessingStage
     var progress: Double
+    var processingActivity: PageProcessingActivity?
     var errorMessage: String?
 
-    init(page: ComicPage) {
+    init(
+        page: ComicPage,
+        maskRedoRegionIDs: [UUID] = [],
+        processingActivity: PageProcessingActivity? = nil
+    ) {
+        let maskURL = Self.existingFileURL(page.maskURL)
+        let backgroundURL = Self.existingFileURL(page.backgroundURL)
+        let translationPreviewFileURL = Self.existingFileURL(page.translationPreviewURL)
+        let outputURL = Self.existingFileURL(page.outputURL)
         id = page.id
         index = page.index
         title = page.title
         pixelWidth = page.pixelWidth
         pixelHeight = page.pixelHeight
         sourcePreviewURL = "mangakitchen-asset://\(page.id.uuidString.lowercased())/source"
-        maskPreviewURL = page.maskURL == nil
+        maskPreviewURL = maskURL == nil
             ? nil
             : "mangakitchen-asset://\(page.id.uuidString.lowercased())/mask"
-        outputPreviewURL = page.outputURL == nil
+        maskRevision = Self.modificationTimestamp(for: maskURL)
+        maskAppliedPreviewURL = backgroundURL == nil
+            ? nil
+            : "mangakitchen-asset://\(page.id.uuidString.lowercased())/background"
+        translationPreviewURL = translationPreviewFileURL.map {
+            let revision = Self.modificationTimestamp(for: $0) ?? 0
+            return "mangakitchen-asset://\(page.id.uuidString.lowercased())/translation-preview?updated=\(revision)"
+        }
+        outputPreviewURL = outputURL == nil
             ? nil
             : "mangakitchen-asset://\(page.id.uuidString.lowercased())/output"
         relativeSourcePath = page.relativeSourcePath
         stringTablePath = page.stringTableURL?.path
         regions = page.regions
+        self.maskRedoRegionIDs = maskRedoRegionIDs
         stage = page.stage
         progress = page.progress
+        self.processingActivity = processingActivity
         errorMessage = page.errorMessage
+    }
+
+    private static func existingFileURL(_ url: URL?) -> URL? {
+        guard let url else { return nil }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return nil }
+        return url
+    }
+
+    private static func modificationTimestamp(for url: URL?) -> TimeInterval? {
+        guard let url,
+              let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+              let date = values.contentModificationDate else {
+            return nil
+        }
+        return date.timeIntervalSince1970
     }
 }
 
@@ -71,6 +112,7 @@ struct WebBatchJob: Encodable {
     var projectName: String
     var operation: BatchOperation
     var status: BatchJobStatus
+    var pageIDs: [UUID]
     var pageCount: Int
     var completedCount: Int
     var failureCount: Int
@@ -86,6 +128,7 @@ struct WebBatchJob: Encodable {
         projectName = job.projectName
         operation = job.operation
         status = job.status
+        pageIDs = job.pageIDs
         pageCount = job.pageIDs.count
         completedCount = job.completedPageIDs.count
         failureCount = job.failures.count
@@ -119,21 +162,39 @@ struct WebGlossaryEntry: Encodable {
 }
 
 struct WebGlobalSettings: Encodable {
+    struct ModelOption: Encodable {
+        var id: String
+        var displayName: String
+        var recommended: Bool
+        var installed: Bool
+    }
+
     var interfaceLanguage: String
     var colorScheme: String
     var dataDirectoryPath: String?
     var configuredDataDirectoryPath: String?
     var activeDataDirectoryPath: String?
     var dataDirectoryRestartRequired: Bool
+    var imageCompositingBackend: ImageCompositingBackend
     var imageToTextModelPath: String?
+    var imageToTextModelDownloadDirectoryPath: String?
+    var imageToTextModelVariant: String
+    var imageToTextModelOptions: [ModelOption]
+    var imageToTextModelInstalled: Bool
+    var modelDownloadState: ModelDownloadState?
     var imageToImageModelPath: String?
     var mcpEnabled: Bool
     var mcpPort: Int
+    var mcpEndpointURL: String?
     var mcpAllowedClients: [String]
     var appVersion: String
 
     @MainActor
-    init(preferences: AppPreferences, store: AppStore) {
+    init(
+        preferences: AppPreferences,
+        store: AppStore,
+        mcpController: MCPServiceController
+    ) {
         interfaceLanguage = preferences.interfaceLanguage
         colorScheme = preferences.colorScheme
         dataDirectoryPath = preferences.dataDirectoryPath
@@ -145,10 +206,38 @@ struct WebGlobalSettings: Encodable {
             .appendingPathComponent(ApplicationDirectories.currentName, isDirectory: true)
             .standardizedFileURL.path
         dataDirectoryRestartRequired = configuredDataDirectoryPath != store.applicationDataDirectoryPath
+        imageCompositingBackend = preferences.resolvedImageCompositingBackend
         imageToTextModelPath = preferences.imageToTextModelPath
+        imageToTextModelDownloadDirectoryPath = preferences.imageToTextModelDownloadDirectoryPath
+        let selectedImageToTextModelVariant = preferences.resolvedImageToTextModelVariant
+        imageToTextModelVariant = selectedImageToTextModelVariant
+        let modelStorageDirectoryURL = preferences.imageToTextModelDownloadDirectoryPath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        }
+        imageToTextModelOptions = DownloadableModelCatalog.imageToTextModels.map { model in
+            ModelOption(
+                id: model.id,
+                displayName: model.displayName,
+                recommended: model.recommended,
+                installed: modelStorageDirectoryURL.flatMap {
+                    DownloadableModelCatalog.installedModelDirectory(
+                        storageDirectoryURL: $0,
+                        model: model
+                    )
+                } != nil
+            )
+        }
+        imageToTextModelInstalled = imageToTextModelOptions.first {
+            $0.id == selectedImageToTextModelVariant
+        }?.installed ?? false
+        modelDownloadState = store.modelDownloadState
         imageToImageModelPath = preferences.imageToImageModelPath
         mcpEnabled = preferences.mcpEnabled
         mcpPort = preferences.mcpPort
+        mcpEndpointURL = mcpController.enabled
+            ? mcpController.endpointURL?.absoluteString
+                ?? "http://127.0.0.1:\(mcpController.port)/mcp"
+            : nil
         mcpAllowedClients = preferences.mcpAllowedClients
         appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             ?? "0.1.0"
@@ -165,6 +254,7 @@ struct WebAppState: Encodable {
     var selectedPageID: UUID?
     var selectedPageIDs: [UUID]
     var options: ProcessingOptions
+    var availableFontFamilies: [String]
     var loadedModels: [LoadedModelInfo]
     var glossary: [WebGlossaryEntry]
     var batchJobs: [WebBatchJob]
@@ -175,15 +265,32 @@ struct WebAppState: Encodable {
     var statusMessage: String?
 
     @MainActor
-    init(store: AppStore, preferences: AppPreferences) {
-        globalSettings = WebGlobalSettings(preferences: preferences, store: store)
+    init(
+        store: AppStore,
+        preferences: AppPreferences,
+        mcpController: MCPServiceController
+    ) {
+        globalSettings = WebGlobalSettings(
+            preferences: preferences,
+            store: store,
+            mcpController: mcpController
+        )
         projects = store.projects.map(WebProject.init)
         activeProjectID = store.activeProjectID
         activeProjectName = store.activeProjectName
-        pages = store.pages.map(WebPage.init)
+        pages = store.pages.map {
+            WebPage(
+                page: $0,
+                maskRedoRegionIDs: store.maskRedoRegionIDs(pageID: $0.id),
+                processingActivity: store.processingActivities[$0.id]
+            )
+        }
         selectedPageID = store.selectedPageID
         selectedPageIDs = store.pages.lazy.map(\.id).filter(store.selectedPageIDs.contains)
         options = store.options
+        availableFontFamilies = NSFontManager.shared.availableFontFamilies
+            .filter { !$0.hasPrefix(".") }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         loadedModels = store.loadedModels
         glossary = store.glossary.entries.map {
             WebGlossaryEntry(entry: $0, targetLanguageCode: store.options.targetLanguageCode)

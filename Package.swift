@@ -18,6 +18,10 @@ let package = Package(
             exact: "2.30.6"
         ),
         .package(
+            url: "https://github.com/huggingface/swift-transformers",
+            exact: "1.1.9"
+        ),
+        .package(
             url: "https://github.com/modelcontextprotocol/swift-sdk.git",
             exact: "0.12.1"
         ),
@@ -41,10 +45,14 @@ let package = Package(
             dependencies: [
                 "MangaKitchenCore",
                 "MangaKitchenRuntime",
+                .product(name: "Hub", package: "swift-transformers"),
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio")
+            ],
+            exclude: [
+                "Resources/AppIcon"
             ],
             resources: [
                 .copy("Resources/WebUI")

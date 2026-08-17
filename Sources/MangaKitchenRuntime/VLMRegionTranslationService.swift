@@ -2,6 +2,8 @@ import Foundation
 import MangaKitchenCore
 
 public actor VLMRegionTranslationService: RegionTranslating {
+    private static let maximumRegionsPerRequest = 12
+
     private struct PromptRegion: Encodable {
         var id: UUID
         var sourceText: String
@@ -30,39 +32,57 @@ public actor VLMRegionTranslationService: RegionTranslating {
             return []
         }
 
-        let payload = regions.map { PromptRegion(id: $0.id, sourceText: $0.sourceText) }
-        let data = try JSONEncoder().encode(payload)
-        guard let regionJSON = String(data: data, encoding: .utf8) else {
-            throw TranslationRuntimeError.promptEncodingFailed
-        }
         let glossaryData = try JSONEncoder().encode(glossaryTerms)
         guard let glossaryJSON = String(data: glossaryData, encoding: .utf8) else {
             throw TranslationRuntimeError.promptEncodingFailed
         }
 
-        let prompt = Self.prompt(
-            targetLanguageCode: targetLanguageCode,
-            glossaryJSON: glossaryJSON,
-            regionsJSON: regionJSON
-        )
-        let response = try await model.generateText(
-            imageURL: pageURL,
-            prompt: prompt,
-            progress: progress
-        )
-        let translations = try Self.decodeTranslations(response)
-        let indexed = Dictionary(uniqueKeysWithValues: translations.map { ($0.id, $0.translatedText) })
+        let batches = stride(from: 0, to: regions.count, by: Self.maximumRegionsPerRequest).map {
+            Array(regions[$0..<min($0 + Self.maximumRegionsPerRequest, regions.count)])
+        }
+        let batchCount = max(1, batches.count)
+        var indexed: [UUID: String] = [:]
 
-        guard regions.contains(where: { indexed[$0.id]?.isEmpty == false }) else {
-            throw TranslationRuntimeError.noMatchingTranslation
+        for (index, batch) in batches.enumerated() {
+            try Task.checkCancellation()
+            let payload = batch.map { PromptRegion(id: $0.id, sourceText: $0.sourceText) }
+            let data = try JSONEncoder().encode(payload)
+            guard let regionJSON = String(data: data, encoding: .utf8) else {
+                throw TranslationRuntimeError.promptEncodingFailed
+            }
+            let prompt = Self.prompt(
+                targetLanguageCode: targetLanguageCode,
+                glossaryJSON: glossaryJSON,
+                regionsJSON: regionJSON
+            )
+            let batchIndex = index
+            let response = try await model.generateText(
+                imageURL: pageURL,
+                prompt: prompt,
+                maximumOutputTokens: 1_536,
+                progress: { value in
+                    let local = min(max(value, 0), 1)
+                    progress((Double(batchIndex) + local) / Double(batchCount))
+                }
+            )
+            for item in try Self.decodeTranslations(response) {
+                let text = item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { indexed[item.id] = text }
+            }
+            progress(Double(index + 1) / Double(batchCount))
         }
 
+        let missingCount = regions.reduce(into: 0) { count, region in
+            if indexed[region.id] == nil { count += 1 }
+        }
+        guard missingCount == 0 else {
+            throw TranslationRuntimeError.missingTranslations(missingCount)
+        }
+
+        progress(1)
         return regions.map { region in
             var translated = region
-            if let text = indexed[region.id]?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !text.isEmpty {
-                translated.translatedText = text
-            }
+            translated.translatedText = indexed[region.id] ?? region.translatedText
             return translated
         }
     }
@@ -75,6 +95,7 @@ public actor VLMRegionTranslationService: RegionTranslating {
         """
         You are translating speech balloons, captions, and sound effects on one comic page.
         Translate every sourceText into the language identified by BCP-47 code "\(targetLanguageCode)".
+        Each sourceText has already been OCR-proofread. Do not re-transcribe or rewrite the source text.
         Use the image only as context for speaker, tone, gender, ambiguity, and sound effects.
         Keep names and terminology consistent. Be concise enough to fit the original region.
         The terminology array below is authoritative. Whenever a sourceTerm occurs in a sourceText,
@@ -114,12 +135,14 @@ public enum TranslationRuntimeError: LocalizedError, Sendable {
     case promptEncodingFailed
     case invalidModelResponse
     case noMatchingTranslation
+    case missingTranslations(Int)
 
     public var errorDescription: String? {
         switch self {
         case .promptEncodingFailed: "無法建立漫畫翻譯 Prompt。"
         case .invalidModelResponse: "圖生文模型沒有回傳指定的翻譯 JSON 格式。"
         case .noMatchingTranslation: "模型回傳內容未包含任何相符的對話區域。"
+        case let .missingTranslations(count): "模型缺少 \(count) 個對話區域的翻譯，未寫入不完整結果。"
         }
     }
 }

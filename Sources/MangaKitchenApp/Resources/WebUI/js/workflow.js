@@ -19,8 +19,10 @@ export const workflow = Object.freeze({
   createProject: () => invoke("chooseSourceDirectory"),
   chooseSourceDirectory: () => invoke("chooseSourceDirectory"),
   switchProject: (projectID) => invoke("switchProject", { projectID }),
+  deleteProject: (projectID) => invoke("deleteProject", { projectID }),
   renameProject: (name) => invoke("renameProject", { name }),
   rescanSourceDirectory: () => invoke("rescanSourceDirectory"),
+  resetPages: (pageIDs) => invoke("resetPages", { pageIDs }),
   chooseOutputDirectory: () => invoke("chooseOutputDirectory"),
   chooseModel: () => invoke("chooseModel"),
 
@@ -34,6 +36,7 @@ export const workflow = Object.freeze({
   runFullPage: (scope = "selected") =>
     invoke(scope === "all" ? "processAll" : "processSelected"),
   cancel: () => invoke("cancelProcessing"),
+  cancelModelDownload: () => invoke("cancelModelDownload"),
   retryFailedBatchJob: (jobID) => invoke("retryFailedBatchJob", { jobID }),
   clearFinishedBatchJobs: () => invoke("clearFinishedBatchJobs"),
 
@@ -44,10 +47,14 @@ export const workflow = Object.freeze({
   clearPageSelection: () => invoke("clearPageSelection"),
   createMaskRegion: (pageID, bounds) =>
     invoke("createMaskRegion", { pageID, bounds }),
+  createRegion: (pageID, bounds, changes = {}) =>
+    invoke("createRegion", { pageID, bounds, ...changes }),
   appendMaskStroke: (pageID, regionID, mode, diameter, points) =>
     invoke("appendMaskStroke", { pageID, regionID, mode, diameter, points }),
   undoMaskStroke: (pageID, regionID) =>
     invoke("undoMaskStroke", { pageID, regionID }),
+  redoMaskStroke: (pageID, regionID) =>
+    invoke("redoMaskStroke", { pageID, regionID }),
   removeRegion: (pageID, regionID) =>
     invoke("removeRegion", { pageID, regionID }),
   updateRegion: (pageID, regionID, changes) =>

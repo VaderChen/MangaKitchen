@@ -9,6 +9,7 @@ import MangaKitchenRuntime
 final class HybridBridgeController: NSObject, ObservableObject {
     let preferences: AppPreferencesController
     let store: AppStore
+    let mcpController: MCPServiceController
     let assetSchemeHandler = AssetSchemeHandler()
     let webUISchemeHandler = WebUISchemeHandler()
     @Published private(set) var interfaceLanguageCode = NativeLocalization.automaticLanguageCode
@@ -16,14 +17,20 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private weak var webView: WKWebView?
     private var storeCancellable: AnyCancellable?
     private var preferencesCancellable: AnyCancellable?
+    private var mcpCancellable: AnyCancellable?
     private var pendingPush: Task<Void, Never>?
     private var pageReady = false
 
-    init(preferences: AppPreferencesController) {
+    init(
+        preferences: AppPreferencesController,
+        mcpController: MCPServiceController
+    ) {
         self.preferences = preferences
+        self.mcpController = mcpController
         let settings = preferences.settings
         store = AppStore(
             dataDirectoryPath: settings.dataDirectoryPath,
+            imageCompositingBackend: settings.resolvedImageCompositingBackend,
             imageToTextModelPath: settings.imageToTextModelPath,
             imageToImageModelPath: settings.imageToImageModelPath
         )
@@ -34,6 +41,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
             }
         }
         preferencesCancellable = preferences.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.scheduleStatePush()
+            }
+        }
+        mcpCancellable = mcpController.objectWillChange.sink { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.scheduleStatePush()
             }
@@ -50,7 +62,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
         do {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(WebAppState(store: store, preferences: preferences.settings))
+            let data = try encoder.encode(WebAppState(
+                store: store,
+                preferences: preferences.settings,
+                mcpController: mcpController
+            ))
             guard let json = String(data: data, encoding: .utf8) else { return }
             webView.evaluateJavaScript("window.MangaKitchenNative?.receiveState(\(json));")
         } catch {
@@ -62,11 +78,13 @@ final class HybridBridgeController: NSObject, ObservableObject {
     }
 
     private func scheduleStatePush() {
-        pendingPush?.cancel()
+        guard pendingPush == nil else { return }
         pendingPush = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(35))
+            try? await Task.sleep(for: .milliseconds(80))
+            guard let self else { return }
+            self.pendingPush = nil
             guard !Task.isCancelled else { return }
-            self?.pushState()
+            self.pushState()
         }
     }
 
@@ -95,6 +113,14 @@ final class HybridBridgeController: NSObject, ObservableObject {
             )
         case "choosePreferredModelDirectory":
             return try choosePreferredModelDirectory(params)
+        case "chooseModelDownloadDirectory":
+            return try chooseModelDownloadDirectory(params)
+        case "downloadPreferredModel":
+            try downloadPreferredModel(params)
+            return nil
+        case "deleteInstalledModel":
+            try deleteInstalledModel(params)
+            return nil
         case "importPages", "chooseSourceDirectory":
             chooseSourceDirectory()
             return nil
@@ -103,6 +129,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
                 throw BridgeError.invalidParameters
             }
             store.activateProject(projectID)
+            return nil
+        case "deleteProject":
+            guard let projectID = uuid(params["projectID"]) else {
+                throw BridgeError.invalidParameters
+            }
+            store.deleteProject(projectID)
             return nil
         case "renameProject":
             guard let name = params["name"] as? String else {
@@ -113,9 +145,16 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "rescanSourceDirectory":
             store.rescanSourceDirectory()
             return nil
-        case "chooseOutputDirectory":
-            chooseOutputDirectory()
+        case "resetPages":
+            guard let rawPageIDs = params["pageIDs"] as? [String] else {
+                throw BridgeError.invalidParameters
+            }
+            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
+            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
+            store.resetPages(pageIDs)
             return nil
+        case "chooseOutputDirectory":
+            return chooseOutputDirectory()
         case "chooseModel":
             chooseModelDirectory()
             return nil
@@ -186,8 +225,8 @@ final class HybridBridgeController: NSObject, ObservableObject {
             }
             let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
             guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
-            store.enqueueBatch(operation: operation, pageIDs: pageIDs)
-            return nil
+            let jobID = store.enqueueBatch(operation: operation, pageIDs: pageIDs)
+            return jobID.map { ["jobID": $0.uuidString] } ?? [:]
         case "cancelProcessing":
             store.cancelProcessing()
             return nil
@@ -198,13 +237,21 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "clearFinishedBatchJobs":
             store.clearFinishedBatchJobs()
             return nil
-        case "createMaskRegion":
-            return try createMaskRegion(params)
+        case "cancelModelDownload":
+            store.cancelModelDownload()
+            return nil
+        case "createRegion", "createMaskRegion":
+            return try createRegion(params)
+        case "duplicateRegion":
+            return try duplicateRegion(params)
         case "appendMaskStroke":
             try appendMaskStroke(params)
             return nil
         case "undoMaskStroke":
             try undoMaskStroke(params)
+            return nil
+        case "redoMaskStroke":
+            try redoMaskStroke(params)
             return nil
         case "removeRegion":
             try removeRegion(params)
@@ -234,7 +281,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         store.openProject(from: url)
     }
 
-    private func chooseOutputDirectory() {
+    private func chooseOutputDirectory() -> [String: Any]? {
         let panel = NSOpenPanel()
         panel.title = localized("outputPanelTitle")
         panel.prompt = localized("choose")
@@ -242,8 +289,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        store.setOutputDirectory(url)
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        let selectedURL = url.standardizedFileURL
+        store.setOutputDirectory(selectedURL)
+        guard store.outputDirectoryURL == selectedURL else { return nil }
+        return ["path": selectedURL.path]
     }
 
     private func chooseModelDirectory() {
@@ -287,11 +337,102 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return selected
     }
 
+    private func chooseModelDownloadDirectory(_ params: [String: Any]) throws -> [String: Any]? {
+        guard let rawCapability = params["capability"] as? String,
+              let capability = ModelCapability(rawValue: rawCapability),
+              capability == .imageToText else {
+            throw BridgeError.invalidParameters
+        }
+        guard let selected = chooseDirectory(
+            title: localized("imageToTextModelDownloadDirectoryPanelTitle"),
+            prompt: localized("choose")
+        ), let path = selected["path"] as? String else { return nil }
+        let selectedURL = URL(fileURLWithPath: path).standardizedFileURL
+        if let model = DownloadableModelCatalog.model(
+            matching: selectedURL,
+            capability: capability
+        ), DownloadableModelCatalog.isCompleteModelDirectory(selectedURL) {
+            return [
+                "path": selectedURL.deletingLastPathComponent().path,
+                "variant": model.id,
+            ]
+        }
+        return selected
+    }
+
+    private func downloadPreferredModel(_ params: [String: Any]) throws {
+        guard let rawCapability = params["capability"] as? String,
+              let capability = ModelCapability(rawValue: rawCapability),
+              capability == .imageToText,
+              let variantID = params["variantID"] as? String,
+              let model = DownloadableModelCatalog.model(id: variantID, capability: capability),
+              let directoryPath = preferences.settings.imageToTextModelDownloadDirectoryPath else {
+            throw BridgeError.invalidParameters
+        }
+        let storageDirectoryURL = URL(fileURLWithPath: directoryPath).standardizedFileURL
+        store.downloadModel(model, to: storageDirectoryURL) { [weak self] result in
+            guard let self, case let .success(modelDirectoryURL) = result else { return }
+            let previous = preferences.settings
+            var updated = previous
+            updated.imageToTextModelDownloadDirectoryPath = storageDirectoryURL.path
+            updated.imageToTextModelVariant = model.id
+            updated.imageToTextModelPath = modelDirectoryURL.path
+            preferences.replace(with: updated)
+            let current = preferences.settings
+            if previous.imageToTextModelPath != current.imageToTextModelPath {
+                store.applyPreferredModels(
+                    imageToTextPath: current.imageToTextModelPath,
+                    imageToImagePath: current.imageToImageModelPath
+                )
+            }
+        }
+    }
+
+    private func deleteInstalledModel(_ params: [String: Any]) throws {
+        guard let rawCapability = params["capability"] as? String,
+              let capability = ModelCapability(rawValue: rawCapability),
+              capability == .imageToText,
+              let variantID = params["variantID"] as? String,
+              let model = DownloadableModelCatalog.model(id: variantID, capability: capability),
+              let directoryPath = preferences.settings.imageToTextModelDownloadDirectoryPath else {
+            throw BridgeError.invalidParameters
+        }
+        let storageDirectoryURL = URL(fileURLWithPath: directoryPath).standardizedFileURL
+        try store.deleteInstalledModel(model, from: storageDirectoryURL)
+
+        let previous = preferences.settings
+        var updated = previous
+        let deletedDirectoryURL = DownloadableModelCatalog.modelDirectory(
+            storageDirectoryURL: storageDirectoryURL,
+            model: model
+        )
+        if previous.imageToTextModelPath.map({
+            URL(fileURLWithPath: $0).standardizedFileURL == deletedDirectoryURL
+        }) == true {
+            updated.imageToTextModelPath = nil
+        }
+        preferences.replace(with: updated)
+        let current = preferences.settings
+        if previous.imageToTextModelPath != current.imageToTextModelPath {
+            store.applyPreferredModels(
+                imageToTextPath: current.imageToTextModelPath,
+                imageToImagePath: current.imageToImageModelPath
+            )
+        }
+    }
+
     private func updateGlobalSettings(_ params: [String: Any]) throws {
         guard let interfaceLanguage = params["interfaceLanguage"] as? String,
               AppPreferences.supportedInterfaceLanguages.contains(interfaceLanguage),
               let colorScheme = params["colorScheme"] as? String,
               AppPreferences.supportedColorSchemes.contains(colorScheme),
+              let imageCompositingRaw = params["imageCompositingBackend"] as? String,
+              let imageCompositingBackend = ImageCompositingBackend(rawValue: imageCompositingRaw),
+              let imageToTextModelVariant = params["imageToTextModelVariant"] as? String,
+              DownloadableModelCatalog.model(
+                id: imageToTextModelVariant,
+                capability: .imageToText
+              ) != nil,
               let mcpEnabled = params["mcpEnabled"] as? Bool,
               let mcpPort = integer(params["mcpPort"]),
               (1...65_535).contains(mcpPort),
@@ -304,7 +445,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
         updated.interfaceLanguage = interfaceLanguage
         updated.colorScheme = colorScheme
         updated.dataDirectoryPath = params["dataDirectoryPath"] as? String
+        updated.imageCompositingBackend = imageCompositingBackend
         updated.imageToTextModelPath = params["imageToTextModelPath"] as? String
+        updated.imageToTextModelDownloadDirectoryPath = params[
+            "imageToTextModelDownloadDirectoryPath"
+        ] as? String
+        updated.imageToTextModelVariant = imageToTextModelVariant
         updated.imageToImageModelPath = params["imageToImageModelPath"] as? String
         updated.mcpEnabled = mcpEnabled
         updated.mcpPort = mcpPort
@@ -312,6 +458,9 @@ final class HybridBridgeController: NSObject, ObservableObject {
         preferences.replace(with: updated)
 
         let current = preferences.settings
+        if previous.resolvedImageCompositingBackend != current.resolvedImageCompositingBackend {
+            store.setImageCompositingBackend(current.resolvedImageCompositingBackend)
+        }
         if previous.imageToTextModelPath != current.imageToTextModelPath
             || previous.imageToImageModelPath != current.imageToImageModelPath {
             store.applyPreferredModels(
@@ -348,9 +497,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         if let amount = double(params["maskExpansion"]), amount.isFinite {
             value.maskExpansion = min(max(amount, 0), 0.75)
         }
-        if let enabled = params["useImageToImageRestoration"] as? Bool {
-            value.useImageToImageRestoration = enabled
-        }
+        value.useImageToImageRestoration = false
         if let preserve = params["preserveUntranslatedRegions"] as? Bool {
             value.preserveUntranslatedRegions = preserve
         }
@@ -375,7 +522,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         ) else {
             throw BridgeError.invalidParameters
         }
-        return ["entryID": entryID.uuidString.lowercased()]
+        return ["entryID": entryID.uuidString]
     }
 
     private func updateRegion(_ params: [String: Any]) throws {
@@ -395,27 +542,49 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
         let direction = (params["writingDirection"] as? String)
             .flatMap(WritingDirection.init(rawValue:))
+        let fontWeight = (params["fontWeight"] as? String)
+            .flatMap(DialogueFontWeight.init(rawValue:))
         store.updateRegion(
             pageID: pageID,
             regionID: regionID,
             sourceText: params["sourceText"] as? String,
             translatedText: params["translatedText"] as? String,
+            translationAnchor: normalizedPoint(params["translationAnchor"]),
+            translationBounds: normalizedRect(params["translationBounds"]),
             bounds: bounds,
+            bubbleBounds: normalizedRect(params["bubbleBounds"]),
+            maskPolygons: normalizedPolygons(params["maskPolygons"]),
             fontName: params["fontName"] as? String,
             fontSize: double(params["fontSize"]),
+            fontWeight: fontWeight,
             useAutomaticFontSize: params["useAutomaticFontSize"] as? Bool,
             writingDirection: direction,
             automaticMaskEnabled: params["automaticMaskEnabled"] as? Bool
         )
     }
 
-    private func createMaskRegion(_ params: [String: Any]) throws -> [String: Any] {
+    private func createRegion(_ params: [String: Any]) throws -> [String: Any] {
         guard let pageID = uuid(params["pageID"]),
               let bounds = normalizedRect(params["bounds"]),
-              let regionID = store.createRegion(pageID: pageID, bounds: bounds) else {
+              let regionID = store.createRegion(
+                pageID: pageID,
+                bounds: bounds,
+                sourceText: params["sourceText"] as? String ?? "",
+                translatedText: params["translatedText"] as? String ?? "",
+                automaticMaskEnabled: params["automaticMaskEnabled"] as? Bool ?? true
+              ) else {
             throw BridgeError.invalidParameters
         }
-        return ["regionID": regionID.uuidString.lowercased()]
+        return ["regionID": regionID.uuidString]
+    }
+
+    private func duplicateRegion(_ params: [String: Any]) throws -> [String: Any] {
+        guard let pageID = uuid(params["pageID"]),
+              let sourceRegionID = uuid(params["regionID"]),
+              let regionID = store.duplicateRegion(pageID: pageID, regionID: sourceRegionID) else {
+            throw BridgeError.invalidParameters
+        }
+        return ["regionID": regionID.uuidString]
     }
 
     private func appendMaskStroke(_ params: [String: Any]) throws {
@@ -450,6 +619,14 @@ final class HybridBridgeController: NSObject, ObservableObject {
             throw BridgeError.invalidParameters
         }
         store.undoMaskStroke(pageID: pageID, regionID: regionID)
+    }
+
+    private func redoMaskStroke(_ params: [String: Any]) throws {
+        guard let pageID = uuid(params["pageID"]),
+              let regionID = uuid(params["regionID"]) else {
+            throw BridgeError.invalidParameters
+        }
+        store.redoMaskStroke(pageID: pageID, regionID: regionID)
     }
 
     private func removeRegion(_ params: [String: Any]) throws {
@@ -492,6 +669,32 @@ final class HybridBridgeController: NSObject, ObservableObject {
               let height = double(raw["height"]),
               x.isFinite, y.isFinite, width.isFinite, height.isFinite else { return nil }
         return NormalizedRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func normalizedPoint(_ value: Any?) -> NormalizedPoint? {
+        guard let raw = value as? [String: Any],
+              let x = double(raw["x"]),
+              let y = double(raw["y"]),
+              x.isFinite, y.isFinite else { return nil }
+        return NormalizedPoint(x: x, y: y).clamped()
+    }
+
+    private func normalizedPolygons(_ value: Any?) -> [[NormalizedPoint]]? {
+        guard let rawPolygons = value as? [Any] else { return nil }
+        var result: [[NormalizedPoint]] = []
+        for rawPolygon in rawPolygons {
+            guard let rawPoints = rawPolygon as? [Any], rawPoints.count >= 3 else { return nil }
+            var points: [NormalizedPoint] = []
+            for rawPoint in rawPoints {
+                guard let object = rawPoint as? [String: Any],
+                      let x = double(object["x"]),
+                      let y = double(object["y"]),
+                      x.isFinite, y.isFinite else { return nil }
+                points.append(NormalizedPoint(x: x, y: y).clamped())
+            }
+            result.append(points)
+        }
+        return result
     }
 
     private func localized(_ key: String) -> String {

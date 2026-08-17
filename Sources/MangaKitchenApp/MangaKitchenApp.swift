@@ -13,7 +13,7 @@ private final class MangaKitchenAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        false
+        true
     }
 }
 
@@ -42,17 +42,22 @@ private struct MangaKitchenApplication: App {
         if let enabled = configuration.mcpEnabled {
             preferences.setMCPEnabled(enabled)
         }
+        let mcpController = MCPServiceController(
+            enabled: preferences.settings.mcpEnabled,
+            port: configuration.mcpPort ?? preferences.settings.mcpPort,
+            portOverride: configuration.mcpPort,
+            allowedClients: preferences.settings.mcpAllowedClients,
+            dataDirectoryPath: preferences.settings.dataDirectoryPath,
+            imageCompositingBackend: preferences.settings.resolvedImageCompositingBackend
+        )
         _preferences = StateObject(wrappedValue: preferences)
-        _bridge = StateObject(wrappedValue: HybridBridgeController(preferences: preferences))
-        _mcpController = StateObject(
-            wrappedValue: MCPServiceController(
-                enabled: preferences.settings.mcpEnabled,
-                port: configuration.mcpPort ?? preferences.settings.mcpPort,
-                portOverride: configuration.mcpPort,
-                allowedClients: preferences.settings.mcpAllowedClients,
-                dataDirectoryPath: preferences.settings.dataDirectoryPath
+        _bridge = StateObject(
+            wrappedValue: HybridBridgeController(
+                preferences: preferences,
+                mcpController: mcpController
             )
         )
+        _mcpController = StateObject(wrappedValue: mcpController)
         if let launchError {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 let alert = NSAlert()
@@ -78,7 +83,8 @@ private struct MangaKitchenApplication: App {
                     mcpController.configure(
                         enabled: settings.mcpEnabled,
                         port: settings.mcpPort,
-                        allowedClients: settings.mcpAllowedClients
+                        allowedClients: settings.mcpAllowedClients,
+                        imageCompositingBackend: settings.resolvedImageCompositingBackend
                     )
                 }
         }

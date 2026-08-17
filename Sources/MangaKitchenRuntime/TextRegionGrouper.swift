@@ -72,8 +72,10 @@ enum TextRegionGrouper {
         let confidence = group.map(\.confidence).reduce(0, +) / Double(group.count)
         return DialogueRegion(
             bounds: NormalizedRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY),
+            rawSourceText: ordered.map { $0.rawSourceText ?? $0.sourceText }.joined(separator: "\n"),
             sourceText: ordered.map(\.sourceText).joined(separator: "\n"),
-            confidence: confidence
+            confidence: confidence,
+            maskPolygons: group.flatMap(\.maskPolygons)
         )
     }
 

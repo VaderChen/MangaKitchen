@@ -39,8 +39,10 @@ public actor VisionOCRService: PageTextRecognizing {
             ).clamped()
             return DialogueRegion(
                 bounds: topLeftBounds,
+                rawSourceText: text,
                 sourceText: text,
-                confidence: Double(candidate.confidence)
+                confidence: Double(candidate.confidence),
+                automaticMaskEnabled: false
             )
         }
 
