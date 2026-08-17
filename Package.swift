@@ -57,6 +57,10 @@ let package = Package(
             resources: [
                 .copy("Resources/WebUI")
             ]
+        ),
+        .testTarget(
+            name: "MangaKitchenRuntimeTests",
+            dependencies: ["MangaKitchenCore", "MangaKitchenRuntime"]
         )
     ]
 )

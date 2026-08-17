@@ -110,7 +110,7 @@ public struct ProjectGlossary: Codable, Hashable, Sendable {
         entries.removeAll { $0.id == entryID }
     }
 
-    /// 只回傳目標語言有對照，而且本頁 OCR 文字確實出現的詞條。
+    /// 只回傳目標語言有對照，而且本頁來源文字確實出現的詞條。
     public func resolvedTerms(
         for targetLanguageCode: String,
         sourceTexts: [String]

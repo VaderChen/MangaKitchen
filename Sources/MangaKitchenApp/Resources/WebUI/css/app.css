@@ -136,7 +136,8 @@ textarea { resize: vertical; line-height: 1.45; }
   background: var(--panel);
 }
 
-.workflow-steps { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 12px; }
+.workflow-center { min-width: 0; position: relative; display: flex; align-items: center; justify-content: center; }
+.workflow-steps { width: 100%; min-width: 0; display: flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 12px; }
 .workflow-step { display: flex; align-items: center; gap: 6px; border-color: transparent; background: transparent; color: var(--muted); }
 .workflow-step > span:first-child { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--border-soft); font-size: 11px; }
 .workflow-step .step-label { display: inline; }
@@ -256,6 +257,7 @@ textarea { resize: vertical; line-height: 1.45; }
 .translation-primary-tools output { min-width: 42px; color: #f4f4f5; text-align: center; font-variant-numeric: tabular-nums; }
 .translation-primary-tools .translation-weight.active { color: white; border-color: var(--accent); background: var(--accent); }
 #reveal-output { flex: 0 0 auto; margin-left: auto; }
+#reveal-output[hidden] + #workflow-next { margin-left: auto; }
 .mask-tool.active { color: white; border-color: #ff5f57; background: #b83434; box-shadow: 0 0 0 2px rgba(255, 95, 87, .18); }
 .canvas-surface { padding: 18px; }
 .previews { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 16px; max-width: 1400px; margin: 0 auto; }
@@ -284,8 +286,30 @@ figcaption { margin-bottom: 7px; color: #c9cace; font-weight: 600; }
   box-shadow: none;
 }
 .image-stack #mask-drawing-layer { touch-action: none; }
-#page-workspace.mask-mode.mask-brush-tool #mask-drawing-layer { cursor: url("../images/brush-cursor.svg") 3 29, auto; }
-#page-workspace.mask-mode.mask-eraser-tool #mask-drawing-layer { cursor: url("../images/eraser-cursor.svg") 5 27, auto; }
+/* 筆刷游標改用即時 overlay：靜態 SVG 游標無法反映筆刷大小。 */
+#page-workspace.mask-mode.mask-brush-tool #mask-drawing-layer,
+#page-workspace.mask-mode.mask-eraser-tool #mask-drawing-layer { cursor: none; }
+
+/* 必須掛在 <body> 之下：.image-stack 有 transform，被 transform 的祖先會讓
+   position: fixed 改以該祖先為基準，游標就會飛出畫布。 */
+#mask-brush-cursor {
+  position: fixed;
+  z-index: 60;
+  border-radius: 50%;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  box-sizing: border-box;
+}
+/* 畫筆：紅色圓圈 */
+#mask-brush-cursor.brush {
+  border: 2px solid #e23b3b;
+  background: rgba(226, 59, 59, .18);
+}
+/* 橡皮擦：白色圓、黑外框 */
+#mask-brush-cursor.eraser {
+  border: 2px solid #111;
+  background: rgba(255, 255, 255, .85);
+}
 .image-stack #mask-layer[hidden],
 .image-stack #mask-drawing-layer[hidden] { display: none; }
 #page-workspace.mask-mode #source-image-stage { border-color: #d84c4c; box-shadow: inset 0 0 0 1px rgba(216, 76, 76, .35); }
@@ -437,8 +461,30 @@ figcaption { margin-bottom: 7px; color: #c9cace; font-weight: 600; }
 .calculation-dialog-heading h2 { margin: 0; font-size: 17px; }
 .calculation-dialog-heading p { margin: 4px 0 0; color: var(--muted); line-height: 1.4; }
 .calculation-spinner { width: 30px; height: 30px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: output-spin .8s linear infinite; }
+.calculation-spinner[hidden] { display: none; }
 #calculation-progress { width: 100%; accent-color: var(--accent); }
-.calculation-dialog-actions { display: flex; justify-content: flex-end; }
+.calculation-dialog-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dialog-elapsed { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+#model-loading-dialog {
+  width: min(430px, calc(100vw - 48px));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .34);
+}
+#model-loading-dialog::backdrop { background: rgba(12, 13, 15, .58); backdrop-filter: blur(3px); }
+.model-loading-dialog-shell { display: grid; gap: 15px; padding: 18px; }
+.model-loading-dialog-heading { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: center; gap: 11px; }
+.model-loading-dialog-heading h2 { margin: 0; font-size: 17px; }
+.model-loading-dialog-heading strong { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+.model-loading-dialog-heading p { margin: 4px 0 0; color: var(--muted); line-height: 1.4; }
+.model-loading-error-icon { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; color: white; background: var(--danger); font-weight: 800; }
+.model-loading-error-icon[hidden] { display: none; }
+#model-loading-progress { width: 100%; accent-color: var(--accent); }
+.model-loading-dialog-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 30px; }
 
 #settings-dialog {
   width: min(780px, calc(100vw - 48px));
@@ -455,6 +501,7 @@ figcaption { margin-bottom: 7px; color: #c9cace; font-weight: 600; }
 }
 
 #settings-dialog::backdrop { background: rgba(12, 13, 15, .48); backdrop-filter: blur(2px); }
+#notice-dialog,
 #confirmation-dialog {
   width: min(400px, calc(100vw - 48px));
   padding: 0;
@@ -464,6 +511,7 @@ figcaption { margin-bottom: 7px; color: #c9cace; font-weight: 600; }
   background: var(--panel);
   box-shadow: 0 20px 60px rgba(0, 0, 0, .34);
 }
+#notice-dialog::backdrop,
 #confirmation-dialog::backdrop { background: rgba(12, 13, 15, .48); backdrop-filter: blur(2px); }
 .confirmation-dialog-shell { display: grid; gap: 10px; margin: 0; padding: 18px; }
 .confirmation-dialog-shell h2 { margin: 0; font-size: 17px; }
@@ -544,4 +592,35 @@ figcaption { margin-bottom: 7px; color: #c9cace; font-weight: 600; }
   .workspace { grid-template-columns: 220px minmax(360px, 1fr) 290px; }
   .app-bar button.secondary:not(#open-settings) { display: none; }
   .previews { grid-template-columns: 1fr; }
+}
+
+
+/* 精細掃描固定在畫布工具列左側，不參與三欄 Grid，也不改變步驟列中心。 */
+.fine-scan-toggle {
+  position: absolute;
+  left: 10px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0;
+  font-size: 0.82rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.fine-scan-toggle small {
+  opacity: 0.6;
+  font-size: 0.72rem;
+}
+.fine-scan-toggle:has(input:checked) {
+  color: var(--accent, #c2410c);
+}
+.fine-scan-toggle:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+
+@media (max-width: 1250px) {
+  .fine-scan-toggle small { display: none; }
+}
+
+@media (max-width: 1000px) {
+  .fine-scan-toggle span { display: none; }
 }

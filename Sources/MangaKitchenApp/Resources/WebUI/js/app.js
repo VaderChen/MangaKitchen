@@ -18,11 +18,18 @@ let selectedTranslationRegionID = null;
 let pendingRegionSelectionID = null;
 let regionContextTarget = null;
 let calculationDialogState = null;
+let calculationElapsedTimer = null;
+let dismissedModelLoadingFailureID = null;
 let maskTool = "add";
 let activeMaskStroke = null;
+// 譯文編輯的防抖更新在筆劃期間不能送出：它一送出，後端推回的狀態會蓋掉
+// 樂觀繪製的 pendingStrokes，畫到一半的筆劃就「縮回去」。畫的時候暫停，
+// 放開筆再一次補送 —— 暫停而不是取消，使用者剛打的字不會遺失。
+let maskStrokeSuspendsRegionUpdates = false;
 const maskPreviewStates = new Map();
 const collapsedPageFolders = new Set();
 const regionUpdateTimers = new Map();
+let regionUpdatesSuspended = false;
 let translationDrag = null;
 let translationResize = null;
 const canvasViewport = { pageID: null, scale: 1, x: 0, y: 0, drag: null };
@@ -48,6 +55,7 @@ const elements = {
   maskDrawingLayer: document.querySelector("#mask-drawing-layer"),
   maskBrush: document.querySelector("#mask-brush"),
   maskEraser: document.querySelector("#mask-eraser"),
+  maskBrushCursor: document.querySelector("#mask-brush-cursor"),
   maskBrushSize: document.querySelector("#mask-brush-size"),
   maskBrushSizeValue: document.querySelector("#mask-brush-size-value"),
   maskUndo: document.querySelector("#mask-undo"),
@@ -80,11 +88,25 @@ const elements = {
   confirmationTitle: document.querySelector("#confirmation-title"),
   confirmationMessage: document.querySelector("#confirmation-message"),
   confirmationSubmit: document.querySelector("#confirmation-submit"),
+  noticeDialog: document.querySelector("#notice-dialog"),
+  noticeTitle: document.querySelector("#notice-title"),
+  noticeMessage: document.querySelector("#notice-message"),
+  noticeDismiss: document.querySelector("#notice-dismiss"),
   calculationDialog: document.querySelector("#calculation-dialog"),
   calculationTitle: document.querySelector("#calculation-title"),
   calculationMessage: document.querySelector("#calculation-message"),
   calculationProgress: document.querySelector("#calculation-progress"),
+  calculationElapsed: document.querySelector("#calculation-elapsed"),
   calculationCancel: document.querySelector("#calculation-cancel"),
+  modelLoadingDialog: document.querySelector("#model-loading-dialog"),
+  modelLoadingTitle: document.querySelector("#model-loading-title"),
+  modelLoadingName: document.querySelector("#model-loading-name"),
+  modelLoadingMessage: document.querySelector("#model-loading-message"),
+  modelLoadingProgress: document.querySelector("#model-loading-progress"),
+  modelLoadingCount: document.querySelector("#model-loading-count"),
+  modelLoadingSpinner: document.querySelector("#model-loading-spinner"),
+  modelLoadingErrorIcon: document.querySelector("#model-loading-error-icon"),
+  modelLoadingClose: document.querySelector("#model-loading-close"),
   settingsLanguage: document.querySelector("#settings-language"),
   settingsColorScheme: document.querySelector("#settings-color-scheme"),
   settingsImageCompositingBackend: document.querySelector("#settings-image-compositing-backend"),
@@ -92,6 +114,7 @@ const elements = {
   dataDirectoryRestartNote: document.querySelector("#data-directory-restart-note"),
   settingsImageToTextModel: document.querySelector("#settings-image-to-text-model"),
   settingsImageToTextModelVariant: document.querySelector("#settings-image-to-text-model-variant"),
+  fineScan: document.querySelector("#fine-scan"),
   settingsImageToTextModelDownload: document.querySelector("#download-image-to-text-model"),
   settingsImageToTextModelClear: document.querySelector("#clear-image-to-text-model"),
   settingsImageToTextModelDelete: document.querySelector("#delete-image-to-text-model"),
@@ -192,12 +215,11 @@ const jobStatusLabelKeys = {
 
 const processingActivityLabelKeys = {
   preparingPage: "activityPreparingPage",
-  startingOCR: "activityStartingOCR",
+  detectingEnclosures: "activityDetectingEnclosures",
   preparingTextModel: "activityPreparingTextModel",
   detectingRegions: "activityDetectingRegions",
   mergingRegions: "activityMergingRegions",
   refiningPixelMask: "activityRefiningPixelMask",
-  refiningOCR: "activityRefiningOCR",
   generatingMask: "activityGeneratingMask",
   renderingMaskPreview: "activityRenderingMaskPreview",
   applyingGlossary: "activityApplyingGlossary",
@@ -267,23 +289,119 @@ function calculationStepLabel(operation) {
   return key ? t(key) : operation;
 }
 
+function formatElapsedDuration(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const minuteText = String(minutes).padStart(2, "0");
+  const secondText = String(seconds).padStart(2, "0");
+  if (hours === 0) return `${minuteText}:${secondText}`;
+  return `${String(hours).padStart(2, "0")}:${minuteText}:${secondText}`;
+}
+
+function updateCalculationElapsed() {
+  const startedAt = calculationDialogState?.startedAt ?? Date.now();
+  elements.calculationElapsed.textContent = t("elapsedTime", {
+    time: formatElapsedDuration(Date.now() - startedAt),
+  });
+}
+
+function startCalculationElapsedTimer() {
+  if (calculationElapsedTimer !== null) clearInterval(calculationElapsedTimer);
+  updateCalculationElapsed();
+  calculationElapsedTimer = setInterval(updateCalculationElapsed, 1000);
+}
+
+function stopCalculationElapsedTimer() {
+  if (calculationElapsedTimer !== null) clearInterval(calculationElapsedTimer);
+  calculationElapsedTimer = null;
+  elements.calculationElapsed.textContent = t("elapsedTime", { time: "00:00" });
+}
+
 function openCalculationDialog(operation, pageIDs) {
   const step = calculationStepLabel(operation);
-  calculationDialogState = { operation, pageIDs, jobID: null, started: false };
+  calculationDialogState = {
+    operation,
+    pageIDs,
+    jobID: null,
+    started: false,
+    startedAt: Date.now(),
+  };
   elements.calculationTitle.textContent = t("calculatingStep", { step });
   elements.calculationMessage.textContent = t("preparingCalculation");
   elements.calculationProgress.value = 0;
   elements.calculationCancel.disabled = false;
+  startCalculationElapsedTimer();
   if (!elements.calculationDialog.open) elements.calculationDialog.showModal();
 }
 
 function closeCalculationDialog() {
+  stopCalculationElapsedTimer();
   calculationDialogState = null;
   if (elements.calculationDialog.open) elements.calculationDialog.close();
 }
 
+function closeModelLoadingDialog() {
+  if (elements.modelLoadingDialog.open) elements.modelLoadingDialog.close();
+}
+
+function renderModelLoadingDialog() {
+  const loading = state?.modelLoadingState;
+  if (!loading || loading.phase === "completed") {
+    closeModelLoadingDialog();
+    return;
+  }
+
+  const loadingID = loading.id?.toLowerCase() ?? "unknown";
+  const failed = loading.phase === "failed";
+  if (failed && dismissedModelLoadingFailureID === loadingID) {
+    closeModelLoadingDialog();
+    return;
+  }
+
+  elements.modelLoadingTitle.textContent = t(failed
+    ? "loadingModelFailedTitle"
+    : "loadingModelTitle");
+  elements.modelLoadingName.textContent = loading.displayName || t("unknownModel");
+  elements.modelLoadingMessage.textContent = failed
+    ? loading.errorMessage || t("loadingModelFailedFallback")
+    : t("loadingModelPreparing");
+  elements.modelLoadingCount.textContent = t("loadingModelCount", {
+    current: loading.currentIndex,
+    total: loading.totalCount,
+  });
+  elements.modelLoadingSpinner.hidden = failed;
+  elements.modelLoadingErrorIcon.hidden = !failed;
+  elements.modelLoadingClose.hidden = !failed;
+
+  if (Number.isFinite(loading.progress)) {
+    elements.modelLoadingProgress.value = Math.min(Math.max(loading.progress, 0), 1);
+  } else {
+    elements.modelLoadingProgress.removeAttribute("value");
+  }
+  if (!elements.modelLoadingDialog.open) elements.modelLoadingDialog.showModal();
+}
+
+async function flushPendingRegionUpdates() {
+  const pendingUpdates = [...regionUpdateTimers.values()];
+  regionUpdateTimers.clear();
+  for (const update of pendingUpdates) clearTimeout(update.timer);
+  await Promise.all(pendingUpdates.map((update) => update.commit()));
+}
+
+function stopRegionUpdateTimers() {
+  for (const update of regionUpdateTimers.values()) clearTimeout(update.timer);
+  regionUpdateTimers.clear();
+  regionUpdatesSuspended = true;
+  for (const control of elements.regionList.querySelectorAll("textarea, select")) {
+    control.disabled = true;
+  }
+}
+
 function renderCalculationDialog() {
   if (!calculationDialogState) return;
+  updateCalculationElapsed();
   const step = calculationStepLabel(calculationDialogState.operation);
   elements.calculationTitle.textContent = t("calculatingStep", { step });
   if (calculationDialogState.operation === "rescan") {
@@ -334,6 +452,7 @@ function renderCalculationDialog() {
 }
 
 async function selectOrCalculateWorkflowStep(step, operation, force = false) {
+  await flushPendingRegionUpdates();
   selectWorkflowStep(step);
   const pages = selectedWorkflowPages();
   if (!pages.length) {
@@ -343,6 +462,16 @@ async function selectOrCalculateWorkflowStep(step, operation, force = false) {
   const pendingPages = force ? pages : pages.filter((page) => !hasWorkflowStepData(page, step));
   if (!pendingPages.length) return;
   const pageIDs = pendingPages.map((page) => page.id);
+  const hasImageToTextModel = state.loadedModels.some(
+    (model) => model.capability === "imageToText"
+  );
+  if (operation === "detectMasks" && !hasImageToTextModel) {
+    await showNotice(
+      t("manualMaskModeTitle"),
+      t("manualMaskModeMessage"),
+      t("enterManualMaskMode")
+    );
+  }
   if (operation === "compose") {
     await runBatch(operation, pageIDs);
     return;
@@ -368,18 +497,12 @@ async function runBatchWithCalculationDialog(operation, pageIDs) {
   const hasImageToTextModel = state.loadedModels.some(
     (model) => model.capability === "imageToText"
   );
-  let batchOperation = operation;
-  if (["detectMasks", "fullPage"].includes(operation) && !hasImageToTextModel) {
-    const confirmed = await requestConfirmation(
-      t("systemOCRWarningTitle"),
-      t("systemOCRWarningMessage"),
-      t("continueRecognition")
-    );
-    if (!confirmed) return null;
-    if (operation === "fullPage") batchOperation = "detectMasks";
+  if (operation === "fullPage" && !hasImageToTextModel) {
+    showError(new Error(t("vlmRequiredForDetection")));
+    return null;
   }
-  openCalculationDialog(batchOperation, pageIDs);
-  const result = await runBatch(batchOperation, pageIDs);
+  openCalculationDialog(operation, pageIDs);
+  const result = await runBatch(operation, pageIDs);
   if (!result?.jobID) {
     closeCalculationDialog();
     return null;
@@ -436,6 +559,16 @@ function requestConfirmation(title, message, confirmLabel) {
       resolve(elements.confirmationDialog.returnValue === "confirm");
     }, { once: true });
     elements.confirmationDialog.showModal();
+  });
+}
+
+function showNotice(title, message, dismissLabel) {
+  elements.noticeTitle.textContent = title;
+  elements.noticeMessage.textContent = message;
+  elements.noticeDismiss.textContent = dismissLabel;
+  return new Promise((resolve) => {
+    elements.noticeDialog.addEventListener("close", resolve, { once: true });
+    elements.noticeDialog.showModal();
   });
 }
 
@@ -506,7 +639,7 @@ async function removeTextRegion(page, region, index) {
   );
   if (!confirmed) return;
   const timerKey = `${page.id}:${region.id}`;
-  clearTimeout(regionUpdateTimers.get(timerKey));
+  clearTimeout(regionUpdateTimers.get(timerKey)?.timer);
   regionUpdateTimers.delete(timerKey);
   await invoke("removeRegion", { pageID: page.id, regionID: region.id });
 }
@@ -866,9 +999,11 @@ function renderRegions(page) {
     const editor = document.createElement("textarea");
     editor.value = region.translatedText;
     editor.rows = 3;
+    editor.disabled = state.isProcessing || regionUpdatesSuspended;
     editor.setAttribute("aria-label", t("regionTranslationAria", { number: index + 1 }));
 
     const direction = document.createElement("select");
+    direction.disabled = state.isProcessing || regionUpdatesSuspended;
     for (const [value, labelKey] of [["automatic", "automaticTypesetting"], ["horizontal", "horizontal"], ["vertical", "vertical"]]) {
       const option = document.createElement("option");
       option.value = value;
@@ -878,17 +1013,26 @@ function renderRegions(page) {
     }
 
     const scheduleUpdate = () => {
+      if (state.isProcessing || regionUpdatesSuspended) return;
       const timerKey = `${page.id}:${region.id}`;
-      clearTimeout(regionUpdateTimers.get(timerKey));
-      regionUpdateTimers.set(timerKey, setTimeout(() => {
+      clearTimeout(regionUpdateTimers.get(timerKey)?.timer);
+      const commit = () => invoke("updateRegion", {
+        pageID: page.id,
+        regionID: region.id,
+        translatedText: editor.value,
+        writingDirection: direction.value,
+      });
+      const timer = setTimeout(() => {
+        if (regionUpdateTimers.get(timerKey)?.timer !== timer) return;
+        // 正在畫筆劃就先不送，重新排程，等放開筆再說。
+        if (maskStrokeSuspendsRegionUpdates) {
+          scheduleUpdate();
+          return;
+        }
         regionUpdateTimers.delete(timerKey);
-        invoke("updateRegion", {
-          pageID: page.id,
-          regionID: region.id,
-          translatedText: editor.value,
-          writingDirection: direction.value,
-        }).catch(showError);
-      }, 1000));
+        commit().catch(showError);
+      }, 1000);
+      regionUpdateTimers.set(timerKey, { timer, commit });
     };
     editor.addEventListener("input", scheduleUpdate);
     direction.addEventListener("change", scheduleUpdate);
@@ -1025,6 +1169,7 @@ function renderMaskEditor(page) {
   elements.sourcePreviewCaption.textContent = t(maskMode ? "maskLayer" : "sourceImage");
   elements.maskLayer.hidden = !maskMode || !hasMask;
   elements.maskDrawingLayer.hidden = !maskMode || !hasMask;
+  if (!maskMode || !hasMask) hideMaskBrushCursor();
 
   if (page) {
     const width = Math.max(1, page.pixelWidth);
@@ -1060,6 +1205,40 @@ function renderMaskEditor(page) {
   elements.maskBrush.classList.toggle("active", maskTool === "add");
   elements.maskEraser.classList.toggle("active", maskTool === "erase");
   elements.maskBrushSizeValue.value = `${elements.maskBrushSize.value} px`;
+}
+
+/// 筆刷游標的螢幕直徑。normalizedDiameter 以頁面短邊為基準（與遮罩產生器
+/// 的 diameter * min(width, height) 一致），所以螢幕上也要用短邊換算。
+let lastMaskPointerPosition = null;
+
+function updateMaskBrushCursor(event) {
+  const cursor = elements.maskBrushCursor;
+  if (!cursor) return;
+  if (event) lastMaskPointerPosition = { clientX: event.clientX, clientY: event.clientY };
+  const position = event ?? lastMaskPointerPosition;
+  if (!position) { cursor.hidden = true; return; }
+  const page = activePage();
+  const rect = elements.maskDrawingLayer.getBoundingClientRect();
+  if (activeWorkflowStep !== "mask" || !page?.maskPreviewURL
+      || !rect.width || !rect.height) {
+    cursor.hidden = true;
+    return;
+  }
+  cursor.classList.toggle("brush", maskTool === "add");
+  cursor.classList.toggle("eraser", maskTool === "erase");
+  const brushPixels = Number(elements.maskBrushSize.value);
+  const shortSide = Math.max(1, Math.min(page.pixelWidth, page.pixelHeight));
+  const size = Math.max(4, (brushPixels / shortSide) * Math.min(rect.width, rect.height));
+  cursor.style.width = `${size}px`;
+  cursor.style.height = `${size}px`;
+  cursor.style.left = `${position.clientX}px`;
+  cursor.style.top = `${position.clientY}px`;
+  cursor.hidden = false;
+}
+
+function hideMaskBrushCursor() {
+  lastMaskPointerPosition = null;
+  if (elements.maskBrushCursor) elements.maskBrushCursor.hidden = true;
 }
 
 function normalizedMaskPoint(event) {
@@ -1104,6 +1283,9 @@ function beginMaskStroke(event) {
     return;
   }
   selectMaskRegion(page, region.id);
+  // 確定要開始畫了才暫停防抖更新；設在前面的話，上面任何一個 early return
+  // 都會讓旗標卡在 true，譯文從此再也存不進去。
+  maskStrokeSuspendsRegionUpdates = true;
   activeMaskStroke = {
     pointerID: event.pointerId,
     pageID: page.id,
@@ -1134,6 +1316,7 @@ function finishMaskStroke(event, cancelled = false) {
   if (!activeMaskStroke || activeMaskStroke.pointerID !== event.pointerId) return;
   const stroke = activeMaskStroke;
   activeMaskStroke = null;
+  maskStrokeSuspendsRegionUpdates = false;
   if (elements.maskDrawingLayer.hasPointerCapture(event.pointerId)) {
     elements.maskDrawingLayer.releasePointerCapture(event.pointerId);
   }
@@ -1175,8 +1358,17 @@ function canvasStackForStage(stage) {
 }
 
 function clampCanvasPan(stage) {
-  const stack = canvasStackForStage(stage);
-  if (!stack || canvasViewport.scale <= 1) {
+  let stack = canvasStackForStage(stage);
+  // 兩個 stage 共用同一組 viewport，但輸出預覽在還沒合成前是 hidden 的，
+  // offsetWidth 為 0 會讓可平移範圍算成 0、位移被夾死 —— 畫面明明是放大的
+  // 卻拖不動。沒有版面尺寸時改用另一個看得見的 stack 當基準。
+  if (!stack?.offsetWidth || !stack?.offsetHeight) {
+    const fallback = stack === elements.sourceImageStack
+      ? elements.outputPreviewStack
+      : elements.sourceImageStack;
+    if (fallback?.offsetWidth && fallback?.offsetHeight) stack = fallback;
+  }
+  if (!stack?.offsetWidth || !stack?.offsetHeight || canvasViewport.scale <= 1) {
     canvasViewport.x = 0;
     canvasViewport.y = 0;
     return;
@@ -1636,10 +1828,21 @@ function renderPage() {
   elements.emptyState.hidden = hasProject && Boolean(page);
   elements.workspace.hidden = !page;
   const outputStepActive = activeWorkflowStep === "compose";
+  const hasImageToTextModel = state.loadedModels.some(
+    (model) => model.capability === "imageToText"
+  );
+  const hasCalculatedOutput = Boolean(
+    page?.maskPreviewURL
+      || page?.maskAppliedPreviewURL
+      || page?.translationPreviewURL
+      || page?.outputPreviewURL
+  );
   elements.reveal.textContent = t(outputStepActive ? "revealOutput" : "recalculate");
+  elements.reveal.hidden = !page
+    || (activeWorkflowStep === "pages" && !hasCalculatedOutput);
   elements.reveal.disabled = outputStepActive
     ? !page?.outputPreviewURL
-    : !page || state.isProcessing;
+    : !page || state.isProcessing || !hasImageToTextModel;
   elements.workflowNext.hidden = !page || outputStepActive;
   elements.workflowNext.disabled = !page || state.isProcessing;
   elements.progress.value = page?.progress ?? 0;
@@ -1732,6 +1935,8 @@ function renderSettings() {
   elements.fontName.value = selectedFont;
   elements.useImageModel.checked = false;
   elements.useImageModel.disabled = true;
+  elements.fineScan.checked = Boolean(options.fineScanEnabled);
+  elements.fineScan.disabled = !state.activeProjectID;
   for (const control of [elements.targetLanguage, elements.readingDirection, elements.writingDirection, elements.fontName]) {
     control.disabled = !state.activeProjectID;
   }
@@ -2055,6 +2260,8 @@ function renderSelectionSummary() {
 }
 
 function render(nextState) {
+  if (nextState.isProcessing && !state?.isProcessing) stopRegionUpdateTimers();
+  if (!nextState.isProcessing) regionUpdatesSuspended = false;
   state = nextState;
   renderProjects();
   renderPages();
@@ -2064,6 +2271,7 @@ function render(nextState) {
   renderGlobalSettings();
   renderGlossary();
   renderBatchJobs();
+  renderModelLoadingDialog();
   renderCalculationDialog();
   renderSelectionSummary();
   elements.cancel.disabled = !state.isProcessing;
@@ -2098,6 +2306,8 @@ async function choosePreferenceDirectory(method, overrides) {
   await updateGlobalSettings(overrides.value(result.path));
 }
 
+elements.fineScan?.addEventListener("change", () => updateSettings());
+
 function updateSettings() {
   invoke("updateSettings", {
     targetLanguageCode: elements.targetLanguage.value,
@@ -2105,6 +2315,7 @@ function updateSettings() {
     writingDirection: elements.writingDirection.value,
     fontName: elements.fontName.value,
     useImageToImageRestoration: false,
+    fineScanEnabled: elements.fineScan?.checked ?? false,
   }).catch(showError);
 }
 
@@ -2128,10 +2339,17 @@ async function runBatch(operation, pageIDs) {
       elements.outputPlaceholder.classList.add("processing");
     }
   }
-  return invoke("runBatch", { operation, pageIDs }).catch((error) => {
+  await flushPendingRegionUpdates();
+  stopRegionUpdateTimers();
+  const result = await invoke("runBatch", { operation, pageIDs }).catch((error) => {
     showError(error);
     return null;
   });
+  if (!result?.jobID) {
+    regionUpdatesSuspended = false;
+    renderRegions(activePage());
+  }
+  return result;
 }
 
 elements.outputPreview.addEventListener("error", () => {
@@ -2178,6 +2396,19 @@ document.querySelector("#open-settings").addEventListener("click", () => {
 document.querySelector("#close-settings").addEventListener("click", () => elements.settingsDialog.close());
 document.querySelector("#close-settings-icon").addEventListener("click", () => elements.settingsDialog.close());
 elements.calculationDialog.addEventListener("cancel", (event) => event.preventDefault());
+elements.modelLoadingDialog.addEventListener("cancel", (event) => {
+  const loading = state?.modelLoadingState;
+  if (loading?.phase !== "failed") {
+    event.preventDefault();
+    return;
+  }
+  dismissedModelLoadingFailureID = loading.id?.toLowerCase() ?? "unknown";
+});
+elements.modelLoadingClose.addEventListener("click", () => {
+  const loading = state?.modelLoadingState;
+  dismissedModelLoadingFailureID = loading?.id?.toLowerCase() ?? "unknown";
+  closeModelLoadingDialog();
+});
 elements.calculationCancel.addEventListener("click", () => {
   elements.calculationCancel.disabled = true;
   closeCalculationDialog();
@@ -2269,6 +2500,7 @@ elements.maskEraser.addEventListener("click", () => {
 });
 elements.maskBrushSize.addEventListener("input", () => {
   elements.maskBrushSizeValue.value = `${elements.maskBrushSize.value} px`;
+  updateMaskBrushCursor();
 });
 elements.translationFontDecrease.addEventListener("click", () => adjustSelectedTranslationFontSize(-1));
 elements.translationFontIncrease.addEventListener("click", () => adjustSelectedTranslationFontSize(1));
@@ -2297,6 +2529,9 @@ elements.maskRedo.addEventListener("click", () => {
   if (!page || !region) return;
   invoke("redoMaskStroke", { pageID: page.id, regionID: region.id }).catch(showError);
 });
+elements.maskDrawingLayer.addEventListener("pointermove", updateMaskBrushCursor);
+elements.maskDrawingLayer.addEventListener("pointerenter", updateMaskBrushCursor);
+elements.maskDrawingLayer.addEventListener("pointerleave", hideMaskBrushCursor);
 elements.maskDrawingLayer.addEventListener("pointerdown", beginMaskStroke);
 elements.maskDrawingLayer.addEventListener("pointermove", continueMaskStroke);
 elements.maskDrawingLayer.addEventListener("pointerup", (event) => finishMaskStroke(event));
@@ -2443,7 +2678,10 @@ elements.settingsMCPClient.addEventListener("keydown", (event) => {
 
 window.addEventListener("mangakitchen-language-change", () => {
   elements.settingsLanguage.value = interfaceLanguageSetting();
-  if (state) renderPage();
+  if (state) {
+    renderPage();
+    renderModelLoadingDialog();
+  }
   syncNativeInterfaceLanguage().catch(showError);
 });
 

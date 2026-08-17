@@ -40,7 +40,7 @@ struct MCPPageTask: Codable, Sendable {
     var pixelWidth: Int
     var pixelHeight: Int
     var regionCount: Int
-    /// 尚未寫入原文或尚未標記校正完成的區域數。
+    /// 尚未寫入來源文字的區域數。
     var regionsMissingSourceText: Int
     /// 尚未寫入譯文的區域數。
     var regionsMissingTranslation: Int
@@ -125,7 +125,7 @@ actor MCPWorkflowService {
     private let models: ModelRuntimeHub
     /// 區域也交給 Agent：辨識與語意判讀全部封死。
     private let agentPipeline: ComicTranslationPipeline
-    /// 區域由本機計算：Vision OCR ＋ 本機 VLM 語意分類／OCR 校正。
+    /// 區域由本機封閉區域演算法定位，再由 VLM 分類與轉錄。
     /// 翻譯位置同樣是 AgentDrivenTranslator —— 兩條管線都不會用本機模型翻譯。
     private let localDetectionPipeline: ComicTranslationPipeline
     private var pipeline: ComicTranslationPipeline {
@@ -159,7 +159,7 @@ actor MCPWorkflowService {
         self.models = models
         self.workspaceRoot = root
         let maskGenerator = DialogueMaskGenerator()
-        let typesetter = CoreTextDialogueTypesetter()
+        let typesetter = HTMLDialogueTypesetter()
         let backgroundRestorer = try HybridBackgroundRestorer(
             models: models,
             metal: metal,
@@ -169,9 +169,7 @@ actor MCPWorkflowService {
         // 翻譯位置在兩條管線都是 AgentDrivenTranslator：MCP 永遠不會用
         // 內建圖生文模型翻譯，這一點不隨模式改變。
         self.agentPipeline = ComicTranslationPipeline(
-            recognizer: AgentDrivenTextRecognizer(),
             regionDetector: AgentDrivenRegionDetector(),
-            ocrTextRefiner: AgentDrivenOCRTextRefiner(),
             maskRefiner: MangaTextMaskRefiner(),
             translator: AgentDrivenTranslator(),
             maskGenerator: maskGenerator,
@@ -180,9 +178,7 @@ actor MCPWorkflowService {
             outputRoot: artifactsRoot
         )
         self.localDetectionPipeline = ComicTranslationPipeline(
-            recognizer: VisionOCRService(),
             regionDetector: VLMSupplementalRegionDetector(model: models),
-            ocrTextRefiner: VLMOCRTextRefinementService(model: models),
             maskRefiner: MangaTextMaskRefiner(),
             translator: AgentDrivenTranslator(),
             maskGenerator: DialogueMaskGenerator(),
@@ -191,7 +187,7 @@ actor MCPWorkflowService {
                 metal: metal,
                 compositingBackend: imageCompositingBackend
             ),
-            typesetter: CoreTextDialogueTypesetter(),
+            typesetter: HTMLDialogueTypesetter(),
             outputRoot: root.appendingPathComponent("Artifacts", isDirectory: true)
         )
     }
@@ -508,7 +504,7 @@ actor MCPWorkflowService {
         guard let page = pages.first(where: { $0.id == pageID }),
               !page.regions.isEmpty else { return false }
         return page.regions.allSatisfy {
-            $0.ocrTextRefined
+            !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && !$0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
@@ -548,7 +544,7 @@ actor MCPWorkflowService {
     private static func makePageTask(_ page: ComicPage) -> MCPPageTask {
         let missingSourceText = page.regions.reduce(into: 0) { count, region in
             let text = region.sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if text.isEmpty || !region.ocrTextRefined { count += 1 }
+            if text.isEmpty { count += 1 }
         }
         let missingTranslation = page.regions.reduce(into: 0) { count, region in
             if region.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -952,7 +948,7 @@ actor MCPWorkflowService {
         try await persistStringTable(pageID: pageID)
     }
 
-    /// 純 Agent 模式：不呼叫內建 OCR 或圖生文模型。只把 Agent 目前提供的區域
+    /// 純 Agent 模式：不呼叫內建封閉區域偵測或圖生文模型。只把 Agent 目前提供的區域
     /// 收斂成像素級遮罩並輸出遮罩圖；沒有區域時就產生空白遮罩，等 Agent 補齊。
     private func detectByAgentSuppliedRegions(
         pageIndex: Int,
@@ -980,18 +976,18 @@ actor MCPWorkflowService {
         progress(.maskReady, 1)
     }
 
-    /// 本機區域模式：Vision OCR 定位，已載入圖生文模型時再做語意分類與 OCR 校正。
+    /// 本機區域模式：封閉區域演算法定位，再由圖生文模型做語意分類與轉錄。
     /// 這一步會**重新產生區域並覆寫**該頁既有結果（含已寫入的譯文）。
     private func detectByLocalPipeline(
         pageIndex: Int,
         progress: @escaping PagePipelineProgress
     ) async throws {
-        let useLocalTextModel = await models.isLoaded(.imageToText)
+        guard await models.isLoaded(.imageToText) else {
+            throw ModelRuntimeError.capabilityNotLoaded(.imageToText)
+        }
         let result = try await pipeline.detectMasks(
             page: pages[pageIndex],
             options: options,
-            refineOCRText: useLocalTextModel,
-            detectMissingRegions: useLocalTextModel,
             progress: progress
         )
         pages[pageIndex].regions = result.regions
@@ -1008,15 +1004,6 @@ actor MCPWorkflowService {
             throw MCPServiceError.pageNotFound
         }
         guard !pages[index].regions.isEmpty else { throw MCPServiceError.maskRequired }
-        if pages[index].regions.contains(where: { !$0.ocrTextRefined }) {
-            pages[index].regions = try await pipeline.refineOCRText(
-                page: pages[index],
-                regions: pages[index].regions,
-                options: options,
-                progress: progress
-            )
-            try await persistStringTable(pageID: pageID)
-        }
         let translated = try await pipeline.translate(
             page: pages[index],
             regions: pages[index].regions,

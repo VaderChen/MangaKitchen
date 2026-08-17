@@ -10,7 +10,7 @@ struct WebPage: Encodable {
     var pixelHeight: Int
     var sourcePreviewURL: String
     var maskPreviewURL: String?
-    var maskRevision: TimeInterval?
+    var maskRevision: UInt64?
     var maskAppliedPreviewURL: String?
     var translationPreviewURL: String?
     var outputPreviewURL: String?
@@ -25,6 +25,7 @@ struct WebPage: Encodable {
 
     init(
         page: ComicPage,
+        maskRevision: UInt64 = 0,
         maskRedoRegionIDs: [UUID] = [],
         processingActivity: PageProcessingActivity? = nil
     ) {
@@ -41,7 +42,7 @@ struct WebPage: Encodable {
         maskPreviewURL = maskURL == nil
             ? nil
             : "mangakitchen-asset://\(page.id.uuidString.lowercased())/mask"
-        maskRevision = Self.modificationTimestamp(for: maskURL)
+        self.maskRevision = maskURL == nil ? nil : maskRevision
         maskAppliedPreviewURL = backgroundURL == nil
             ? nil
             : "mangakitchen-asset://\(page.id.uuidString.lowercased())/background"
@@ -245,7 +246,7 @@ struct WebGlobalSettings: Encodable {
 }
 
 struct WebAppState: Encodable {
-    var schemaVersion = 4
+    var schemaVersion = 5
     var globalSettings: WebGlobalSettings
     var projects: [WebProject]
     var activeProjectID: UUID?
@@ -256,6 +257,7 @@ struct WebAppState: Encodable {
     var options: ProcessingOptions
     var availableFontFamilies: [String]
     var loadedModels: [LoadedModelInfo]
+    var modelLoadingState: ModelLoadingState?
     var glossary: [WebGlossaryEntry]
     var batchJobs: [WebBatchJob]
     var sourceDirectoryPath: String?
@@ -281,6 +283,7 @@ struct WebAppState: Encodable {
         pages = store.pages.map {
             WebPage(
                 page: $0,
+                maskRevision: store.maskRevision(pageID: $0.id),
                 maskRedoRegionIDs: store.maskRedoRegionIDs(pageID: $0.id),
                 processingActivity: store.processingActivities[$0.id]
             )
@@ -292,6 +295,7 @@ struct WebAppState: Encodable {
             .filter { !$0.hasPrefix(".") }
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         loadedModels = store.loadedModels
+        modelLoadingState = store.modelLoadingState
         glossary = store.glossary.entries.map {
             WebGlossaryEntry(entry: $0, targetLanguageCode: store.options.targetLanguageCode)
         }

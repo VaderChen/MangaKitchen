@@ -2,9 +2,7 @@ import Foundation
 import MangaKitchenCore
 
 public actor ComicTranslationPipeline {
-    private let recognizer: any PageTextRecognizing
     private let regionDetector: any SemanticRegionDetecting
-    private let ocrTextRefiner: any OCRTextRefining
     private let maskRefiner: any DialogueMaskRefining
     private let translator: any RegionTranslating
     private let maskGenerator: any DialogueMaskGenerating
@@ -13,9 +11,7 @@ public actor ComicTranslationPipeline {
     private let outputRoot: URL
 
     public init(
-        recognizer: any PageTextRecognizing,
         regionDetector: any SemanticRegionDetecting,
-        ocrTextRefiner: any OCRTextRefining,
         maskRefiner: any DialogueMaskRefining,
         translator: any RegionTranslating,
         maskGenerator: any DialogueMaskGenerating,
@@ -23,9 +19,7 @@ public actor ComicTranslationPipeline {
         typesetter: any DialogueTypesetting,
         outputRoot: URL
     ) {
-        self.recognizer = recognizer
         self.regionDetector = regionDetector
-        self.ocrTextRefiner = ocrTextRefiner
         self.maskRefiner = maskRefiner
         self.translator = translator
         self.maskGenerator = maskGenerator
@@ -80,42 +74,27 @@ public actor ComicTranslationPipeline {
     public func detectMasks(
         page: ComicPage,
         options: ProcessingOptions,
-        refineOCRText: Bool = true,
-        detectMissingRegions: Bool = true,
         activity: @escaping PagePipelineActivity = { _ in },
         progress: @escaping PagePipelineProgress
     ) async throws -> PageDetectionResult {
         try Task.checkCancellation()
         let urls = try artifactURLs(for: page)
         var warnings: [String] = []
-        activity(.startingOCR)
+        activity(.detectingEnclosures)
         progress(.detectingText, 0)
-        var regions = try await recognizer.recognizeText(
-            in: page.sourceURL,
-            languageCodes: options.sourceLanguageCodes,
-            readingDirection: options.readingDirection
-        )
-        progress(.detectingText, 0.12)
-
-        if detectMissingRegions {
-            activity(.preparingTextModel)
-            // 語意偵測器會把系統 OCR、VLM 判讀與封閉白框候選合併成完整清單，
-            // 補足 Vision 容易漏掉的直排 CJK，並排除擬聲字與頁尾資訊。模型失敗
-            // 時必須讓本步驟失敗，不可把局部結果誤標為完整頁面。
-            let mergedRegions = try await regionDetector.detectRegions(
-                pageURL: page.sourceURL,
-                existingRegions: regions,
-                sourceLanguageCodes: options.sourceLanguageCodes
-            ) { value in
-                if value > 0 { activity(.detectingRegions) }
-                progress(.detectingText, 0.12 + min(max(value, 0), 1) * 0.08)
-            }
-            activity(.mergingRegions)
-            regions = ReadingOrderResolver.sorted(
-                mergedRegions,
-                direction: options.readingDirection
-            )
+        let detectedRegions = try await regionDetector.detectRegions(
+            pageURL: page.sourceURL,
+            sourceLanguageCodes: options.sourceLanguageCodes,
+            fineScanEnabled: options.fineScanEnabled
+        ) { value in
+            if value > 0 { activity(.detectingRegions) }
+            progress(.detectingText, min(max(value, 0), 1) * 0.2)
         }
+        activity(.mergingRegions)
+        var regions = ReadingOrderResolver.sorted(
+            detectedRegions,
+            direction: options.readingDirection
+        )
 
         try Task.checkCancellation()
         activity(.refiningPixelMask)
@@ -130,29 +109,13 @@ public actor ComicTranslationPipeline {
                 "有 \(incompleteMasks.count) 個文字區域未通過像素遮罩覆蓋檢查；請先補齊粗定位或對話框內緣。"
             )
         }
-        progress(.detectingText, 0.3)
-        if refineOCRText {
-            activity(.preparingTextModel)
-            regions = try await ocrTextRefiner.refineOCRText(
-                regions: regions,
-                pageURL: page.sourceURL,
-                sourceLanguageCodes: options.sourceLanguageCodes
-            ) { value in
-                if value > 0 { activity(.refiningOCR) }
-                progress(.detectingText, 0.3 + min(max(value, 0), 1) * 0.58)
-            }
-        } else {
-            progress(.detectingText, 0.88)
-        }
+        progress(.detectingText, 0.88)
         activity(.mergingRegions)
         regions = regions.map { region in
             var value = region
-            let detectedDirection = value.style.writingDirection
+            // 新偵測區域一律採用使用者的預設樣式；預設為 automatic 時交由
+            // typesetter 依譯文與框形決定方向，不把 VLM 猜測寫成固定橫／直排。
             value.style = options.defaultStyle
-            if value.style.writingDirection == .automatic,
-               detectedDirection != .automatic {
-                value.style.writingDirection = detectedDirection
-            }
             return value
         }
         progress(.detectingText, 0.92)
@@ -167,7 +130,7 @@ public actor ComicTranslationPipeline {
         return PageDetectionResult(regions: regions, maskURL: urls.mask, warnings: warnings)
     }
 
-    /// 重新輸出人工畫筆修改後的遮罩，不重跑 OCR。
+    /// 重新輸出人工畫筆修改後的遮罩，不重跑封閉區域偵測或 VLM。
     @discardableResult
     public func regenerateMask(
         page: ComicPage,
@@ -206,7 +169,7 @@ public actor ComicTranslationPipeline {
         return urls.background
     }
 
-    /// 將外部 Agent 提供的文字粗框收斂成像素級文字遮罩，不重跑 OCR 或模型偵測。
+    /// 將外部 Agent 提供的文字粗框收斂成像素級文字遮罩，不重跑模型偵測。
     /// Agent 直接提供且未標示為自動精修的多邊形會原樣保留；自動精修未通過
     /// 覆蓋檢查時則重新運算，避免沿用不完整遮罩。
     public func refineMasks(
@@ -230,31 +193,6 @@ public actor ComicTranslationPipeline {
         }
     }
 
-    /// 只校正既有 OCR 文字，不重跑區域偵測、遮罩精修或人工筆劃。
-    public func refineOCRText(
-        page: ComicPage,
-        regions: [DialogueRegion],
-        options: ProcessingOptions,
-        activity: @escaping PagePipelineActivity = { _ in },
-        progress: @escaping PagePipelineProgress
-    ) async throws -> [DialogueRegion] {
-        try Task.checkCancellation()
-        let pending = regions.contains { !$0.ocrTextRefined }
-        guard pending else { return regions }
-        activity(.preparingTextModel)
-        progress(.detectingText, 0)
-        let refined = try await ocrTextRefiner.refineOCRText(
-            regions: regions,
-            pageURL: page.sourceURL,
-            sourceLanguageCodes: options.sourceLanguageCodes
-        ) { value in
-            if value > 0 { activity(.refiningOCR) }
-            progress(.detectingText, min(max(value, 0), 1))
-        }
-        progress(.maskReady, 1)
-        return refined
-    }
-
     /// 步驟三：只翻譯既有區域，保留 bounds、style 與人工遮罩筆劃。
     public func translate(
         page: ComicPage,
@@ -265,8 +203,10 @@ public actor ComicTranslationPipeline {
         progress: @escaping PagePipelineProgress
     ) async throws -> [DialogueRegion] {
         try Task.checkCancellation()
-        guard regions.allSatisfy(\.ocrTextRefined) else {
-            throw ComicTranslationPipelineError.ocrTextRefinementRequired
+        guard regions.allSatisfy({
+            !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            throw ComicTranslationPipelineError.sourceTextRequired
         }
         activity(.applyingGlossary)
         let glossaryTerms = glossary.resolvedTerms(
@@ -413,12 +353,12 @@ public actor ComicTranslationPipeline {
 }
 
 public enum ComicTranslationPipelineError: LocalizedError, Sendable {
-    case ocrTextRefinementRequired
+    case sourceTextRequired
 
     public var errorDescription: String? {
         switch self {
-        case .ocrTextRefinementRequired:
-            "翻譯前必須先以圖生文模型、AI Agent 或人工完成所有 OCR 文字校正。"
+        case .sourceTextRequired:
+            "翻譯前每個區域都必須有由圖生文模型、AI Agent 或人工提供的來源文字；請重新執行步驟二或補齊文字。"
         }
     }
 }

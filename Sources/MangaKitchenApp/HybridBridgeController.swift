@@ -494,6 +494,9 @@ final class HybridBridgeController: NSObject, ObservableObject {
         if let fontName = params["fontName"] as? String, !fontName.isEmpty {
             value.defaultStyle.fontName = fontName
         }
+        if let enabled = params["fineScanEnabled"] as? Bool {
+            value.fineScanEnabled = enabled
+        }
         if let amount = double(params["maskExpansion"]), amount.isFinite {
             value.maskExpansion = min(max(amount, 0), 0.75)
         }

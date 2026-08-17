@@ -1,26 +1,26 @@
 import CoreGraphics
-import CoreText
 import Foundation
 import MangaKitchenCore
 
-/// 先用傳統影像演算法找出封閉白色泡泡／標題框，再把候選裁成有編號的聯絡表，
-/// 交由圖生文模型判斷語意並轉錄。VLM 不再負責整頁座標，因此即使模型的
-/// visual-grounding 座標漂移，也不會把擬聲字或人物線稿當成遮罩位置。
+/// 以封閉區域或整頁字形筆畫找出候選，交由圖生文模型分類、轉錄與粗定位。
+///
+/// 主訊號是「字」而不是「封閉白區」：白底頁面上，開口氣泡與無框台詞的內部會
+/// 直接連到整頁背景（實測 flood fill 得到 100% 頁面積，任何門檻皆然），封閉
+/// 白區在原理上就看不見它們，文字會在進入 VLM 之前就消失。改以文字定位後，
+/// 有沒有外框只影響 bubbleBounds 精不精確，不再決定能否被偵測到。
+///
+/// VLM 的 visual grounding 只限定後續像素精修的搜尋區；真正遮罩仍由圖像連通元件產生。
 public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
-    /// 候選有兩個來源，語意分類一視同仁，但幾何意義不同。
-    private enum CandidateSource {
-        /// 封閉白區：bounds 就是對話框內緣，可當 bubbleBounds。
-        /// 同時保留歸屬此框的系統 OCR 結果，供定位、文字備援與結果合併。
-        case enclosure([DialogueRegion])
-        /// 沒有任何白框認領的 OCR 文字塊（無框台詞、放射線上的字）。
-        /// 這種沒有可信的對話框邊界，bubbleBounds 必須留空。
-        case recognizedText(DialogueRegion)
-    }
-
     private struct IndexedCandidate {
         var index: Int
+        /// 文字塊範圍，決定卡片裁切與最終 bounds。
         var bounds: NormalizedRect
-        var source: CandidateSource
+        /// 包住這個文字塊的封閉白區；沒有就是無框台詞，維持 nil。
+        var bubbleBounds: NormalizedRect?
+        /// 封閉白區只是氣泡候選，必須有 VLM 文字框才能進入像素精修。
+        var requiresGrounding: Bool
+        /// VLM 漏回座標時，以本機字形群集當安全後備，不得退回整個氣泡。
+        var fallbackTextBounds: NormalizedRect?
     }
 
     private struct ClassifiedItem: Decodable {
@@ -28,10 +28,143 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         var text: String
         var kind: String
         var direction: String?
+        var textBoxes: [[Double]]?
+
+        private enum CodingKeys: String, CodingKey {
+            case index
+            case text
+            case kind
+            case direction
+            case textBoxes = "text_boxes"
+            case textBBoxes = "text_bboxes"
+            case textBBox = "text_bbox"
+            case bbox2D = "bbox_2d"
+        }
+
+        init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            index = try values.decodeIfPresent(Int.self, forKey: .index) ?? 1
+            text = try values.decode(String.self, forKey: .text)
+            kind = try values.decode(String.self, forKey: .kind)
+            direction = try values.decodeIfPresent(String.self, forKey: .direction)
+
+            func boxes(for key: CodingKeys) -> [[Double]]? {
+                if let boxes = try? values.decode([VLMGroundingBox].self, forKey: key) {
+                    return boxes.map(\.coordinates)
+                }
+                if let box = try? values.decode(VLMGroundingBox.self, forKey: key) {
+                    return [box.coordinates]
+                }
+                return nil
+            }
+            textBoxes = boxes(for: .textBoxes)
+                ?? boxes(for: .textBBoxes)
+                ?? boxes(for: .textBBox)
+                ?? boxes(for: .bbox2D)
+        }
     }
 
-    private static let maximumCandidatesPerRequest = 6
+    private struct ResolvedClassifiedItem {
+        var text: String
+        var kind: String
+        var direction: String?
+        var textBounds: NormalizedRect?
+    }
+
+    private struct CandidateCrop {
+        var sourceRect: CGRect
+    }
+
+    /// 文字塊要幾乎整個落在封閉白區內，才算那個對話框的內容。
+    /// 字形群集被封閉白區覆蓋到這個比例，就視為已由主來源處理。
+    private static let coveredByEnclosureRatio = 0.6
+    /// 補洞卡片的數量上限，避免線稿多的頁面把推論成本放大。
+    private static let maximumSupplementalCards = 12
+    /// 精細掃描的卡片上限；比快速模式寬，因為它的目的就是不漏字。
+    private static let maximumFineScanCards = 36
+
+    /// 在單一格子內找出所有字形群集，換算回整頁座標。
+    private static func textClusters(
+        within tile: NormalizedRect,
+        of source: CGImage,
+        using detector: MangaTextClusterDetector
+    ) -> [NormalizedRect] {
+        let width = Double(source.width)
+        let height = Double(source.height)
+        let cropRect = CGRect(
+            x: (tile.minX * width).rounded(.down),
+            y: (tile.minY * height).rounded(.down),
+            width: (tile.width * width).rounded(.up),
+            height: (tile.height * height).rounded(.up)
+        ).intersection(CGRect(x: 0, y: 0, width: width, height: height))
+        guard cropRect.width > 8, cropRect.height > 8,
+              let crop = source.cropping(to: cropRect),
+              let clusters = try? detector.detect(in: crop) else { return [] }
+
+        return clusters.map { cluster in
+            let local = cluster.bounds
+            return NormalizedRect(
+                x: (cropRect.minX + local.minX * cropRect.width) / width,
+                y: (cropRect.minY + local.minY * cropRect.height) / height,
+                width: local.width * cropRect.width / width,
+                height: local.height * cropRect.height / height
+            ).clamped()
+        }
+    }
+
+    /// 精細掃描用的規則網格。重疊 20% 讓跨格的對話不會被切成兩半。
+    private static func gridTiles(columns: Int = 3, rows: Int = 4) -> [NormalizedRect] {
+        let overlap = 0.2
+        let width = 1.0 / Double(columns)
+        let height = 1.0 / Double(rows)
+        var tiles: [NormalizedRect] = []
+        for row in 0..<rows {
+            for column in 0..<columns {
+                let x = Double(column) * width - width * overlap / 2
+                let y = Double(row) * height - height * overlap / 2
+                tiles.append(NormalizedRect(
+                    x: x, y: y,
+                    width: width * (1 + overlap),
+                    height: height * (1 + overlap)
+                ).clamped())
+            }
+        }
+        return tiles
+    }
+
+    private static func containmentRatio(
+        of inner: NormalizedRect,
+        in outer: NormalizedRect
+    ) -> Double {
+        let overlap = outer.intersection(with: inner)
+        let innerArea = max(inner.width * inner.height, .leastNonzeroMagnitude)
+        return (overlap.width * overlap.height) / innerArea
+    }
+
+    private static func enclosure(
+        containing textBounds: NormalizedRect,
+        in enclosures: [NormalizedRect]
+    ) -> NormalizedRect? {
+        var best: NormalizedRect?
+        var bestArea = Double.greatestFiniteMagnitude
+        for enclosure in enclosures {
+            let overlap = enclosure.intersection(with: textBounds)
+            let textArea = max(textBounds.width * textBounds.height, .leastNonzeroMagnitude)
+            guard (overlap.width * overlap.height) / textArea >= 0.9 else { continue }
+            let area = enclosure.width * enclosure.height
+            // 巢狀時取最小的那個，才不會拿到整格分鏡當對話框。
+            if area < bestArea { bestArea = area; best = enclosure }
+        }
+        return best
+    }
+
+    /// 小型 VLM 同時看多個候選時，容易把轉錄或座標向前錯配。
+    /// 單卡推論雖增加呼叫次數，但可讓文字、粗框與原圖裁切維持一對一。
+    private static let maximumCandidatesPerRequest = 1
+    /// 防止短文字被配到整格分鏡：候選正規化面積除以可見字元數不得超過此值。
+    private static let maximumAreaPerTranscriptCharacter = 0.008
     private let model: any ImageToTextGenerating
+    private let textClusterDetector = MangaTextClusterDetector()
     private let candidateDetector: MangaBubbleCandidateDetector
 
     public init(model: any ImageToTextGenerating) {
@@ -41,46 +174,87 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
 
     public func detectRegions(
         pageURL: URL,
-        existingRegions: [DialogueRegion],
         sourceLanguageCodes: [String],
+        fineScanEnabled: Bool,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
         try Task.checkCancellation()
         let source = try CGImageIO.load(from: pageURL)
+        // NOTE: 文字優先（MangaTextClusterDetector）還在調校中，尚未接上主流程。
+        // 目前仍以封閉白區為主訊號 —— 已知在白底頁面會漏掉開口氣泡與無框台詞。
+        // 封閉白區在兩種模式下都會算，但用途不同：
+        // 快速模式當候選來源，精細掃描只拿它當 bubbleBounds 的供應者。
         let enclosures = try candidateDetector.detect(in: source)
+        let pageTextClusters = fineScanEnabled
+            ? []
+            : ((try? textClusterDetector.detect(in: source)) ?? [])
+        var candidates: [IndexedCandidate] = []
 
-        // 每個系統 OCR 區域只歸屬重疊率最高的封閉框，避免同一段文字被相鄰框
-        // 重複吸收。完全沒有可信封閉框的 OCR 則自成卡片，讓無框台詞仍可辨識。
-        var enclosureText = [[DialogueRegion]](repeating: [], count: enclosures.count)
-        var standaloneText: [DialogueRegion] = []
-        for region in existingRegions {
-            let bestMatch = enclosures.enumerated()
-                .map { (index: $0.offset, ratio: Self.containmentRatio(of: region.bounds, in: $0.element)) }
-                .max { $0.ratio < $1.ratio }
-            if let bestMatch, bestMatch.ratio >= Self.textOwnershipRatio {
-                enclosureText[bestMatch.index].append(region)
-            } else {
-                standaloneText.append(region)
+        if fineScanEnabled {
+            // 精細掃描：先切 3×3 格，在每格內找字形群集定位，再把貼緊文字的裁切
+            // 交給 VLM 辨識與二次粗定位。即使 grounding 失敗，仍可用幾何群集當後備。
+            //
+            // 為什麼要分格：整頁跑群集會被線稿淹沒（實測 39 組）；格子尺度小，
+            // 字形大小分布集中，聚類穩定得多。誤判的線稿群集仍會成為卡片，
+            // 但那正是 VLM 分類擅長的事 —— 實測它把人臉、鞭子全判成 ignore。
+            var located: [NormalizedRect] = []
+            for tile in Self.gridTiles(columns: 3, rows: 3) {
+                for cluster in Self.textClusters(
+                    within: tile, of: source, using: textClusterDetector
+                ) {
+                    // 跨格重疊的同一段文字只保留一次。
+                    guard !located.contains(where: {
+                        Self.containmentRatio(of: cluster, in: $0) >= 0.5
+                            || Self.containmentRatio(of: $0, in: cluster) >= 0.5
+                    }) else { continue }
+                    located.append(cluster)
+                }
+            }
+            for bounds in located.prefix(Self.maximumFineScanCards) {
+                candidates.append(IndexedCandidate(
+                    index: candidates.count + 1,
+                    bounds: bounds,
+                    bubbleBounds: Self.enclosure(containing: bounds, in: enclosures),
+                    requiresGrounding: false,
+                    fallbackTextBounds: bounds
+                ))
+            }
+        } else {
+            for enclosure in enclosures {
+                let fallbackTextBounds = pageTextClusters
+                    .filter {
+                        Self.containmentRatio(of: $0.bounds, in: enclosure)
+                            >= Self.coveredByEnclosureRatio
+                    }
+                    .max { $0.glyphCount < $1.glyphCount }?
+                    .bounds
+                candidates.append(IndexedCandidate(
+                    index: candidates.count + 1,
+                    bounds: enclosure,
+                    bubbleBounds: enclosure,
+                    requiresGrounding: true,
+                    fallbackTextBounds: fallbackTextBounds
+                ))
+            }
+            // 補洞：白底上的開口氣泡與無框台詞，其內部直接連到整頁背景
+            // （實測 flood fill 得到 100% 頁面積），封閉白區永遠看不見。
+            // 群集會夾帶線稿誤判，交給 VLM 判 ignore —— 實測它能正確擋掉。
+            let uncovered = pageTextClusters.filter { cluster in
+                !enclosures.contains {
+                    Self.containmentRatio(of: cluster.bounds, in: $0) >= Self.coveredByEnclosureRatio
+                }
+            }.prefix(Self.maximumSupplementalCards)
+            for cluster in uncovered {
+                candidates.append(IndexedCandidate(
+                    index: candidates.count + 1,
+                    bounds: cluster.bounds,
+                    bubbleBounds: Self.enclosure(containing: cluster.bounds, in: enclosures),
+                    requiresGrounding: false,
+                    fallbackTextBounds: cluster.bounds
+                ))
             }
         }
 
-        var candidates: [IndexedCandidate] = []
-        // 封閉白框本身就是獨立的文字候選，不可要求系統 OCR 先命中。直式 CJK
-        // 經常不會產生任何 Vision 結果，仍須讓 VLM 判斷框內是台詞、空框或人物。
-        for (index, enclosure) in enclosures.enumerated() {
-            candidates.append(IndexedCandidate(
-                index: candidates.count + 1,
-                bounds: enclosure,
-                source: .enclosure(enclosureText[index])
-            ))
-        }
-        for region in standaloneText {
-            candidates.append(IndexedCandidate(
-                index: candidates.count + 1,
-                bounds: region.bounds,
-                source: .recognizedText(region)
-            ))
-        }
         guard !candidates.isEmpty else {
             progress(1)
             return []
@@ -93,7 +267,7 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
             Array(candidates[$0..<min($0 + Self.maximumCandidatesPerRequest, candidates.count)])
         }
         let temporaryDirectoryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MangaKitchen-Bubble-Sheets-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("MangaKitchen-Grounded-Crops-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: temporaryDirectoryURL,
             withIntermediateDirectories: true
@@ -104,58 +278,102 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
             ? "unknown; infer it from the cards"
             : sourceLanguageCodes.joined(separator: ", ")
         let batchCount = max(1, batches.count)
-        var classifiedByIndex: [Int: ClassifiedItem] = [:]
+        var classifiedByIndex: [Int: ResolvedClassifiedItem] = [:]
 
         for (batchIndex, batch) in batches.enumerated() {
             try Task.checkCancellation()
-            let sheetCandidates = batch.enumerated().map {
+            let requestCandidates = batch.enumerated().map {
                 IndexedCandidate(
                     index: $0.offset + 1,
                     bounds: $0.element.bounds,
-                    source: $0.element.source
+                    bubbleBounds: $0.element.bubbleBounds,
+                    requiresGrounding: $0.element.requiresGrounding,
+                    fallbackTextBounds: $0.element.fallbackTextBounds
                 )
             }
-            let sheetURL = temporaryDirectoryURL
-                .appendingPathComponent(String(format: "sheet-%03d.png", batchIndex + 1))
-            try Self.writeContactSheet(source: source, candidates: sheetCandidates, to: sheetURL)
-            let requestIndex = batchIndex
-            let response = try await model.generateText(
-                imageURL: sheetURL,
-                prompt: Self.prompt(
-                    languageHint: languageHint,
-                    expectedIndices: sheetCandidates.map(\.index)
-                ),
-                maximumOutputTokens: 1_536,
-                progress: { value in
-                    let local = min(max(value, 0), 1)
-                    progress((Double(requestIndex) + local) / Double(batchCount))
-                }
+            guard let requestCandidate = requestCandidates.first else { continue }
+            let cropURL = temporaryDirectoryURL
+                .appendingPathComponent(String(format: "crop-%03d.png", batchIndex + 1))
+            let candidateCrop = try Self.writeCandidateCrop(
+                source: source,
+                candidate: requestCandidate,
+                to: cropURL
             )
-            #if DEBUG
-            if ProcessInfo.processInfo.environment["MANGAKITCHEN_DEBUG_VLM_REGIONS"] == "1" {
-                let message = "[MangaKitchen bubble sheet response \(batchIndex + 1)/\(batchCount)]\n\(response)\n"
-                FileHandle.standardError.write(Data(message.utf8))
-            }
-            #endif
+            let requestIndex = batchIndex
+            let expected = Set(requestCandidates.map(\.index))
+            var items: [ClassifiedItem]?
 
-            let items = try Self.decode(response)
-            let expected = Set(sheetCandidates.map(\.index))
-            var returnedLocalIndices: Set<Int> = []
+            for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
+                try Task.checkCancellation()
+                let response = try await model.generateText(
+                    imageURL: cropURL,
+                    prompt: Self.prompt(
+                        languageHint: languageHint,
+                        expectedIndices: requestCandidates.map(\.index),
+                        attempt: attempt
+                    ),
+                    maximumOutputTokens: 2_048,
+                    progress: { value in
+                        let local = VLMStructuredResponseDecoder.mappedProgress(
+                            attempt: attempt,
+                            value: value
+                        )
+                        progress((Double(requestIndex) + local) / Double(batchCount))
+                    }
+                )
+                #if DEBUG
+                if ProcessInfo.processInfo.environment["MANGAKITCHEN_DEBUG_VLM_REGIONS"] == "1" {
+                    let message = "[MangaKitchen grounded crop response \(batchIndex + 1)/\(batchCount), attempt \(attempt + 1)]\n\(response)\n"
+                    FileHandle.standardError.write(Data(message.utf8))
+                }
+                #endif
+
+                for candidateItems in VLMStructuredResponseDecoder.decodeArrays(
+                    ClassifiedItem.self,
+                    from: response
+                ) {
+                    let returnedIndices = Set(candidateItems.map(\.index)).intersection(expected)
+                    let missingCount = expected.subtracting(returnedIndices).count
+                    if missingCount == 0 {
+                        items = candidateItems
+                        break
+                    }
+                }
+                if items != nil { break }
+            }
+
+            guard let items else {
+                // 單一卡片的模型輸出不完整時，只略過該候選。不能因為一個候選失敗，
+                // 就丟棄同一頁其他已成功分類的區域。空文字與未知 kind 會在下方統一過濾，
+                // 仍不會被寫成不完整的對話區域。
+                progress(Double(batchIndex + 1) / Double(batchCount))
+                continue
+            }
+
             for item in items where expected.contains(item.index) {
-                returnedLocalIndices.insert(item.index)
-                let globalIndex = batch[item.index - 1].index
-                classifiedByIndex[globalIndex] = ClassifiedItem(
-                    index: globalIndex,
+                let localIndex = item.index - 1
+                guard batch.indices.contains(localIndex) else { continue }
+                let candidate = batch[localIndex]
+                let clippingBounds = candidate.bubbleBounds
+                    ?? candidate.bounds.expanded(by: 0.5)
+                let groundedBounds = VLMTextGrounding.pageBounds(
+                    modelBoxes: item.textBoxes ?? [],
+                    cropRect: candidateCrop.sourceRect,
+                    imageWidth: source.width,
+                    imageHeight: source.height,
+                    clippingBounds: clippingBounds
+                )
+                // 本機字形群集是像素精修的可信種子；VLM 座標只在本機沒有找到
+                // 文字時補位。反過來會讓偶爾漂到分鏡底線的粗框蓋過正確定位。
+                let textBounds = candidate.fallbackTextBounds
+                    ?? groundedBounds
+                    ?? (candidate.requiresGrounding ? nil : candidate.bounds)
+                classifiedByIndex[candidate.index] = ResolvedClassifiedItem(
                     text: item.text,
                     kind: item.kind,
-                    direction: item.direction
+                    direction: item.direction,
+                    textBounds: textBounds
                 )
-            }
-            let missingCount = expected.reduce(into: 0) { count, index in
-                if !returnedLocalIndices.contains(index) { count += 1 }
-            }
-            guard missingCount == 0 else {
-                throw SupplementalRegionDetectionError.missingCandidateResults(missingCount)
             }
             progress(Double(batchIndex + 1) / Double(batchCount))
         }
@@ -163,80 +381,25 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         let resolved = candidates.compactMap { candidate -> DialogueRegion? in
             guard let item = classifiedByIndex[candidate.index] else { return nil }
             let kind = item.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let modelAccepted = ["dialogue", "caption", "title"].contains(kind)
-            guard modelAccepted else { return nil }
-            let modelText = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let groundingOCR: [DialogueRegion]
-            switch candidate.source {
-            case let .enclosure(regions):
-                groundingOCR = regions
-            case let .recognizedText(region):
-                groundingOCR = [region]
-            }
-            // 只有「整個被框住」的 OCR 框才拿來定位。跨在框線上的 OCR 框可能屬於
-            // 隔壁對話框或擬聲字，讓它參與聯集會把 bounds 拉向邊緣；寧可退回
-            // 候選框，交由像素精修收斂。
-            let containedOCR = groundingOCR.filter {
-                Self.containmentRatio(of: $0.bounds, in: candidate.bounds)
-                    >= Self.positioningContainmentRatio
-            }
-            let ocrText: String
-            switch candidate.source {
-            case .enclosure:
-                // 有 OCR 時以其文字作備援；沒有 OCR 時直接採用 VLM 對封閉框的
-                // 轉錄，讓直式文字不會因系統 OCR 漏字而整區消失。
-                ocrText = groundingOCR
-                    .map { $0.rawSourceText ?? $0.sourceText }
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                    .joined(separator: "\n")
-            case let .recognizedText(region):
-                // 這張卡片就是這個 OCR 區塊本身，模型看不清時沿用它原本的文字。
-                ocrText = (region.rawSourceText ?? region.sourceText)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            let text = !modelText.isEmpty ? modelText : ocrText
-            guard !text.isEmpty else { return nil }
-            let rawText = !ocrText.isEmpty ? ocrText : text
-
-            // 兩個來源重疊時以 OCR 位置優先：取完全被框住的 OCR 框聯集當「文字在
-            // 哪」，白區候選則退為「不得超出的框」。候選框可能是整格白底分鏡，
-            // 直接拿來排版會把譯文擺到分鏡正中央；用 OCR 聯集才對得回原文位置。
-            // 聯集偏小也安全：像素精修若發現粗框截斷了文字，會自動改用整個
-            // bubbleBounds 重新搜尋，最後再收斂到字形級多邊形。
-            let textBounds = containedOCR
-                .map(\.bounds)
-                .reduce(nil) { partial, bounds in
-                    partial.map { $0.union(with: bounds) } ?? bounds
-                }
-                .map { $0.intersection(with: candidate.bounds) }
-                .flatMap { $0.width > 0 && $0.height > 0 ? $0 : nil }
-            var style = groundingOCR.first?.style ?? DialogueStyle()
+            guard Self.isModelAcceptedKind(kind) else { return nil }
+            let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let bounds = item.textBounds,
+                  !text.isEmpty,
+                  !Self.isSoundEffectTranscript(text),
+                  Self.isPlausibleTranscript(text, in: bounds) else { return nil }
+            var style = DialogueStyle()
             style.writingDirection = item.direction
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
                 .flatMap(WritingDirection.init(rawValue:))
                 ?? .automatic
-
-            let bounds: NormalizedRect
-            let bubbleBounds: NormalizedRect?
-            switch candidate.source {
-            case .enclosure:
-                bounds = textBounds ?? candidate.bounds
-                bubbleBounds = candidate.bounds
-            case let .recognizedText(region):
-                // 沒有封閉白區就沒有可信的對話框邊界。bubbleBounds 留 nil，
-                // 遮罩與排版才會退回「只依 maskExpansion 由文字外擴」，
-                // 而不是把一個猜出來的框當成硬邊界。
-                bounds = region.bounds
-                bubbleBounds = nil
-            }
+            let bubbleBounds = candidate.bubbleBounds
             return DialogueRegion(
-                id: groundingOCR.first?.id ?? UUID(),
                 bounds: bounds,
                 bubbleBounds: bubbleBounds,
-                rawSourceText: rawText,
+                rawSourceText: text,
                 sourceText: text,
-                confidence: max(0.75, groundingOCR.map(\.confidence).max() ?? 0),
+                ocrTextRefined: true,
+                confidence: 0.75,
                 style: style,
                 // 只有像素精修成功後才開啟自動遮罩；失敗時不可把整個泡泡抹掉。
                 automaticMaskEnabled: false
@@ -246,27 +409,14 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         return Self.deduplicated(resolved)
     }
 
-    /// OCR 區塊至少有此比例落在封閉框內，才歸屬該框；否則視為無框文字。
-    private static let textOwnershipRatio = 0.3
-    /// 允許 OCR 框決定 bounds 所需的重疊比例；OCR 粗框本來就會鬆一點，
-    /// 因此不要求數學上的 100%。
-    private static let positioningContainmentRatio = 0.95
-
-    private static func containmentRatio(
-        of textBounds: NormalizedRect,
-        in candidateBounds: NormalizedRect
-    ) -> Double {
-        let overlap = candidateBounds.intersection(with: textBounds)
-        let textArea = max(textBounds.width * textBounds.height, .leastNonzeroMagnitude)
-        return (overlap.width * overlap.height) / textArea
-    }
-
-    /// 封閉框偵測與 OCR 粗框偶爾會對同一內容產生近似候選。幾何高度重疊，或
-    /// 文字相同且有實質交集時視為同一區域；保留具有封閉框資訊與較小文字框者。
+    /// 封閉框偵測偶爾會對同一內容產生近似候選。幾何高度重疊，或文字相同且有
+    /// 實質交集時視為同一區域。
     private static func deduplicated(_ regions: [DialogueRegion]) -> [DialogueRegion] {
         var result: [DialogueRegion] = []
         for region in regions {
-            guard let duplicateIndex = result.firstIndex(where: { isDuplicate($0, region) }) else {
+            guard let duplicateIndex = result.firstIndex(where: {
+                isDuplicate($0, region) || isTranscriptionEcho($0, region)
+            }) else {
                 result.append(region)
                 continue
             }
@@ -287,6 +437,34 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         let lhsText = normalizedText(lhs.sourceText)
         let rhsText = normalizedText(rhs.sourceText)
         return !lhsText.isEmpty && lhsText == rhsText && overlapArea / minimumArea >= 0.25
+    }
+
+    /// 轉錄回聲：兩個位置完全不重疊，文字卻幾乎一樣。這是無框候選從鄰近卡片
+    /// 把同一段台詞再讀一次造成的，幾何去重看不到（重疊為零就直接放行）。
+    ///
+    /// 只在其中一邊沒有 bubbleBounds 時才判定重複 —— 同一頁本來就可能有兩顆
+    /// 內容相同的氣泡（003 就有兩個「ここだ…！」），兩邊都有封閉框佐證時不能合併。
+    private static func isTranscriptionEcho(_ lhs: DialogueRegion, _ rhs: DialogueRegion) -> Bool {
+        guard lhs.bubbleBounds == nil || rhs.bubbleBounds == nil else { return false }
+        let lhsText = normalizedText(lhs.sourceText)
+        let rhsText = normalizedText(rhs.sourceText)
+        guard lhsText.count >= 4, rhsText.count >= 4 else { return false }
+        return characterOverlapRatio(lhsText, rhsText) >= 0.7
+    }
+
+    /// 較短那串有多少比例的字元也出現在較長那串裡（以出現次數計）。
+    /// 模型重讀同一段時常有錯字與省略，因此不用完全相等比對。
+    private static func characterOverlapRatio(_ lhs: String, _ rhs: String) -> Double {
+        let shorter = lhs.count <= rhs.count ? lhs : rhs
+        let longer = lhs.count <= rhs.count ? rhs : lhs
+        var pool: [Character: Int] = [:]
+        for character in longer { pool[character, default: 0] += 1 }
+        var shared = 0
+        for character in shorter where (pool[character] ?? 0) > 0 {
+            pool[character]! -= 1
+            shared += 1
+        }
+        return Double(shared) / Double(max(shorter.count, 1))
     }
 
     private static func preferredRegion(_ lhs: DialogueRegion, _ rhs: DialogueRegion) -> DialogueRegion {
@@ -313,135 +491,89 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
             .lowercased()
     }
 
-    private static func prompt(languageHint: String, expectedIndices: [Int]) -> String {
+    private static func isSoundEffectTranscript(_ text: String) -> Bool {
+        let normalized = normalizedText(text)
+        return normalized.hasPrefix("sfx:")
+            || normalized.hasPrefix("sfx：")
+            || normalized.hasPrefix("soundeffect:")
+    }
+
+    private static func isModelAcceptedKind(_ kind: String) -> Bool {
+        ["dialogue", "caption", "title"].contains(
+            kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        )
+    }
+
+    private static func isPlausibleTranscript(
+        _ text: String,
+        in bounds: NormalizedRect
+    ) -> Bool {
+        let visibleCharacterCount = text.reduce(into: 0) { count, character in
+            guard !character.isWhitespace, !character.isNewline else { return }
+            count += 1
+        }
+        guard visibleCharacterCount > 0 else { return false }
+        let areaPerCharacter = bounds.width * bounds.height / Double(visibleCharacterCount)
+        return areaPerCharacter <= maximumAreaPerTranscriptCharacter
+    }
+
+    private static func prompt(languageHint: String, expectedIndices: [Int], attempt: Int) -> String {
         """
-        You are proofreading candidate regions from one comic page. The image is a contact sheet.
-        Every card has a visible REGION number. A card is a crop either around one enclosed white
-        area (a balloon, caption box, or title card) or around a block of text that has no
-        enclosure at all. Both kinds can hold real dialogue.
+        You are proofreading one cropped candidate region from a comic page. It may contain
+        enclosed or unenclosed text, an empty panel, artwork, or another non-text area.
         Likely source language codes: \(languageHint).
         Expected REGION numbers: \(expectedIndices).
 
         For every expected REGION, return exactly one item:
-        - dialogue: speech or thought, whether or not a balloon encloses it;
-        - caption: narration or inner monologue, whether it sits in a caption box or is set
-          directly on the artwork or on speed lines;
+        - dialogue: speech or thought, with or without a closed balloon;
+        - caption: narration or inner monologue, with or without a closed caption box;
         - title: a chapter, episode, or panel title;
         - ignore: artwork, a face, clothing, empty decoration, sound effect, action sound, credit,
           username, watermark, publisher mark, advertisement, or page number.
 
         Rules:
-        - Decide by WHAT THE TEXT IS, not by whether a frame encloses it. Unenclosed narration and
-          unenclosed speech are still caption and dialogue.
+        - Decide by the visible text and its semantic role, not by whether an outline encloses it.
         - Stylised onomatopoeia drawn as artwork (impact and action sounds) is always ignore, even
-          when it is large and legible.
-        - A numbered chapter/episode heading inside its own framed title card is title, not a page number.
+          when it is large and legible. Do not confuse it with words spoken by a character.
+        - A spoken attack name or emphatic phrase is dialogue when it appears in a speech balloon
+          or is visibly uttered by a character, even when its lettering is large, bold or stylised.
+        - title is only for an explicit chapter or episode heading, not a spoken attack name.
         - Transcribe all text on an accepted card exactly in its original language.
         - Combine all lines or vertical columns belonging to the same card into one text value, in
           the source language's reading order.
         - direction must describe the source text in the card: vertical for top-to-bottom columns,
           horizontal for left-to-right or right-to-left rows.
-        - For ignore, return an empty text string.
+        - For every accepted item, bbox_2d must be one tight rectangle enclosing all transcribed
+          glyphs. Coordinates are [x1,y1,x2,y2], relative to the entire supplied crop, from 0 to 1000.
+        - Exclude balloon outlines, panel borders, faces, hair, clothing, illustrations, speed
+          lines, and sound effects from bbox_2d.
+        - For ignore, return an empty text string and an empty bbox_2d array.
         - Never translate, explain, omit, duplicate, or renumber a REGION.
 
         Return only a syntactically valid JSON array in this exact shape:
-        [{"index":1,"text":"source text","kind":"dialogue","direction":"vertical"},{"index":2,"text":"","kind":"ignore","direction":"horizontal"}]
+        [{"index":1,"text":"source text","kind":"dialogue","direction":"vertical","bbox_2d":[480,110,760,720]}]
+        \(VLMStructuredResponseDecoder.retryInstruction(attempt: attempt))
         """
     }
 
-    private static func writeContactSheet(
+    private static func writeCandidateCrop(
         source: CGImage,
-        candidates: [IndexedCandidate],
+        candidate: IndexedCandidate,
         to outputURL: URL
-    ) throws {
-        let columns = min(3, max(1, candidates.count))
-        let rows = Int(ceil(Double(candidates.count) / Double(columns)))
-        let cellWidth = 384
-        let cellHeight = 384
-        let sheetWidth = columns * cellWidth
-        let sheetHeight = rows * cellHeight
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(
-            data: nil,
-            width: sheetWidth,
-            height: sheetHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: sheetWidth * 4,
-            space: colorSpace,
-            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
-                | CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
+    ) throws -> CandidateCrop {
+        let visibleBounds = candidate.bubbleBounds
+            .map { $0.union(with: candidate.bounds) }
+            ?? candidate.bounds
+        let sourceRect = expandedPixelRect(
+            for: visibleBounds,
+            sourceWidth: source.width,
+            sourceHeight: source.height
+        )
+        guard let crop = source.cropping(to: sourceRect) else {
             throw ImageProcessingError.cannotCreateBitmap
         }
-
-        context.setFillColor(gray: 0.92, alpha: 1)
-        context.fill(CGRect(x: 0, y: 0, width: sheetWidth, height: sheetHeight))
-        context.interpolationQuality = .high
-        context.setShouldAntialias(true)
-
-        for (offset, candidate) in candidates.enumerated() {
-            let column = offset % columns
-            let row = offset / columns
-            let cellX = CGFloat(column * cellWidth)
-            let cellTop = CGFloat(row * cellHeight)
-            let cellBottom = CGFloat(sheetHeight) - cellTop - CGFloat(cellHeight)
-            let cellRect = CGRect(
-                x: cellX + 4,
-                y: cellBottom + 4,
-                width: CGFloat(cellWidth - 8),
-                height: CGFloat(cellHeight - 8)
-            )
-            context.setFillColor(gray: 1, alpha: 1)
-            context.fill(cellRect)
-            context.setStrokeColor(gray: 0.15, alpha: 1)
-            context.setLineWidth(3)
-            context.stroke(cellRect)
-
-            let sourceRect = expandedPixelRect(
-                for: candidate.bounds,
-                sourceWidth: source.width,
-                sourceHeight: source.height
-            )
-            if let crop = source.cropping(to: sourceRect) {
-                let availableWidth = CGFloat(cellWidth - 24)
-                let availableHeight = CGFloat(cellHeight - 62)
-                let scale = min(
-                    availableWidth / CGFloat(crop.width),
-                    availableHeight / CGFloat(crop.height)
-                )
-                let drawWidth = CGFloat(crop.width) * scale
-                let drawHeight = CGFloat(crop.height) * scale
-                let contentBottom = cellBottom + 12
-                let drawRect = CGRect(
-                    x: cellX + (CGFloat(cellWidth) - drawWidth) / 2,
-                    y: contentBottom + (availableHeight - drawHeight) / 2,
-                    width: drawWidth,
-                    height: drawHeight
-                )
-                context.draw(crop, in: drawRect)
-            }
-
-            let label = "REGION \(candidate.index)" as CFString
-            let attributes: [CFString: Any] = [
-                kCTFontAttributeName: CTFontCreateWithName("Helvetica-Bold" as CFString, 24, nil),
-                kCTForegroundColorAttributeName: CGColor(gray: 0.05, alpha: 1)
-            ]
-            let line = CTLineCreateWithAttributedString(CFAttributedStringCreate(
-                nil,
-                label,
-                attributes as CFDictionary
-            ))
-            context.textPosition = CGPoint(
-                x: cellX + 12,
-                y: cellBottom + CGFloat(cellHeight - 34)
-            )
-            CTLineDraw(line, context)
-        }
-
-        guard let sheet = context.makeImage() else {
-            throw ImageProcessingError.cannotCreateBitmap
-        }
-        try CGImageIO.writePNG(sheet, to: outputURL)
+        try CGImageIO.writePNG(crop, to: outputURL)
+        return CandidateCrop(sourceRect: sourceRect)
     }
 
     private static func expandedPixelRect(
@@ -462,33 +594,18 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         ).intersection(CGRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight))
     }
 
-    private static func decode(_ response: String) throws -> [ClassifiedItem] {
-        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let data = trimmed.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([ClassifiedItem].self, from: data) {
-            return decoded
-        }
-        guard let start = trimmed.firstIndex(of: "["),
-              let end = trimmed.lastIndex(of: "]"),
-              start <= end,
-              let data = String(trimmed[start...end]).data(using: .utf8),
-              let decoded = try? JSONDecoder().decode([ClassifiedItem].self, from: data) else {
-            throw SupplementalRegionDetectionError.invalidModelResponse
-        }
-        return decoded
-    }
 }
 
 public enum SupplementalRegionDetectionError: LocalizedError, Sendable {
     case invalidModelResponse
-    case missingCandidateResults(Int)
+    case incompleteCandidateResults(Int)
 
     public var errorDescription: String? {
         switch self {
         case .invalidModelResponse:
             "圖生文模型沒有回傳指定的泡泡分類 JSON 格式。"
-        case let .missingCandidateResults(count):
-            "泡泡分類缺少 \(count) 個候選區域，未寫入不完整結果。"
+        case let .incompleteCandidateResults(count):
+            "泡泡分類有 \(count) 個候選缺少結果或有效文字內容，未寫入不完整結果。"
         }
     }
 }

@@ -41,7 +41,7 @@ public actor DialogueMaskGenerator: DialogueMaskGenerating {
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         for region in regions where region.automaticMaskEnabled {
             // 只有在確實知道對話框內緣時才裁切。若退回 region.bounds，外擴後的遮罩
-            // 會立刻被裁回 OCR 粗框，maskExpansion 等於完全失效。
+            // 會立刻被裁回來源粗框，maskExpansion 等於完全失效。
             let bubbleBounds = region.bubbleBounds?.clamped()
             var clipRectangle: CGRect?
             if let bubbleBounds {

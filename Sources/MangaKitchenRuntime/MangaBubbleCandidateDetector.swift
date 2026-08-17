@@ -22,93 +22,62 @@ struct MangaBubbleCandidateDetector {
         var area: Int
     }
 
-    /// 補洞後的元件輪廓資訊。洞（框內被墨線圍住的暗區）本身就是分類依據：
-    /// 對話框裡的洞是字，小而多；分鏡裡的洞是人物線稿，會出現單一大塊。
-    private struct EnclosureMetrics {
-        var bounds: PixelBounds
-        var brightArea: Int
-        var holeArea: Int
-        var largestHoleArea: Int
-
-        var solidArea: Int { brightArea + holeArea }
-        var boundsArea: Int { bounds.width * bounds.height }
-        /// 補洞後的形狀相對於外接矩形的填滿率；細長殘白會被擋掉。
-        var fillRatio: Double { Double(solidArea) / Double(max(boundsArea, 1)) }
-        /// 框內墨色佔比。對話框以留白為主，分鏡以線稿為主。
-        var inkRatio: Double { Double(holeArea) / Double(max(solidArea, 1)) }
-        /// 最大單一洞的佔比。字再多也只是一個個小洞，人物剪影則是一大塊。
-        var largestHoleRatio: Double { Double(largestHoleArea) / Double(max(solidArea, 1)) }
-    }
-
-    private let maximumWhiteThreshold: UInt8
+    private let inkThreshold: UInt8
+    private let minimumWhiteAreaRatio: Double
     private let minimumBoundsAreaRatio: Double
     private let maximumBoundsAreaRatio: Double
     private let minimumFillRatio: Double
-    private let maximumInkRatio: Double
-    private let maximumLargestHoleRatio: Double
     private let maximumCandidates: Int
 
     init(
-        maximumWhiteThreshold: UInt8 = 245,
+        // 判準是「非墨色」而不是「夠白」：網點面板上的氣泡內部只有 200 出頭，
+        // 用 245 會整片看不見。實測從氣泡內部 flood fill，>200 這個判準下
+        // 氣泡都是封閉的（0.5～2.2% 頁面積），不會漏進分鏡背景。
+        //
+        // 面積下限也放寬：實測「ふふ…」只佔 0.6% 頁面積，舊的 0.01（1%）
+        // 會把這類小氣泡整個刷掉 —— 那才是它一直被漏掉的原因，不是拓樸問題。
+        // 放寬帶進來的誤判交給 VLM 判 ignore，那一段已驗證可靠。
+        inkThreshold: UInt8 = 200,
+        minimumWhiteAreaRatio: Double = 0.002,
         minimumBoundsAreaRatio: Double = 0.004,
-        maximumBoundsAreaRatio: Double = 0.25,
-        minimumFillRatio: Double = 0.55,
-        maximumInkRatio: Double = 0.45,
-        maximumLargestHoleRatio: Double = 0.1,
+        maximumBoundsAreaRatio: Double = 0.2,
+        minimumFillRatio: Double = 0.45,
         maximumCandidates: Int = 36
     ) {
-        self.maximumWhiteThreshold = maximumWhiteThreshold
+        self.inkThreshold = inkThreshold
+        self.minimumWhiteAreaRatio = minimumWhiteAreaRatio
         self.minimumBoundsAreaRatio = minimumBoundsAreaRatio
         self.maximumBoundsAreaRatio = maximumBoundsAreaRatio
         self.minimumFillRatio = minimumFillRatio
-        self.maximumInkRatio = maximumInkRatio
-        self.maximumLargestHoleRatio = maximumLargestHoleRatio
         self.maximumCandidates = max(1, maximumCandidates)
     }
 
     func detect(in image: CGImage) throws -> [NormalizedRect] {
         let raster = try GrayscaleRaster(image: image)
-        let width = raster.width
-        let height = raster.height
-        let imageArea = Double(max(width * height, 1))
-        let bright = raster.brightMask(threshold: paperThreshold(in: raster))
-
-        // 不可在全頁補洞後才切元件：對話框外框墨線被白色分鏡背景包住，
-        // 補洞會把它填成亮區，於是分鏡背景與框內留白連成同一個元件，
-        // 整格分鏡就被當成一個候選。改為先切元件，再逐一在自己的範圍內補洞。
-        let labelled = labelComponents(in: bright, width: width, height: height)
-        let sized = labelled.components.enumerated().filter { _, component in
-            let boundsAreaRatio = Double(component.bounds.width * component.bounds.height) / imageArea
-            return boundsAreaRatio >= minimumBoundsAreaRatio
-                && boundsAreaRatio <= maximumBoundsAreaRatio
-                && Double(component.bounds.width) / Double(width) >= 0.03
-                && Double(component.bounds.height) / Double(height) >= 0.02
-        }
-
-        let shaped = sized.compactMap { index, component -> EnclosureMetrics? in
-            let metrics = enclosureMetrics(
-                label: Int32(index),
-                component: component,
-                labels: labelled.labels,
-                width: width,
-                height: height
-            )
-            guard metrics.fillRatio >= minimumFillRatio,
-                  metrics.inkRatio <= maximumInkRatio,
-                  metrics.largestHoleRatio <= maximumLargestHoleRatio else { return nil }
-            return metrics
-        }
-
-        // 對話框不會包住另一個對話框，但白底分鏡會包住畫在它上面的對話框。
-        // 因此凡是「包住另一個候選」的候選都是分鏡，取內不取外。
-        var candidates = shaped.filter { candidate in
-            !shaped.contains { encloses(candidate, $0) }
-        }.map { metrics in
-            NormalizedRect(
-                x: Double(metrics.bounds.minX) / Double(width),
-                y: Double(metrics.bounds.minY) / Double(height),
-                width: Double(metrics.bounds.width) / Double(width),
-                height: Double(metrics.bounds.height) / Double(height)
+        let imageArea = Double(max(raster.width * raster.height, 1))
+        var candidates = connectedWhiteComponents(in: raster).compactMap { component -> NormalizedRect? in
+            let boundsArea = component.bounds.width * component.bounds.height
+            guard boundsArea > 0 else { return nil }
+            let whiteAreaRatio = Double(component.area) / imageArea
+            let boundsAreaRatio = Double(boundsArea) / imageArea
+            let fillRatio = Double(component.area) / Double(boundsArea)
+            let widthRatio = Double(component.bounds.width) / Double(raster.width)
+            let heightRatio = Double(component.bounds.height) / Double(raster.height)
+            guard whiteAreaRatio >= minimumWhiteAreaRatio,
+                  boundsAreaRatio >= minimumBoundsAreaRatio,
+                  boundsAreaRatio <= maximumBoundsAreaRatio,
+                  fillRatio >= minimumFillRatio,
+                  widthRatio >= 0.04,
+                  heightRatio >= 0.02,
+                  !(boundsAreaRatio >= 0.04
+                    && isFrameLike(component.bounds, in: raster)) else {
+                return nil
+            }
+            return NormalizedRect(
+                x: Double(component.bounds.minX) / Double(raster.width),
+                y: Double(component.bounds.minY) / Double(raster.height),
+                width: widthRatio,
+                height: heightRatio
             ).clamped()
         }
 
@@ -124,49 +93,20 @@ struct MangaBubbleCandidateDetector {
         }
     }
 
-    private func encloses(_ outer: EnclosureMetrics, _ inner: EnclosureMetrics) -> Bool {
-        guard inner.boundsArea < outer.boundsArea else { return false }
-        let overlapWidth = max(0, min(inner.bounds.maxX, outer.bounds.maxX)
-            - max(inner.bounds.minX, outer.bounds.minX))
-        let overlapHeight = max(0, min(inner.bounds.maxY, outer.bounds.maxY)
-            - max(inner.bounds.minY, outer.bounds.minY))
-        let overlap = Double(overlapWidth * overlapHeight)
-        return overlap / Double(max(inner.boundsArea, 1)) >= 0.9
-            && Double(inner.boundsArea) / Double(max(outer.boundsArea, 1)) <= 0.6
-    }
-
-    /// 紙面白並非固定值：JPEG 壓縮與網點會把泡泡內部壓到 240 以下，
-    /// 固定 245 會把整頁切成數萬個雜訊碎片，一個候選都留不下來。
-    /// 改以「200 以上最亮的主峰」當紙色，再往下讓出壓縮雜訊的餘裕。
-    private func paperThreshold(in raster: GrayscaleRaster) -> UInt8 {
-        let histogram = raster.histogram()
-        var peak = Int(maximumWhiteThreshold)
-        var peakCount = -1
-        for level in 200...255 where histogram[level] > peakCount {
-            peakCount = histogram[level]
-            peak = level
-        }
-        let relaxed = peak - 10
-        return UInt8(min(Int(maximumWhiteThreshold), max(225, relaxed)))
-    }
-
-    /// 4-連通標記亮區元件，並保留每個像素的元件編號，
-    /// 後續才能逐元件在自己的範圍內補洞。
-    private func labelComponents(
-        in bright: [Bool],
-        width: Int,
-        height: Int
-    ) -> (labels: [Int32], components: [Component]) {
-        var labels = [Int32](repeating: -1, count: width * height)
+    private func connectedWhiteComponents(in raster: GrayscaleRaster) -> [Component] {
+        let width = raster.width
+        let height = raster.height
+        var visited = [UInt8](repeating: 0, count: width * height)
         var components: [Component] = []
         let offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
         for y in 0..<height {
             for x in 0..<width {
                 let startIndex = y * width + x
-                guard bright[startIndex], labels[startIndex] == -1 else { continue }
-                let identifier = Int32(components.count)
-                labels[startIndex] = identifier
+                guard visited[startIndex] == 0 else { continue }
+                visited[startIndex] = 1
+                guard raster[x, y] > inkThreshold else { continue }
+
                 var queue = [startIndex]
                 var cursor = 0
                 var area = 0
@@ -192,9 +132,11 @@ struct MangaBubbleCandidateDetector {
                         guard nextX >= 0, nextX < width,
                               nextY >= 0, nextY < height else { continue }
                         let nextIndex = nextY * width + nextX
-                        guard bright[nextIndex], labels[nextIndex] == -1 else { continue }
-                        labels[nextIndex] = identifier
-                        queue.append(nextIndex)
+                        guard visited[nextIndex] == 0 else { continue }
+                        visited[nextIndex] = 1
+                        if raster[nextX, nextY] > inkThreshold {
+                            queue.append(nextIndex)
+                        }
                     }
                 }
 
@@ -204,100 +146,61 @@ struct MangaBubbleCandidateDetector {
                 ))
             }
         }
-        return (labels, components)
+        return components
     }
 
-    /// 在元件自己的外接矩形內補洞：從矩形邊界對「非本元件」像素做 flood fill，
-    /// 邊界到不了的就是被本元件圍住的洞。這樣既能量到補洞後的真實形狀，
-    /// 又不會像全頁補洞那樣把相鄰元件連在一起。
-    private func enclosureMetrics(
-        label: Int32,
-        component: Component,
-        labels: [Int32],
-        width: Int,
-        height: Int
-    ) -> EnclosureMetrics {
-        let localWidth = component.bounds.width + 2
-        let localHeight = component.bounds.height + 2
-        func belongsToComponent(_ localX: Int, _ localY: Int) -> Bool {
-            let x = component.bounds.minX + localX - 1
-            let y = component.bounds.minY + localY - 1
-            guard x >= 0, x < width, y >= 0, y < height else { return false }
-            return labels[y * width + x] == label
-        }
+    /// 大型白底分鏡會被四條近乎筆直的框線包住，僅靠白區面積與填充率會被誤認
+    /// 成巨大對話框。檢查元件外接框四邊附近的墨色覆蓋率，把完整分鏡排除；小型
+    /// 矩形旁白框不套用這個規則，仍可由文字群集補充進工作流。
+    private func isFrameLike(_ bounds: PixelBounds, in raster: GrayscaleRaster) -> Bool {
+        guard bounds.width > 8, bounds.height > 8 else { return false }
+        let thickness = 3
 
-        var outside = [Bool](repeating: false, count: localWidth * localHeight)
-        var stack: [Int] = []
-        func seed(_ localX: Int, _ localY: Int) {
-            let index = localY * localWidth + localX
-            guard !outside[index], !belongsToComponent(localX, localY) else { return }
-            outside[index] = true
-            stack.append(index)
-        }
-        for localX in 0..<localWidth {
-            seed(localX, 0)
-            seed(localX, localHeight - 1)
-        }
-        for localY in 0..<localHeight {
-            seed(0, localY)
-            seed(localWidth - 1, localY)
-        }
-        while let current = stack.popLast() {
-            let currentX = current % localWidth
-            let currentY = current / localWidth
-            for (offsetX, offsetY) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let nextX = currentX + offsetX
-                let nextY = currentY + offsetY
-                guard nextX >= 0, nextX < localWidth,
-                      nextY >= 0, nextY < localHeight else { continue }
-                let nextIndex = nextY * localWidth + nextX
-                guard !outside[nextIndex], !belongsToComponent(nextX, nextY) else { continue }
-                outside[nextIndex] = true
-                stack.append(nextIndex)
-            }
-        }
-
-        var visited = [Bool](repeating: false, count: localWidth * localHeight)
-        var holeArea = 0
-        var largestHoleArea = 0
-        for localY in 0..<localHeight {
-            for localX in 0..<localWidth {
-                let index = localY * localWidth + localX
-                guard !outside[index], !visited[index],
-                      !belongsToComponent(localX, localY) else { continue }
-                visited[index] = true
-                var queue = [index]
-                var cursor = 0
-                var size = 0
-                while cursor < queue.count {
-                    let current = queue[cursor]
-                    cursor += 1
-                    size += 1
-                    let currentX = current % localWidth
-                    let currentY = current / localWidth
-                    for (offsetX, offsetY) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                        let nextX = currentX + offsetX
-                        let nextY = currentY + offsetY
-                        guard nextX >= 0, nextX < localWidth,
-                              nextY >= 0, nextY < localHeight else { continue }
-                        let nextIndex = nextY * localWidth + nextX
-                        guard !outside[nextIndex], !visited[nextIndex],
-                              !belongsToComponent(nextX, nextY) else { continue }
-                        visited[nextIndex] = true
-                        queue.append(nextIndex)
-                    }
+        func horizontalInteriorCoverage(from minimumY: Int, to maximumY: Int) -> Double {
+            guard minimumY < maximumY else { return 0 }
+            var whiteColumns = 0
+            for x in max(0, bounds.minX)..<min(raster.width, bounds.maxX) {
+                var isWhite = false
+                for sampleY in minimumY..<maximumY where raster[x, sampleY] > inkThreshold {
+                    isWhite = true
+                    break
                 }
-                holeArea += size
-                largestHoleArea = max(largestHoleArea, size)
+                if isWhite { whiteColumns += 1 }
             }
+            return Double(whiteColumns) / Double(max(bounds.width, 1))
         }
 
-        return EnclosureMetrics(
-            bounds: component.bounds,
-            brightArea: component.area,
-            holeArea: holeArea,
-            largestHoleArea: largestHoleArea
+        func verticalInteriorCoverage(from minimumX: Int, to maximumX: Int) -> Double {
+            guard minimumX < maximumX else { return 0 }
+            var whiteRows = 0
+            for y in max(0, bounds.minY)..<min(raster.height, bounds.maxY) {
+                var isWhite = false
+                for sampleX in minimumX..<maximumX where raster[sampleX, y] > inkThreshold {
+                    isWhite = true
+                    break
+                }
+                if isWhite { whiteRows += 1 }
+            }
+            return Double(whiteRows) / Double(max(bounds.height, 1))
+        }
+
+        let top = horizontalInteriorCoverage(
+            from: bounds.minY,
+            to: min(bounds.maxY, bounds.minY + thickness)
         )
+        let bottom = horizontalInteriorCoverage(
+            from: max(bounds.minY, bounds.maxY - thickness),
+            to: bounds.maxY
+        )
+        let left = verticalInteriorCoverage(
+            from: bounds.minX,
+            to: min(bounds.maxX, bounds.minX + thickness)
+        )
+        let right = verticalInteriorCoverage(
+            from: max(bounds.minX, bounds.maxX - thickness),
+            to: bounds.maxX
+        )
+        return top >= 0.72 && bottom >= 0.72 && left >= 0.72 && right >= 0.72
     }
 }
 
@@ -330,11 +233,14 @@ private struct GrayscaleRaster {
         var grayscale = [UInt8](repeating: 255, count: imageWidth * imageHeight)
         for index in grayscale.indices {
             let offset = index * 4
-            grayscale[index] = UInt8((
-                Int(rgba[offset]) * 299
-                    + Int(rgba[offset + 1]) * 587
-                    + Int(rgba[offset + 2]) * 114
-            ) / 1_000)
+            let red = Int(rgba[offset])
+            let green = Int(rgba[offset + 1])
+            let blue = Int(rgba[offset + 2])
+            let weightedRed = red * 299
+            let weightedGreen = green * 587
+            let weightedBlue = blue * 114
+            let luminance = (weightedRed + weightedGreen + weightedBlue) / 1_000
+            grayscale[index] = UInt8(luminance)
         }
         width = imageWidth
         height = imageHeight
@@ -343,15 +249,5 @@ private struct GrayscaleRaster {
 
     subscript(x: Int, y: Int) -> UInt8 {
         pixels[y * width + x]
-    }
-
-    func histogram() -> [Int] {
-        var result = [Int](repeating: 0, count: 256)
-        for value in pixels { result[Int(value)] += 1 }
-        return result
-    }
-
-    func brightMask(threshold: UInt8) -> [Bool] {
-        pixels.map { $0 >= threshold }
     }
 }

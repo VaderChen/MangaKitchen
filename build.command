@@ -1,6 +1,7 @@
 #!/bin/zsh
 
 set -euo pipefail
+export COPYFILE_DISABLE=1
 
 readonly SCRIPT_DIRECTORY=${0:A:h}
 readonly PROJECT_ROOT="$SCRIPT_DIRECTORY"
@@ -63,11 +64,41 @@ if ! command -v swift >/dev/null 2>&1; then
 fi
 
 temporary_app=""
+staging_root=""
 
 cleanup() {
-  if [[ -n "$temporary_app" && -e "$temporary_app" ]]; then
+  if [[ -n "$staging_root" && -e "$staging_root" ]]; then
+    rm -rf "$staging_root"
+  elif [[ -n "$temporary_app" && -e "$temporary_app" ]]; then
     rm -rf "$temporary_app"
   fi
+}
+
+publish_app_bundle() {
+  local previous_app="$OUTPUT_DIRECTORY/.${APP_NAME}.previous.$$"
+  local running_pids=""
+
+  running_pids="$(/usr/bin/pgrep -x "$PRODUCT_NAME" 2>/dev/null || true)"
+  if [[ -n "$running_pids" ]]; then
+    print -u2 "錯誤：偵測到仍在執行的 $PRODUCT_NAME（PID：${running_pids//$'\n'/, }）。"
+    print -u2 "請先結束舊版 App 再重新建置。"
+    return 1
+  fi
+
+  rm -rf "$previous_app"
+  if [[ -e "$final_app" ]]; then
+    mv "$final_app" "$previous_app"
+  fi
+  if mv "$temporary_app" "$final_app"; then
+    temporary_app=""
+    rm -rf "$previous_app"
+    return 0
+  fi
+  if [[ -e "$previous_app" ]]; then
+    mv "$previous_app" "$final_app"
+  fi
+  print -u2 "錯誤：無法將完成的 App 發佈至：$final_app"
+  return 1
 }
 
 report_failure() {
@@ -80,6 +111,77 @@ report_failure() {
     print
   fi
   exit "$exit_code"
+}
+
+mlx_metallib_path=""
+
+prepare_mlx_metallib() {
+  local mlx_generated_root="$PROJECT_ROOT/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated"
+  local shader_root="$mlx_generated_root/metal"
+  local cache_directory="$PROJECT_ROOT/.build/mangakitchen-metal/$configuration"
+  local output_path="$cache_directory/mlx.metallib"
+  local rebuild=false
+  local shader_source
+  local relative_path
+  local air_name
+  local air_path
+  local -a shader_sources
+  local -a air_files
+
+  if [[ ! -d "$shader_root" ]]; then
+    print -u2 "錯誤：找不到 MLX Metal shader 原始碼：$shader_root"
+    exit 1
+  fi
+  shader_sources=("$shader_root"/**/*.metal(N))
+  if (( ${#shader_sources} == 0 )); then
+    print -u2 "錯誤：MLX 不含可編譯的 Metal shader。"
+    exit 1
+  fi
+
+  if [[ ! -f "$output_path" ]]; then
+    rebuild=true
+  else
+    for shader_source in "${shader_sources[@]}"; do
+      if [[ "$shader_source" -nt "$output_path" ]]; then
+        rebuild=true
+        break
+      fi
+    done
+  fi
+
+  if [[ "$rebuild" == true ]]; then
+    if ! command -v xcrun >/dev/null 2>&1 \
+        || ! xcrun -f metal >/dev/null 2>&1 \
+        || ! xcrun -f metallib >/dev/null 2>&1; then
+      print -u2 "錯誤：找不到 Xcode Metal 編譯工具，無法建立 MLX shader。"
+      exit 1
+    fi
+
+    print "==> 編譯 MLX Metal shader"
+    rm -rf "$cache_directory"
+    mkdir -p "$cache_directory"
+    for shader_source in "${shader_sources[@]}"; do
+      relative_path="${shader_source#$mlx_generated_root/}"
+      air_name="${relative_path//\//_}"
+      air_name="${air_name:r}.air"
+      air_path="$cache_directory/$air_name"
+      xcrun -sdk macosx metal \
+        -x metal \
+        -Wall \
+        -Wextra \
+        -fno-fast-math \
+        -Wno-c++17-extensions \
+        -Wno-c++20-extensions \
+        -mmacosx-version-min=14.0 \
+        -I"$mlx_generated_root" \
+        -c "$shader_source" \
+        -o "$air_path"
+      air_files+=("$air_path")
+    done
+    xcrun -sdk macosx metallib "${air_files[@]}" -o "$output_path"
+  fi
+
+  mlx_metallib_path="$output_path"
 }
 
 trap report_failure ZERR
@@ -115,33 +217,40 @@ if [[ ! -x "$executable_path" ]]; then
   exit 1
 fi
 
+prepare_mlx_metallib
+
 mkdir -p "$OUTPUT_DIRECTORY"
-temporary_app="$OUTPUT_DIRECTORY/.${APP_NAME}.tmp.$$"
+staging_root="$(mktemp -d "${TMPDIR:-/tmp}/mangakitchen-app.XXXXXX")"
+temporary_app="$staging_root/$APP_NAME"
 final_app="$OUTPUT_DIRECTORY/$APP_NAME"
 
-rm -rf "$temporary_app"
 mkdir -p \
   "$temporary_app/Contents/MacOS" \
   "$temporary_app/Contents/Resources" \
   "$temporary_app/Contents/Helpers"
 
-ditto "$executable_path" "$temporary_app/Contents/MacOS/$PRODUCT_NAME"
+/bin/cp "$executable_path" "$temporary_app/Contents/MacOS/$PRODUCT_NAME"
 chmod +x "$temporary_app/Contents/MacOS/$PRODUCT_NAME"
+/bin/cp "$mlx_metallib_path" "$temporary_app/Contents/MacOS/mlx.metallib"
 
 for resource_bundle in "$binary_directory"/*.bundle(N); do
-  ditto "$resource_bundle" \
+  ditto --norsrc --noqtn "$resource_bundle" \
     "$temporary_app/Contents/Resources/${resource_bundle:t}"
 done
 
 if [[ -d "$PROJECT_ROOT/Samples" ]]; then
-  ditto "$PROJECT_ROOT/Samples" "$temporary_app/Contents/Resources/Samples"
+  ditto --norsrc --noqtn \
+    "$PROJECT_ROOT/Samples" \
+    "$temporary_app/Contents/Resources/Samples"
 fi
 
 if [[ ! -f "$APP_ICON_PATH" ]]; then
   print -u2 "錯誤：找不到 App Icon：$APP_ICON_PATH"
   exit 1
 fi
-ditto "$APP_ICON_PATH" "$temporary_app/Contents/Resources/MangaKitchen.icns"
+ditto --norsrc --noqtn \
+  "$APP_ICON_PATH" \
+  "$temporary_app/Contents/Resources/MangaKitchen.icns"
 
 cat > "$temporary_app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -199,18 +308,27 @@ if [[ "$build_worker" == true ]]; then
     exit 1
   fi
 
-  ditto "$worker_path" "$temporary_app/Contents/Helpers/$WORKER_NAME"
+  /bin/cp "$worker_path" "$temporary_app/Contents/Helpers/$WORKER_NAME"
   chmod +x "$temporary_app/Contents/Helpers/$WORKER_NAME"
 fi
 
+# 簽章前在 APFS 暫存區清掉從外接磁碟複製進來的舊 AppleDouble。
+find "$temporary_app" -type f -name '._*' -delete
+
 if command -v codesign >/dev/null 2>&1; then
   print "==> 套用本機 Ad Hoc 簽章"
+  codesign --force --sign - "$temporary_app/Contents/MacOS/mlx.metallib"
   codesign --force --deep --sign - "$temporary_app"
+  codesign --verify --deep --strict "$temporary_app"
 fi
 
-rm -rf "$final_app"
-mv "$temporary_app" "$final_app"
-temporary_app=""
+publish_app_bundle
+
+if command -v codesign >/dev/null 2>&1; then
+  # 外接磁碟會將 metallib 的簽章 extended attributes 保存成 `._*`
+  # AppleDouble 檔案；這些檔案不可刪除。
+  codesign --verify --deep --strict "$final_app"
+fi
 
 print ""
 print "建置完成：$final_app"

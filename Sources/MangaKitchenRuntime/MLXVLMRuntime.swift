@@ -87,19 +87,65 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         var result = ""
         var chunks = 0
 
+        var lastRepetitionCheck = 0
+        var stoppedOnRepetition = false
+
         for await event in stream {
             try Task.checkCancellation()
             if case let .chunk(text) = event {
                 result += text
                 chunks += 1
                 progress(min(0.99, 0.55 + Double(chunks) / Double(expectedChunks) * 0.44))
+                // 小模型會卡進重複輸出迴圈，把同一筆 JSON 物件吐上十幾次，
+                // 整段生成因此空轉數十秒。偵測到就提早收工。
+                if chunks - lastRepetitionCheck >= 32, result.count > 400 {
+                    lastRepetitionCheck = chunks
+                    if Self.isRepeatingTail(result) {
+                        stoppedOnRepetition = true
+                        break
+                    }
+                }
             }
         }
 
-        let output = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        var output = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stoppedOnRepetition {
+            output = Self.repairedTruncatedArray(output)
+        }
         guard !output.isEmpty else { throw MLXVLMRuntimeError.emptyResponse }
         progress(1)
         return output
+    }
+
+    /// output 末段是否已經在重複自己。取尾端一小段當樣本，若它在整段裡出現
+    /// 三次以上，就判定進入迴圈。
+    private static func isRepeatingTail(_ output: String) -> Bool {
+        let sampleLength = 90
+        guard output.count > sampleLength * 3 else { return false }
+        let needle = String(output.suffix(sampleLength))
+        guard !needle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        var occurrences = 0
+        var searchRange = output.startIndex..<output.endIndex
+        while let found = output.range(of: needle, range: searchRange) {
+            occurrences += 1
+            if occurrences >= 3 { return true }
+            guard found.upperBound < output.endIndex else { break }
+            searchRange = found.upperBound..<output.endIndex
+        }
+        return false
+    }
+
+    /// 中途停止會留下未閉合的 JSON 陣列。截到最後一個完整物件再補上 ]，
+    /// 讓既有的解碼器仍能取用已經產生的內容，而不是整批作廢。
+    private static func repairedTruncatedArray(_ output: String) -> String {
+        guard output.contains("["), let lastObjectEnd = output.lastIndex(of: "}") else {
+            return output
+        }
+        var repaired = String(output[...lastObjectEnd])
+        let openCount = repaired.filter { $0 == "[" }.count
+        let closeCount = repaired.filter { $0 == "]" }.count
+        repaired += String(repeating: "]", count: max(0, openCount - closeCount))
+        return repaired
     }
 
     private func loadContainer(progress: @escaping InferenceProgress) async throws -> ModelContainer {

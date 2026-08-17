@@ -12,48 +12,23 @@ import MangaKitchenCore
 /// **翻譯不在此列**：兩種模式下譯文都固定由 Agent 以 region.update 寫入，
 /// 後端永遠不會呼叫內建圖生文模型翻譯。
 enum MCPRegionSource: String, Codable, Sendable, CaseIterable {
-    /// 全部交給 Agent：後端連 Vision OCR 都不跑。
+    /// 全部交給 Agent：後端不執行本機封閉區域偵測或 VLM 轉錄。
     case agent
-    /// 區域由本機計算（Vision OCR ＋ 已載入的圖生文模型做語意分類與 OCR 校正），
-    /// 只有翻譯交給 Agent。座標由本機的傳統演算法決定，不會有模型座標漂移。
+    /// 區域由本機封閉區域演算法定位，再由已載入的圖生文模型分類與轉錄；
+    /// 只有翻譯交給 Agent。座標不由模型產生，因此不會有模型座標漂移。
     case local
 }
 
-
-/// 不執行 Vision OCR。區域一律由 Agent 透過 page.supplement_regions／region.create 提供。
-struct AgentDrivenTextRecognizer: PageTextRecognizing {
-    func recognizeText(
-        in imageURL: URL,
-        languageCodes: [String],
-        readingDirection: ReadingDirection
-    ) async throws -> [DialogueRegion] {
-        []
-    }
-}
-
-/// 不執行 VLM 語意區域偵測，原樣退回呼叫端既有的區域。
+/// 不執行本機語意區域偵測；Agent 模式會走專用遮罩路徑，不呼叫此替身。
 struct AgentDrivenRegionDetector: SemanticRegionDetecting {
     func detectRegions(
         pageURL: URL,
-        existingRegions: [DialogueRegion],
         sourceLanguageCodes: [String],
+        fineScanEnabled: Bool,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
         progress(1)
-        return existingRegions
-    }
-}
-
-/// 不執行 VLM OCR 校正。Agent 以 region.update 寫回 source_text 即視為已校正。
-struct AgentDrivenOCRTextRefiner: OCRTextRefining {
-    func refineOCRText(
-        regions: [DialogueRegion],
-        pageURL: URL,
-        sourceLanguageCodes: [String],
-        progress: @escaping InferenceProgress
-    ) async throws -> [DialogueRegion] {
-        progress(1)
-        return regions
+        return []
     }
 }
 

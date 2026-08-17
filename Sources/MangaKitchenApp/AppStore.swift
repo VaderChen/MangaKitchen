@@ -19,6 +19,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var isProcessing = false
     @Published private(set) var isSwitchingProject = false
     @Published private(set) var modelDownloadState: ModelDownloadState?
+    @Published private(set) var modelLoadingState: ModelLoadingState?
     @Published private(set) var processingActivities: [UUID: PageProcessingActivity] = [:]
     @Published var statusMessage: String?
 
@@ -44,6 +45,7 @@ final class AppStore: ObservableObject {
     private var maskRegenerationTasks: [UUID: Task<Void, Never>] = [:]
     private var translationPreviewTasks: [UUID: Task<Void, Never>] = [:]
     private var undoneMaskStrokes: [UUID: [UUID: [MaskStroke]]] = [:]
+    private var maskRevisions: [UUID: UInt64] = [:]
 
     init(
         dataDirectoryPath: String? = nil,
@@ -65,14 +67,12 @@ final class AppStore: ObservableObject {
                 compositingBackend: imageCompositingBackend
             )
             let pipeline = ComicTranslationPipeline(
-                recognizer: VisionOCRService(),
                 regionDetector: VLMSupplementalRegionDetector(model: models),
-                ocrTextRefiner: VLMOCRTextRefinementService(model: models),
                 maskRefiner: MangaTextMaskRefiner(),
                 translator: VLMRegionTranslationService(model: models),
                 maskGenerator: DialogueMaskGenerator(),
                 backgroundRestorer: backgroundRestorer,
-                typesetter: CoreTextDialogueTypesetter(),
+                typesetter: HTMLDialogueTypesetter(),
                 outputRoot: artifactsRoot
             )
             self.models = models
@@ -554,7 +554,7 @@ final class AppStore: ObservableObject {
         }
         if operation.requiresTextModel,
            !loadedModels.contains(where: { $0.capability == .imageToText }) {
-            statusMessage = "OCR 校正或翻譯前請先載入圖生文模型。"
+            statusMessage = "本機文字區域辨識或翻譯前請先載入圖生文模型。"
             return nil
         }
         if operation.requiresOutputDirectory, outputDirectoryURL == nil {
@@ -847,6 +847,10 @@ final class AppStore: ObservableObject {
         undoneMaskStrokes[pageID]?.compactMap { regionID, strokes in
             strokes.isEmpty ? nil : regionID
         } ?? []
+    }
+
+    func maskRevision(pageID: UUID) -> UInt64 {
+        maskRevisions[pageID] ?? 0
     }
 
     private func clearMaskRedoHistory(pageID: UUID, regionID: UUID) {
@@ -1160,7 +1164,7 @@ final class AppStore: ObservableObject {
         guard let page = pages.first(where: { $0.id == pageID }),
               !page.regions.isEmpty else { return false }
         return page.regions.allSatisfy {
-            $0.ocrTextRefined
+            !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && !$0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
@@ -1177,12 +1181,13 @@ final class AppStore: ObservableObject {
               let page = pages.first(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
         }
-        let useLocalTextModel = await models?.isLoaded(.imageToText) ?? false
+        guard await models?.isLoaded(.imageToText) == true else {
+            try await prepareEmptyMask(pageID: pageID, page: page, pipeline: pipeline)
+            return
+        }
         let result = try await pipeline.detectMasks(
             page: page,
             options: options,
-            refineOCRText: useLocalTextModel,
-            detectMissingRegions: useLocalTextModel,
             activity: activityHandler(pageID: pageID),
             progress: progressHandler(pageID: pageID)
         )
@@ -1208,6 +1213,7 @@ final class AppStore: ObservableObject {
         pages[index].regions = result.regions
         pages[index].maskURL = result.maskURL
         pages[index].backgroundURL = previewURL
+        advanceMaskRevision(pageID: pageID)
         pages[index].translationPreviewURL = nil
         pages[index].outputURL = nil
         pages[index].stage = .maskReady
@@ -1221,36 +1227,79 @@ final class AppStore: ObservableObject {
         schedulePersistence()
     }
 
+    /// 沒有圖生文模型時仍允許進入遮罩編輯：用空區域清單產生與原圖
+    /// 同尺寸的全黑遮罩。既有人工區域保留在頁面資料中，不因降級流程被清除。
+    private func prepareEmptyMask(
+        pageID: UUID,
+        page: ComicPage,
+        pipeline: ComicTranslationPipeline
+    ) async throws {
+        updateProcessingActivity(pageID: pageID, activity: .generatingMask)
+        updateProgress(pageID: pageID, stage: .detectingText, fraction: 0.9)
+        let maskURL = try await pipeline.regenerateMask(
+            page: page,
+            regions: [],
+            options: options
+        )
+        try Task.checkCancellation()
+
+        let previewURL: URL?
+        var previewWarning: String?
+        do {
+            updateProcessingActivity(pageID: pageID, activity: .renderingMaskPreview)
+            previewURL = try await pipeline.renderMaskPreview(
+                page: page,
+                regions: [],
+                maskURL: maskURL
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            previewURL = nil
+            previewWarning = "全黑遮罩已完成，但校對預覽建立失敗：\(error.localizedDescription)"
+        }
+        try Task.checkCancellation()
+        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        undoneMaskStrokes[pageID] = nil
+        pages[index].maskURL = maskURL
+        pages[index].backgroundURL = previewURL
+        advanceMaskRevision(pageID: pageID)
+        pages[index].translationPreviewURL = nil
+        pages[index].outputURL = nil
+        pages[index].stage = .maskReady
+        pages[index].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
+        pages[index].errorMessage = nil
+        try await persistStringTableNow(pageID: pageID)
+        statusMessage = previewWarning
+            ?? "尚未載入圖生文模型；已建立全黑遮罩，可手動編輯。"
+        schedulePersistence()
+    }
+
     private func runTranslation(pageID: UUID) async throws {
+        await stopTranslationPreviewRegeneration(pageID: pageID)
+        try Task.checkCancellation()
         guard let pipeline,
               let page = pages.first(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
         }
         guard !page.regions.isEmpty else { throw AppWorkflowError.maskRequired }
-        var sourceRegions = page.regions
-        if sourceRegions.contains(where: { !$0.ocrTextRefined }) {
-            sourceRegions = try await pipeline.refineOCRText(
-                page: page,
-                regions: sourceRegions,
-                options: options,
-                activity: activityHandler(pageID: pageID),
-                progress: progressHandler(pageID: pageID)
-            )
-            try Task.checkCancellation()
-            guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
-            pages[index].regions = sourceRegions
-            try await persistStringTableNow(pageID: pageID)
-        }
         let regions = try await pipeline.translate(
             page: page,
-            regions: sourceRegions,
+            regions: page.regions,
             options: options,
             glossary: glossary,
             activity: activityHandler(pageID: pageID),
             progress: progressHandler(pageID: pageID)
         )
         try Task.checkCancellation()
-        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        guard let translatedIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[translatedIndex].regions = regions
+        pages[translatedIndex].stage = .translationReady
+        pages[translatedIndex].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
+        pages[translatedIndex].errorMessage = nil
+        try await persistStringTableNow(pageID: pageID)
+        schedulePersistence()
+
         let composition = try await pipeline.compose(
             page: page,
             regions: regions,
@@ -1259,9 +1308,11 @@ final class AppStore: ObservableObject {
             progress: translationLayoutProgressHandler(pageID: pageID)
         )
         try Task.checkCancellation()
+        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         pages[index].regions = composition.regions
         pages[index].maskURL = composition.maskURL
         pages[index].backgroundURL = composition.backgroundURL
+        advanceMaskRevision(pageID: pageID)
         pages[index].translationPreviewURL = composition.outputURL
         pages[index].outputURL = nil
         pages[index].stage = .translationReady
@@ -1447,6 +1498,7 @@ final class AppStore: ObservableObject {
                 }
                 self.pages[index].maskURL = maskURL
                 self.pages[index].backgroundURL = previewURL
+                self.advanceMaskRevision(pageID: pageID)
                 try await self.persistStringTableNow(pageID: pageID)
                 self.schedulePersistence()
             } catch is CancellationError {
@@ -1458,13 +1510,18 @@ final class AppStore: ObservableObject {
         }
     }
 
+    private func advanceMaskRevision(pageID: UUID) {
+        objectWillChange.send()
+        maskRevisions[pageID, default: 0] &+= 1
+    }
+
     private func persistEditedRegion(pageID: UUID) {
+        scheduleTranslationPreviewRegeneration(pageID: pageID)
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await self.persistStringTableNow(pageID: pageID)
                 self.schedulePersistence()
-                self.scheduleTranslationPreviewRegeneration(pageID: pageID)
             } catch {
                 self.statusMessage = "更新文字區域失敗：\(error.localizedDescription)"
             }
@@ -1472,9 +1529,11 @@ final class AppStore: ObservableObject {
     }
 
     private func scheduleTranslationPreviewRegeneration(pageID: UUID) {
-        translationPreviewTasks[pageID]?.cancel()
+        let previousTask = translationPreviewTasks[pageID]
+        previousTask?.cancel()
         translationPreviewTasks[pageID] = Task { @MainActor [weak self] in
             guard let self else { return }
+            await previousTask?.value
             try? await Task.sleep(for: .milliseconds(80))
             guard !Task.isCancelled,
                   let pipeline = self.pipeline,
@@ -1498,6 +1557,13 @@ final class AppStore: ObservableObject {
                 self.statusMessage = "更新翻譯排版預覽失敗：\(error.localizedDescription)"
             }
         }
+    }
+
+    private func stopTranslationPreviewRegeneration(pageID: UUID) async {
+        guard let task = translationPreviewTasks[pageID] else { return }
+        task.cancel()
+        await task.value
+        translationPreviewTasks[pageID] = nil
     }
 
     private func cancelMaskRegeneration() {
@@ -1920,12 +1986,25 @@ final class AppStore: ObservableObject {
     private func loadProjectModels(_ directories: [URL]) async {
         guard let models else { return }
         let fileManager = FileManager.default
-        for directoryURL in directories where fileManager.fileExists(atPath: directoryURL.path) {
+        let loadableDirectories = directories.filter { directoryURL in
+            guard fileManager.fileExists(atPath: directoryURL.path) else { return false }
             if let manifest = try? ModelManifest.load(from: directoryURL),
                preferredModelPaths[manifest.capability] != nil {
-                continue
+                return false
             }
-            await loadModelNow(from: directoryURL, models: models, persist: false)
+            return true
+        }
+        let sessionID = UUID()
+        for (offset, directoryURL) in loadableDirectories.enumerated() {
+            let succeeded = await loadModelNow(
+                from: directoryURL,
+                models: models,
+                persist: false,
+                sessionID: sessionID,
+                currentIndex: offset + 1,
+                totalCount: loadableDirectories.count
+            )
+            if !succeeded { break }
         }
     }
 
@@ -1934,16 +2013,18 @@ final class AppStore: ObservableObject {
         imageToImagePath: String?
     ) async {
         guard let models else { return }
-        await replacePreferredModel(
+        let imageToTextSucceeded = await replacePreferredModel(
             capability: .imageToText,
             path: imageToTextPath,
             models: models
         )
-        await replacePreferredModel(
-            capability: .imageToImage,
-            path: imageToImagePath,
-            models: models
-        )
+        if imageToTextSucceeded {
+            _ = await replacePreferredModel(
+                capability: .imageToImage,
+                path: imageToImagePath,
+                models: models
+            )
+        }
         loadedModels = await models.loadedModels()
     }
 
@@ -1951,34 +2032,51 @@ final class AppStore: ObservableObject {
         capability: ModelCapability,
         path: String?,
         models: ModelRuntimeHub
-    ) async {
-        guard preferredModelPaths[capability] != path else { return }
+    ) async -> Bool {
+        guard preferredModelPaths[capability] != path else { return true }
         await models.unloadModel(capability: capability)
         guard let path else {
             preferredModelPaths.removeValue(forKey: capability)
-            return
+            return true
         }
-        preferredModelPaths[capability] = path
         let directoryURL = URL(fileURLWithPath: path).standardizedFileURL
         do {
             let manifest = try ModelManifest.load(from: directoryURL)
             guard manifest.capability == capability else {
                 throw PreferredModelError.capabilityMismatch(expected: capability)
             }
-            _ = try await models.loadModel(at: directoryURL)
+            _ = try await loadRuntimeModel(
+                from: directoryURL,
+                models: models,
+                sessionID: UUID(),
+                currentIndex: 1,
+                totalCount: 1
+            )
+            preferredModelPaths[capability] = path
+            return true
         } catch {
             statusMessage = error.localizedDescription
+            return false
         }
     }
 
+    @discardableResult
     private func loadModelNow(
         from directoryURL: URL,
         models: ModelRuntimeHub,
-        persist: Bool
-    ) async {
-        statusMessage = "正在載入模型：\(directoryURL.lastPathComponent)…"
+        persist: Bool,
+        sessionID: UUID = UUID(),
+        currentIndex: Int = 1,
+        totalCount: Int = 1
+    ) async -> Bool {
         do {
-            let info = try await models.loadModel(at: directoryURL)
+            let info = try await loadRuntimeModel(
+                from: directoryURL,
+                models: models,
+                sessionID: sessionID,
+                currentIndex: currentIndex,
+                totalCount: totalCount
+            )
             loadedModels = await models.loadedModels()
             if persist {
                 let location = directoryURL.standardizedFileURL
@@ -1988,8 +2086,61 @@ final class AppStore: ObservableObject {
                 schedulePersistence()
             }
             statusMessage = "已載入 \(info.displayName)（\(info.backend.rawValue)／\(info.capability.rawValue)）。"
+            return true
         } catch {
             statusMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private func loadRuntimeModel(
+        from directoryURL: URL,
+        models: ModelRuntimeHub,
+        sessionID: UUID,
+        currentIndex: Int,
+        totalCount: Int
+    ) async throws -> LoadedModelInfo {
+        let safeTotalCount = max(1, totalCount)
+        let safeCurrentIndex = min(max(1, currentIndex), safeTotalCount)
+        let fallbackName = directoryURL.lastPathComponent
+        let displayName = (try? ModelManifest.load(from: directoryURL))?.displayName
+            ?? fallbackName
+        modelLoadingState = ModelLoadingState(
+            id: sessionID,
+            phase: .loading,
+            displayName: displayName,
+            currentIndex: safeCurrentIndex,
+            totalCount: safeTotalCount,
+            progress: Double(safeCurrentIndex - 1) / Double(safeTotalCount),
+            errorMessage: nil
+        )
+        statusMessage = "正在載入模型：\(displayName)…"
+
+        do {
+            let info = try await models.loadModel(at: directoryURL)
+            guard modelLoadingState?.id == sessionID else { return info }
+            modelLoadingState?.displayName = info.displayName
+            modelLoadingState?.progress = Double(safeCurrentIndex) / Double(safeTotalCount)
+            if safeCurrentIndex == safeTotalCount {
+                modelLoadingState?.phase = .completed
+                try? await Task.sleep(for: .milliseconds(450))
+                if modelLoadingState?.id == sessionID,
+                   modelLoadingState?.phase == .completed {
+                    modelLoadingState = nil
+                }
+            }
+            return info
+        } catch {
+            modelLoadingState = ModelLoadingState(
+                id: sessionID,
+                phase: .failed,
+                displayName: displayName,
+                currentIndex: safeCurrentIndex,
+                totalCount: safeTotalCount,
+                progress: Double(safeCurrentIndex - 1) / Double(safeTotalCount),
+                errorMessage: error.localizedDescription
+            )
+            throw error
         }
     }
 

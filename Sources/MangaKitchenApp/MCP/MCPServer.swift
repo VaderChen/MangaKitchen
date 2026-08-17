@@ -24,7 +24,7 @@ struct MangaKitchenMCPServer {
             name: "mangakitchen",
             version: "0.1.0",
             title: "MangaKitchen 漫畫翻譯",
-            instructions: "先用 mangakitchen.workspace.open 建立目錄專案；可保留多個 workspace_id 並用 workspace.list／activate 切換。譯文一律由你提供：後端永遠不會用內建圖生文模型翻譯，請以 region.update 寫入 translated_text。區域來源可用 workspace.configure 的 region_source 切換 —— agent（預設）表示連 Vision OCR 都不跑，由你讀 mangakitchen://page/{page_id}/source 原圖後以 page.supplement_regions 提交區域與原文；local 表示由本機 Vision OCR 與已載入的 imageToText 模型產生區域，你只負責翻譯。後端只做確定性的像素遮罩收斂、背景修補與排版。單頁流程：page.detect_masks →（agent 模式才需要）supplement_regions → region.update 寫譯文 → page.compose。使用者要求整批處理時，用 mangakitchen.workspace.pages 取得檔案工作清單，依每頁的 nextAction 逐頁執行，完成一頁後再取一次清單即可續跑；該清單不含 regions 內容，整個專案列出來也很輕量。除非使用者明確要求整批處理，否則不要自行對整個專案迴圈。",
+            instructions: "先用 mangakitchen.workspace.open 建立目錄專案；可保留多個 workspace_id 並用 workspace.list／activate 切換。譯文一律由你提供：後端永遠不會用內建圖生文模型翻譯，請以 region.update 寫入 translated_text。區域來源可用 workspace.configure 的 region_source 切換 —— agent（預設）表示不執行本機區域辨識，由你讀 mangakitchen://page/{page_id}/source 原圖後以 page.supplement_regions 提交區域與原文；local 表示由本機封閉區域演算法定位，再由已載入的 imageToText 模型分類並轉錄，你只負責翻譯。後端只做確定性的像素遮罩收斂、背景修補與排版。單頁流程：page.detect_masks →（agent 模式才需要）supplement_regions → region.update 寫譯文 → page.compose。使用者要求整批處理時，用 mangakitchen.workspace.pages 取得檔案工作清單，依每頁的 nextAction 逐頁執行，完成一頁後再取一次清單即可續跑；該清單不含 regions 內容，整個專案列出來也很輕量。除非使用者明確要求整批處理，否則不要自行對整個專案迴圈。",
 
             capabilities: .init(
                 resources: .init(subscribe: false, listChanged: false),
@@ -788,7 +788,7 @@ struct MangaKitchenMCPServer {
                     "region_source": .object([
                         "type": "string",
                         "enum": .array(["agent", "local"]),
-                        "description": "區域（文字位置與原文）從哪裡來。agent（預設）＝後端連 Vision OCR 都不跑，你用 page.supplement_regions 提交；local＝由本機 Vision OCR 定位，已載入 imageToText 模型時再做語意分類與 OCR 校正，你只負責翻譯。兩種模式的譯文都必須由你以 region.update 寫入，後端永遠不會用內建模型翻譯。切到 local 後 page.detect_masks 會重新產生區域並覆寫該頁既有結果（含已寫入的譯文）。"
+                        "description": "區域（文字位置與原文）從哪裡來。agent（預設）＝後端不執行本機區域辨識，你用 page.supplement_regions 提交；local＝由本機演算法偵測封閉區域，再由已載入的 imageToText 模型分類並轉錄，你只負責翻譯。兩種模式的譯文都必須由你以 region.update 寫入，後端永遠不會用內建模型翻譯。切到 local 後 page.detect_masks 會重新產生區域並覆寫該頁既有結果（含已寫入的譯文）。"
                     ])
                 ], required: ["workspace_id"]),
                 annotations: idempotent,
@@ -797,7 +797,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.model.load",
                 title: "載入本機模型",
-                description: "從含 mangakitchen-model.json 的本機目錄載入模型。MCP 為純 Agent 模式，imageToText 模型不會被工作流使用；只有 imageToImage 會在 page.compose 的生成式背景修補時採用。",
+                description: "從含 mangakitchen-model.json 的本機目錄載入模型。region_source 為 local 時，imageToText 模型會負責封閉區域分類與原文轉錄；imageToImage 則供 page.compose 的生成式背景修補使用。",
                 inputSchema: objectSchema([
                     "model_directory": property("string", "模型目錄的絕對路徑")
                 ], required: ["model_directory"]),
@@ -840,7 +840,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.detect_masks",
                 title: "重建像素遮罩",
-                description: "步驟二，行為取決於 workspace.configure 的 region_source。agent（預設）：不呼叫內建 OCR 或圖生文模型，只把目前已提交的區域收斂成像素級遮罩，既有區域不會被覆寫；頁面還沒有區域時輸出空白遮罩，請接著用 page.supplement_regions 提交。local：由本機 Vision OCR 定位，已載入 imageToText 模型時再做語意分類與 OCR 校正，你只需負責翻譯；此模式會重新產生區域並覆寫該頁既有結果（含已寫入的譯文）。",
+                description: "步驟二，行為取決於 workspace.configure 的 region_source。agent（預設）：不呼叫內建區域辨識或圖生文模型，只把目前已提交的區域收斂成像素級遮罩，既有區域不會被覆寫；頁面還沒有區域時輸出空白遮罩，請接著用 page.supplement_regions 提交。local：由本機演算法偵測封閉區域，再由已載入的 imageToText 模型分類並轉錄，你只需負責翻譯；此模式會重新產生區域並覆寫該頁既有結果（含已寫入的譯文）。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent
@@ -907,7 +907,7 @@ struct MangaKitchenMCPServer {
                     "workspace_id": workspaceID,
                     "page_id": property("string", "頁面 UUID"),
                     "region_id": property("string", "區域 UUID"),
-                    "source_text": property("string", "OCR 原文"),
+                    "source_text": property("string", "來源原文"),
                     "translated_text": property("string", "翻譯文字"),
                     "translation_anchor": point,
                     "bounds": bounds,

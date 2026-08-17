@@ -53,22 +53,56 @@ public actor VLMRegionTranslationService: RegionTranslating {
             let prompt = Self.prompt(
                 targetLanguageCode: targetLanguageCode,
                 glossaryJSON: glossaryJSON,
-                regionsJSON: regionJSON
+                regionsJSON: regionJSON,
+                attempt: 0
             )
             let batchIndex = index
-            let response = try await model.generateText(
-                imageURL: pageURL,
-                prompt: prompt,
-                maximumOutputTokens: 1_536,
-                progress: { value in
-                    let local = min(max(value, 0), 1)
-                    progress((Double(batchIndex) + local) / Double(batchCount))
+            let expectedIDs = Set(batch.map(\.id))
+            var batchResults: [UUID: String] = [:]
+            var receivedDecodableResponse = false
+
+            for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
+                try Task.checkCancellation()
+                let retryPrompt = attempt == 0 ? prompt : Self.prompt(
+                    targetLanguageCode: targetLanguageCode,
+                    glossaryJSON: glossaryJSON,
+                    regionsJSON: regionJSON,
+                    attempt: attempt
+                )
+                let response = try await model.generateText(
+                    imageURL: pageURL,
+                    prompt: retryPrompt,
+                    maximumOutputTokens: 2_048,
+                    progress: { value in
+                        let local = VLMStructuredResponseDecoder.mappedProgress(
+                            attempt: attempt,
+                            value: value
+                        )
+                        progress((Double(batchIndex) + local) / Double(batchCount))
+                    }
+                )
+                let decodedCandidates = VLMStructuredResponseDecoder.decodeArrays(
+                    TranslationItem.self,
+                    from: response
+                )
+                if !decodedCandidates.isEmpty { receivedDecodableResponse = true }
+                for items in decodedCandidates {
+                    for item in items where expectedIDs.contains(item.id) {
+                        let text = item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !text.isEmpty { batchResults[item.id] = text }
+                    }
                 }
-            )
-            for item in try Self.decodeTranslations(response) {
-                let text = item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty { indexed[item.id] = text }
+                if expectedIDs.isSubset(of: Set(batchResults.keys)) { break }
             }
+
+            let missingCount = expectedIDs.subtracting(batchResults.keys).count
+            guard missingCount == 0 else {
+                if receivedDecodableResponse {
+                    throw TranslationRuntimeError.missingTranslations(missingCount)
+                }
+                throw TranslationRuntimeError.invalidModelResponse
+            }
+            indexed.merge(batchResults) { _, new in new }
             progress(Double(index + 1) / Double(batchCount))
         }
 
@@ -90,12 +124,13 @@ public actor VLMRegionTranslationService: RegionTranslating {
     private static func prompt(
         targetLanguageCode: String,
         glossaryJSON: String,
-        regionsJSON: String
+        regionsJSON: String,
+        attempt: Int
     ) -> String {
         """
         You are translating speech balloons, captions, and sound effects on one comic page.
         Translate every sourceText into the language identified by BCP-47 code "\(targetLanguageCode)".
-        Each sourceText has already been OCR-proofread. Do not re-transcribe or rewrite the source text.
+        Each sourceText has already been transcribed or confirmed. Do not re-transcribe or rewrite it.
         Use the image only as context for speaker, tone, gender, ambiguity, and sound effects.
         Keep names and terminology consistent. Be concise enough to fit the original region.
         The terminology array below is authoritative. Whenever a sourceTerm occurs in a sourceText,
@@ -107,27 +142,8 @@ public actor VLMRegionTranslationService: RegionTranslating {
         Keep every UUID unchanged and return one item for every input item.
         Input regions:
         \(regionsJSON)
+        \(VLMStructuredResponseDecoder.retryInstruction(attempt: attempt))
         """
-    }
-
-    private static func decodeTranslations(_ response: String) throws -> [TranslationItem] {
-        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let data = trimmed.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([TranslationItem].self, from: data) {
-            return decoded
-        }
-
-        guard let start = trimmed.firstIndex(of: "["),
-              let end = trimmed.lastIndex(of: "]"),
-              start <= end,
-              let data = String(trimmed[start...end]).data(using: .utf8) else {
-            throw TranslationRuntimeError.invalidModelResponse
-        }
-        do {
-            return try JSONDecoder().decode([TranslationItem].self, from: data)
-        } catch {
-            throw TranslationRuntimeError.invalidModelResponse
-        }
     }
 }
 

@@ -2,9 +2,12 @@ import CoreGraphics
 import Foundation
 import MangaKitchenCore
 
-/// 在 OCR 粗框內以亮度與連通元件尋找實際文字筆畫。
+/// 在封閉區域或 Agent 粗框內以亮度與連通元件尋找實際文字筆畫。
 /// 這一層刻意不判讀語言，黑白、灰階及彩色漫畫可共用同一套流程。
 public actor MangaTextMaskRefiner: DialogueMaskRefining {
+    /// 字形遮罩外框相對於整頁的最大面積。過度寬鬆時，分鏡底線只要和幾個
+    /// 黑色元件相連，就可能形成橫跨多格的帶狀遮罩。
+    private static let maximumMaskAreaPerTextCharacter = 0.003
     private let searchPaddingPixels: Int
     private let componentPaddingPixels: Int
     private let maximumComponentsPerRegion: Int
@@ -38,15 +41,26 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
                 refined.maskCoverageComplete = false
                 return refined
             }
-            refined.maskPolygons = result.polygons
-            if let pixelBounds = Self.enclosingBounds(of: result.polygons) {
-                let clippedBounds = region.bubbleBounds
-                    .map { pixelBounds.intersection(with: $0) }
-                    ?? pixelBounds
-                if clippedBounds.width > 0, clippedBounds.height > 0 {
-                    refined.bounds = clippedBounds
-                }
+            guard let pixelBounds = Self.enclosingBounds(of: result.polygons),
+                  Self.isPlausibleMaskBounds(pixelBounds, for: region.sourceText) else {
+                refined.maskPolygons = []
+                refined.automaticMaskEnabled = false
+                refined.maskRefinementApplied = false
+                refined.maskCoverageRatio = nil
+                refined.maskCoverageComplete = false
+                return refined
             }
+            refined.maskPolygons = result.polygons
+            let clippedBounds = region.bubbleBounds
+                .map { pixelBounds.intersection(with: $0) }
+                ?? pixelBounds
+            if clippedBounds.width > 0, clippedBounds.height > 0 {
+                refined.bounds = clippedBounds
+            }
+            // coverageComplete 是「粗框是否完整包住所有前景」的診斷，不是
+            // 字形多邊形的安全開關。大型誤判已由 isPlausibleMaskBounds
+            // 排除；通過該檢查的部分字形仍應顯示與輸出，否則只要
+            // 有小筆畫接觸搜尋邊界，整頁遮罩就會變成全黑。
             refined.automaticMaskEnabled = true
             refined.maskRefinementApplied = true
             refined.maskCoverageRatio = result.coverageRatio
@@ -81,6 +95,19 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         return bounds.width > 0 && bounds.height > 0 ? bounds : nil
     }
 
+    private static func isPlausibleMaskBounds(
+        _ bounds: NormalizedRect,
+        for text: String
+    ) -> Bool {
+        let visibleCharacterCount = text.reduce(into: 0) { count, character in
+            guard !character.isWhitespace, !character.isNewline else { return }
+            count += 1
+        }
+        guard visibleCharacterCount > 0 else { return false }
+        let areaPerCharacter = bounds.width * bounds.height / Double(visibleCharacterCount)
+        return areaPerCharacter <= maximumMaskAreaPerTextCharacter
+    }
+
     private func refinement(
         for region: DialogueRegion,
         raster: GrayscaleRaster
@@ -95,35 +122,45 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             pixelBounds(for: $0, width: raster.width, height: raster.height)
                 .intersection(imageBounds)
         }
-        let clippingBounds = bubbleBounds ?? coarseBounds
+        // 有氣泡時不得越界；無框文字只靠下方的兩輪局部擴張控制範圍。
+        let clippingBounds = bubbleBounds ?? imageBounds
         let initialSearchBounds = coarseBounds.intersection(clippingBounds)
-        let initial = refinement(
-            in: initialSearchBounds,
+        var searchBounds = initialSearchBounds
+        var best = refinement(
+            in: searchBounds,
             clippingBounds: clippingBounds,
             imageBounds: imageBounds,
             raster: raster,
-            rejectsBoundaryComponents: bubbleBounds != nil
+            // VLM 粗框可能貼著字形，先保留碰界元件供擴張判斷。
+            rejectsBoundaryComponents: false
         )
 
-        // 粗框只負責定位。若已知完整對話框內緣，另外在整個框內搜尋一次；
-        // 發現粗框外仍有可信前景元件時，採用擴大搜尋後的字形多邊形，
-        // 而不是把粗框或整個對話框直接當成遮罩。
-        guard let bubbleBounds,
-              bubbleBounds.width > initialSearchBounds.width
-                || bubbleBounds.height > initialSearchBounds.height,
-              let expanded = refinement(
-                in: bubbleBounds,
-                clippingBounds: bubbleBounds,
+        // grounding 粗框只在必要時小幅擴張，最多兩輪。過去一碰界就搜尋
+        // 整個 bubbleBounds，會把臉、頭髮與速度線一併當成字形。
+        for _ in 0..<2 where best == nil || best?.touchesSearchBoundary == true {
+            // 擴張量必須依短邊計算。橫排大字可能很寬但只有數十像素高；若使用
+            // 長邊，會一次向上下擴張近半個字高並吃到人物、速度線與分鏡內容。
+            let shortSide = min(searchBounds.width, searchBounds.height)
+            let padding = max(4, min(32, Int((Double(shortSide) * 0.08).rounded(.up))))
+            let expandedBounds = searchBounds
+                .expanded(by: padding)
+                .intersection(clippingBounds)
+                .intersection(imageBounds)
+            guard expandedBounds != searchBounds else { break }
+            searchBounds = expandedBounds
+            if let expanded = refinement(
+                in: searchBounds,
+                clippingBounds: clippingBounds,
                 imageBounds: imageBounds,
                 raster: raster,
+                // 擴張後真正的字形應已離開搜尋邊界；仍碰邊的通常是框線、
+                // 分鏡線或延伸到插畫內的輪廓，不可納入遮罩。
                 rejectsBoundaryComponents: true
-              ) else {
-            return initial
+            ) {
+                best = expanded
+            }
         }
-        guard let initial else { return expanded }
-        let meaningfulIncrease = expanded.coveredForegroundCount
-            > max(initial.coveredForegroundCount + 4, Int(Double(initial.coveredForegroundCount) * 1.04))
-        return initial.touchesSearchBoundary || meaningfulIncrease ? expanded : initial
+        return best
     }
 
     private func refinement(
@@ -141,7 +178,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         let foregroundCount = histogram.prefix(threshold + 1).reduce(0, +)
         let foregroundRatio = Double(foregroundCount) / Double(sampleCount)
 
-        // OCR 框若大部分都是暗色，通常落在插畫或實心擬聲字上；
+        // 候選區若大部分都是暗色，通常落在插畫或實心擬聲字上；
         // 傳統二值化無法安全區分筆畫與背景，此時保留原始粗框供模型或人工修訂。
         guard foregroundRatio > 0.001, foregroundRatio < 0.55 else { return nil }
 
@@ -169,10 +206,18 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             ? contentComponents.filter { $0.bounds.touches(searchBounds, tolerance: boundaryTolerance) }
             : []
         let boundaryIDs = Set(boundaryComponents.map(\.id))
-        let filtered = rejectsBoundaryComponents
+        var filtered = rejectsBoundaryComponents
             ? contentComponents.filter { !boundaryIDs.contains($0.id) }
             : contentComponents
-        guard !filtered.isEmpty, filtered.count <= maximumComponentsPerRegion else { return nil }
+        guard !filtered.isEmpty else { return nil }
+        // 元件數超過上限時，只取面積最大的前 N 個，不要整個放棄。
+        // 原本超過就 return nil，等於「字愈多愈沒有遮罩」—— 字數最多的氣泡
+        // 最需要遮罩，卻正好最容易觸發上限，實測就是這樣整顆漏掉的。
+        if filtered.count > maximumComponentsPerRegion {
+            filtered = Array(
+                filtered.sorted { $0.area > $1.area }.prefix(maximumComponentsPerRegion)
+            )
+        }
 
         let coveredForegroundCount = filtered.reduce(0) { $0 + $1.area }
         let ignoredStructuralForegroundCount = structuralComponents.reduce(0) { $0 + $1.area }
@@ -372,7 +417,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
     }
 }
 
-private struct PixelBounds {
+private struct PixelBounds: Equatable {
     var minX: Int
     var minY: Int
     var maxX: Int

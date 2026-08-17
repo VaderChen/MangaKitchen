@@ -70,12 +70,11 @@ public enum PageProcessingStage: String, Codable, CaseIterable, Hashable, Sendab
 
 public enum PageProcessingActivity: String, Codable, CaseIterable, Hashable, Sendable {
     case preparingPage
-    case startingOCR
+    case detectingEnclosures
     case preparingTextModel
     case detectingRegions
     case mergingRegions
     case refiningPixelMask
-    case refiningOCR
     case generatingMask
     case renderingMaskPreview
     case applyingGlossary
@@ -171,16 +170,16 @@ public struct MaskStroke: Identifiable, Codable, Hashable, Sendable {
 
 public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
-    /// OCR／譯文的排版區域。
+    /// VLM／Agent 找到的來源文字區域，也是譯文的預設排版錨點。
     public var bounds: NormalizedRect
     /// 對話框內緣；已知時自動遮罩與譯文都不得超出。
     /// nil 代表尚未偵測到對話框，此時遮罩只依 maskExpansion 由文字向外擴張。
     public var bubbleBounds: NormalizedRect?
-    /// Vision OCR 最初回傳的文字，供稽核與重新校正；人工修改 sourceText 時不覆寫。
+    /// VLM、Agent 或人工最初提供的文字，人工修改 sourceText 時不覆寫。
     public var rawSourceText: String?
-    /// 經 LLM 校正或人工修訂後，供詞表比對與翻譯使用的來源文字。
+    /// 供詞表比對與翻譯使用的來源文字。
     public var sourceText: String
-    /// true 代表目前偵測週期已完成一次 LLM OCR 校正。
+    /// 相容舊 `.str` 的完成標記；新流程代表來源文字已由 VLM、Agent 或人工確認。
     public var ocrTextRefined: Bool
     public var translatedText: String
     public var translationAnchor: NormalizedPoint?
@@ -190,7 +189,7 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     public var automaticMaskEnabled: Bool
     /// 自動遮罩的多邊形集合；每個多邊形至少三點，座標以左上角為原點。
     public var maskPolygons: [[NormalizedPoint]]
-    /// true 代表粗略 OCR 框已經像素級文字元件精修。
+    /// true 代表封閉區域或 Agent 粗框已經像素級文字元件精修。
     public var maskRefinementApplied: Bool
     /// 像素精修保留下來的前景筆畫比例；nil 代表尚未執行自動覆蓋檢查。
     public var maskCoverageRatio: Double?
@@ -356,6 +355,9 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
     public var maskExpansion: Double
     public var useImageToImageRestoration: Bool
     public var preserveUntranslatedRegions: Bool
+    /// 精細掃描：封閉區域偵測不到的地方（白底上的開口氣泡、無框台詞），
+    /// 額外以網格逐塊送給圖生文模型辨識。會顯著增加每頁推論次數。
+    public var fineScanEnabled: Bool
 
     public init(
         sourceLanguageCodes: [String] = ["ja-JP", "zh-Hans", "zh-Hant", "en-US"],
@@ -364,7 +366,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         defaultStyle: DialogueStyle = DialogueStyle(),
         maskExpansion: Double = 0.035,
         useImageToImageRestoration: Bool = false,
-        preserveUntranslatedRegions: Bool = false
+        preserveUntranslatedRegions: Bool = false,
+        fineScanEnabled: Bool = false
     ) {
         self.sourceLanguageCodes = sourceLanguageCodes
         self.targetLanguageCode = targetLanguageCode
@@ -373,6 +376,48 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.maskExpansion = maskExpansion
         self.useImageToImageRestoration = useImageToImageRestoration
         self.preserveUntranslatedRegions = preserveUntranslatedRegions
+        self.fineScanEnabled = fineScanEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sourceLanguageCodes
+        case targetLanguageCode
+        case readingDirection
+        case defaultStyle
+        case maskExpansion
+        case useImageToImageRestoration
+        case preserveUntranslatedRegions
+        case fineScanEnabled
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = ProcessingOptions()
+        sourceLanguageCodes = try values.decodeIfPresent(
+            [String].self, forKey: .sourceLanguageCodes
+        ) ?? defaults.sourceLanguageCodes
+        targetLanguageCode = try values.decodeIfPresent(
+            String.self, forKey: .targetLanguageCode
+        ) ?? defaults.targetLanguageCode
+        readingDirection = try values.decodeIfPresent(
+            ReadingDirection.self, forKey: .readingDirection
+        ) ?? defaults.readingDirection
+        defaultStyle = try values.decodeIfPresent(
+            DialogueStyle.self, forKey: .defaultStyle
+        ) ?? defaults.defaultStyle
+        maskExpansion = try values.decodeIfPresent(
+            Double.self, forKey: .maskExpansion
+        ) ?? defaults.maskExpansion
+        useImageToImageRestoration = try values.decodeIfPresent(
+            Bool.self, forKey: .useImageToImageRestoration
+        ) ?? defaults.useImageToImageRestoration
+        preserveUntranslatedRegions = try values.decodeIfPresent(
+            Bool.self, forKey: .preserveUntranslatedRegions
+        ) ?? defaults.preserveUntranslatedRegions
+        // 舊專案沒有這個欄位；預設關閉，不會突然變慢。
+        fineScanEnabled = try values.decodeIfPresent(
+            Bool.self, forKey: .fineScanEnabled
+        ) ?? defaults.fineScanEnabled
     }
 }
 
@@ -401,7 +446,7 @@ public struct PageProcessingResult: Codable, Hashable, Sendable {
 public struct PageDetectionResult: Codable, Hashable, Sendable {
     public var regions: [DialogueRegion]
     public var maskURL: URL
-    /// 非致命的偵測問題，例如補偵測失敗；此時 regions 仍是可用的 Vision 結果。
+    /// 非致命的偵測問題；此時 regions 仍是可用的 VLM／Agent 結果。
     public var warnings: [String]
 
     public init(regions: [DialogueRegion], maskURL: URL, warnings: [String] = []) {

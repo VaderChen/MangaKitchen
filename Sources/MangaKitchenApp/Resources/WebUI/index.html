@@ -25,11 +25,18 @@
         <button id="import-pages" class="icon-button" data-i18n-title="createOrOpenProject" data-i18n-aria-label="createOrOpenProject" title="建立或開啟專案" aria-label="建立或開啟專案"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
         <button id="delete-project" class="quiet icon-button danger-text" data-i18n-title="deleteProject" data-i18n-aria-label="deleteProject" title="刪除專案" aria-label="刪除專案" disabled><i class="fa-solid fa-trash-can" aria-hidden="true"></i></button>
       </div>
-      <div class="workflow-steps">
-        <button class="workflow-step active" data-step="pages"><span>1</span><span class="step-label" data-i18n="pages">頁面</span></button>
-        <button id="detect-selected" class="workflow-step" data-step="mask"><span>2</span><span class="step-label" data-i18n="mask">遮罩</span></button>
-        <button id="translate-selected" class="workflow-step" data-step="translate"><span>3</span><span class="step-label" data-i18n="translate">翻譯</span></button>
-        <button id="compose-selected" class="workflow-step" data-step="compose"><span>4</span><span class="step-label" data-i18n="output">輸出</span></button>
+      <div class="workflow-center">
+        <label id="fine-scan-toggle" class="fine-scan-toggle" data-i18n-title="fineScanHint" title="開啟後每頁會多出數次模型推論，速度慢很多">
+          <input id="fine-scan" type="checkbox" role="switch">
+          <span data-i18n="fineScan">精細掃描 (Beta)</span>
+          <small data-i18n="fineScanSlow">較慢</small>
+        </label>
+        <div class="workflow-steps">
+          <button class="workflow-step active" data-step="pages"><span>1</span><span class="step-label" data-i18n="pages">頁面</span></button>
+          <button id="detect-selected" class="workflow-step" data-step="mask"><span>2</span><span class="step-label" data-i18n="mask">遮罩</span></button>
+          <button id="translate-selected" class="workflow-step" data-step="translate"><span>3</span><span class="step-label" data-i18n="translate">翻譯</span></button>
+          <button id="compose-selected" class="workflow-step" data-step="compose"><span>4</span><span class="step-label" data-i18n="output">輸出</span></button>
+        </div>
       </div>
       <div class="workflow-meta">
         <div class="workflow-actions">
@@ -396,6 +403,25 @@
       <button id="region-context-delete" type="button" role="menuitem" class="danger-text" data-i18n="delete">刪除</button>
     </div>
 
+    <dialog id="model-loading-dialog" aria-labelledby="model-loading-title" aria-describedby="model-loading-message">
+      <div class="model-loading-dialog-shell">
+        <div class="model-loading-dialog-heading">
+          <div id="model-loading-spinner" class="calculation-spinner" aria-hidden="true"></div>
+          <div id="model-loading-error-icon" class="model-loading-error-icon" aria-hidden="true" hidden>!</div>
+          <div>
+            <h2 id="model-loading-title" data-i18n="loadingModelTitle">正在載入模型…</h2>
+            <strong id="model-loading-name"></strong>
+            <p id="model-loading-message" data-i18n="loadingModelPreparing">正在準備模型執行環境…</p>
+          </div>
+        </div>
+        <progress id="model-loading-progress" max="1"></progress>
+        <div class="model-loading-dialog-actions">
+          <span id="model-loading-count" class="dialog-elapsed"></span>
+          <button id="model-loading-close" type="button" class="secondary" data-i18n="close" hidden>關閉</button>
+        </div>
+      </div>
+    </dialog>
+
     <dialog id="calculation-dialog" aria-labelledby="calculation-title" aria-describedby="calculation-message">
       <div class="calculation-dialog-shell">
         <div class="calculation-dialog-heading">
@@ -407,9 +433,20 @@
         </div>
         <progress id="calculation-progress" max="1" value="0"></progress>
         <div class="calculation-dialog-actions">
+          <time id="calculation-elapsed" class="dialog-elapsed" aria-live="off">已等待 00:00</time>
           <button id="calculation-cancel" type="button" class="secondary" data-i18n="cancelJob">取消工作</button>
         </div>
       </div>
+    </dialog>
+
+    <dialog id="notice-dialog" aria-labelledby="notice-title" aria-describedby="notice-message">
+      <form method="dialog" class="confirmation-dialog-shell">
+        <h2 id="notice-title"></h2>
+        <p id="notice-message"></p>
+        <div class="confirmation-dialog-actions">
+          <button id="notice-dismiss" type="submit" value="acknowledge" class="primary"></button>
+        </div>
+      </form>
     </dialog>
 
     <dialog id="confirmation-dialog" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">
@@ -424,5 +461,6 @@
     </dialog>
 
     <script type="module" src="./js/app.js"></script>
+    <div id="mask-brush-cursor" aria-hidden="true" hidden></div>
   </body>
 </html>

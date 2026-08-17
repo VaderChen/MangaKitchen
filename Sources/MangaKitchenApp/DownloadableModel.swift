@@ -104,3 +104,19 @@ struct ModelDownloadState: Encodable, Sendable {
     var totalByteCount: Int64 = 0
     var bytesPerSecond: Double? = nil
 }
+
+struct ModelLoadingState: Encodable, Equatable, Sendable {
+    enum Phase: String, Encodable, Equatable, Sendable {
+        case loading
+        case completed
+        case failed
+    }
+
+    var id: UUID
+    var phase: Phase
+    var displayName: String
+    var currentIndex: Int
+    var totalCount: Int
+    var progress: Double
+    var errorMessage: String?
+}
