@@ -4,6 +4,10 @@
 
 MangaKitchen is a native macOS workspace for translating comics. Its frontend remains HTML + JavaScript, while the Swift Package backend is separated into a domain core, a Metal/Core ML runtime, and a WKWebView app. The core focuses on model boundaries, page-by-page workflows, dialogue regions, masks, and typesetting without coupling them to a particular UI layout.
 
+<p align="center">
+  <img src="AppPic/screen01.jpg" alt="MangaKitchen application window" width="800">
+</p>
+
 ## Copyright and Lawful Use
 
 All imported comic pages, characters, text, artwork, trademarks, and other content remain the property of their respective authors, publishers, licensed platforms, and other lawful rights holders. Using MangaKitchen does not transfer those rights or grant permission to reproduce, translate, publicly transmit, distribute, or sell a work.

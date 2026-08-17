@@ -4,7 +4,9 @@
 
 漫畫廚房（MangaKitchen）是一個 macOS 原生漫畫翻譯工作台。前端保留為 HTML + JavaScript，後端以 Swift Package 分成領域核心、Metal/Core ML Runtime 與 WKWebView App 三層。核心聚焦於模型邊界、逐頁工作流、對話區域、遮罩與排版，不綁定特定前端版面。
 
-![MangaKitchen 應用程式畫面](AppPic/screen01.jpg)
+<p align="center">
+  <img src="AppPic/screen01.jpg" alt="MangaKitchen 應用程式畫面" width="800">
+</p>
 
 ## 著作權與合法使用
 
