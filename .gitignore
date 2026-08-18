@@ -35,6 +35,7 @@ DerivedData/
 /Projects/
 /Workspace/
 *.bak
+*.str
 
 # Model weights and compiled model bundles
 *.safetensors
