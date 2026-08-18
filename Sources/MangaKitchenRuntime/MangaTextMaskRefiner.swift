@@ -10,18 +10,26 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
     private static let maximumMaskAreaPerTextCharacter = 0.003
     private static let inkThresholdOffset = 6
     private static let maximumInkThreshold = 192
+    /// 抗鋸齒過渡帶的亮度上限。掃描與 JPEG 會在筆畫外緣留下一圈比留白稍暗的像素，
+    /// 硬門檻永遠切在這圈中間，塗白後就成為肉眼看得到的灰色毛邊。
+    private static let softEdgeThreshold = 216
+    /// 遲滯擴張的最大輪數，等於過渡帶最多往外吃幾個像素。
+    private static let softEdgeGrowthLimit = 3
     private let searchPaddingPixels: Int
     private let componentPaddingPixels: Int
     private let maximumComponentsPerRegion: Int
+    private let maskDilationPixels: Int
 
     public init(
         searchPaddingPixels: Int = 2,
         componentPaddingPixels: Int = 0,
-        maximumComponentsPerRegion: Int = 256
+        maximumComponentsPerRegion: Int = 256,
+        maskDilationPixels: Int = 1
     ) {
         self.searchPaddingPixels = max(0, searchPaddingPixels)
         self.componentPaddingPixels = max(0, componentPaddingPixels)
         self.maximumComponentsPerRegion = max(1, maximumComponentsPerRegion)
+        self.maskDilationPixels = max(0, maskDilationPixels)
     }
 
     public func refineMasks(
@@ -43,7 +51,9 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
                 refined.maskCoverageComplete = false
                 return refined
             }
-            guard let pixelBounds = Self.enclosingBounds(of: result.polygons),
+            // 合理性判斷與文字區域都必須用未膨脹的字形外框。改用膨脹後的遮罩外框，
+            // 等於把安全餘裕算進「每字面積」，長句子的遮罩會因此被整個丟掉。
+            guard let pixelBounds = result.glyphBounds,
                   Self.isPlausibleMaskBounds(pixelBounds, for: region.sourceText) else {
                 refined.maskPolygons = []
                 refined.automaticMaskEnabled = false
@@ -67,34 +77,32 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             refined.maskRefinementApplied = true
             refined.maskCoverageRatio = result.coverageRatio
             refined.maskCoverageComplete = result.coverageComplete
+            refined.detectedWritingDirection = result.writingDirection
             return refined
         }
     }
 
-    /// 像素精修完成後，文字區域本身也必須同步收斂到字形多邊形外框。
-    /// `bubbleBounds` 仍保留完整對話框內緣，供遮罩裁切與譯文安全範圍使用。
-    private static func enclosingBounds(
-        of polygons: [[NormalizedPoint]]
+    private static func normalizedBounds(
+        of boundsList: [PixelBounds],
+        width: Int,
+        height: Int
     ) -> NormalizedRect? {
-        let points = polygons.flatMap { $0 }
-        guard let first = points.first else { return nil }
-        var minimumX = first.x
-        var minimumY = first.y
-        var maximumX = first.x
-        var maximumY = first.y
-        for point in points.dropFirst() {
-            minimumX = min(minimumX, point.x)
-            minimumY = min(minimumY, point.y)
-            maximumX = max(maximumX, point.x)
-            maximumY = max(maximumY, point.y)
+        guard let first = boundsList.first else { return nil }
+        let union = boundsList.dropFirst().reduce(first) {
+            PixelBounds(
+                minX: min($0.minX, $1.minX),
+                minY: min($0.minY, $1.minY),
+                maxX: max($0.maxX, $1.maxX),
+                maxY: max($0.maxY, $1.maxY)
+            )
         }
-        let bounds = NormalizedRect(
-            x: minimumX,
-            y: minimumY,
-            width: maximumX - minimumX,
-            height: maximumY - minimumY
+        let rect = NormalizedRect(
+            x: Double(union.minX) / Double(width),
+            y: Double(union.minY) / Double(height),
+            width: Double(union.width) / Double(width),
+            height: Double(union.height) / Double(height)
         ).clamped()
-        return bounds.width > 0 && bounds.height > 0 ? bounds : nil
+        return rect.width > 0 && rect.height > 0 ? rect : nil
     }
 
     private static func isPlausibleMaskBounds(
@@ -128,6 +136,11 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         }
         // 有氣泡時不得越界；無框文字只靠下方的兩輪局部擴張控制範圍。
         let clippingBounds = bubbleBounds ?? imageBounds
+        let bubbleMask = BubbleMask(
+            polygons: region.bubbleMaskPolygons,
+            imageWidth: raster.width,
+            imageHeight: raster.height
+        )
         let initialSearchBounds = coarseBounds.intersection(clippingBounds)
         var searchBounds = initialSearchBounds
         var best = refinement(
@@ -135,6 +148,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             clippingBounds: clippingBounds,
             imageBounds: imageBounds,
             raster: raster,
+            bubbleMask: bubbleMask,
             // VLM 粗框可能貼著字形，先保留碰界元件供擴張判斷。
             rejectsBoundaryComponents: false
         )
@@ -157,6 +171,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
                 clippingBounds: clippingBounds,
                 imageBounds: imageBounds,
                 raster: raster,
+                bubbleMask: bubbleMask,
                 // 擴張後真正的字形應已離開搜尋邊界；仍碰邊的通常是框線、
                 // 分鏡線或延伸到插畫內的輪廓，不可納入遮罩。
                 rejectsBoundaryComponents: true
@@ -172,6 +187,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         clippingBounds: PixelBounds,
         imageBounds: PixelBounds,
         raster: GrayscaleRaster,
+        bubbleMask: BubbleMask?,
         rejectsBoundaryComponents: Bool
     ) -> PixelMaskRefinement? {
         guard searchBounds.width > 0, searchBounds.height > 0 else { return nil }
@@ -204,7 +220,11 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             return (spansWidth || spansHeight) && fillRatio < 0.45
         }
         let structuralIDs = Set(structuralComponents.map(\.id))
-        let contentComponents = candidates.filter { !structuralIDs.contains($0.id) }
+        var contentComponents = candidates.filter { !structuralIDs.contains($0.id) }
+        // 矩形框的四角落在氣泡外，那裡的頭髮、網點與分鏡線都不是台詞。
+        if let bubbleMask {
+            contentComponents = contentComponents.filter { bubbleMask.coverage(of: $0) >= 0.6 }
+        }
         // 擴張到整個對話框內緣時，接觸安全邊界的元件通常是泡泡框線、
         // 人物輪廓或分鏡線，而不是位於留白中的文字。它們可參與「邊界太窄」
         // 的診斷，但不可直接成為遮罩，否則會把泡泡外框一併抹除。
@@ -244,36 +264,145 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         let touchesSearchBoundary = filtered.contains {
             $0.bounds.touches(searchBounds, tolerance: boundaryTolerance)
         }
-        let polygons = filtered
-            .sorted {
-                if $0.bounds.minY != $1.bounds.minY { return $0.bounds.minY < $1.bounds.minY }
-                return $0.bounds.minX < $1.bounds.minX
-            }
-            .flatMap { component in
-                component.pixelRectangles.map { pixelRectangle in
-                    let bounds = pixelRectangle
-                        .expanded(by: componentPaddingPixels)
-                        .intersection(clippingBounds)
-                        .intersection(imageBounds)
-                    let minX = Double(bounds.minX) / Double(raster.width)
-                    let minY = Double(bounds.minY) / Double(raster.height)
-                    let maxX = Double(bounds.maxX) / Double(raster.width)
-                    let maxY = Double(bounds.maxY) / Double(raster.height)
-                    return [
-                        NormalizedPoint(x: minX, y: minY),
-                        NormalizedPoint(x: maxX, y: minY),
-                        NormalizedPoint(x: maxX, y: maxY),
-                        NormalizedPoint(x: minX, y: maxY)
-                    ]
-                }
-            }
+        // 膨脹必須在像素層做。過去是把每一條 run rectangle 各自向量描邊再聯集，
+        // 斜筆畫拆出的一堆 1px 高矩形分別鼓起來，遮罩邊界就變成扇貝狀毛邊。
+        let maskPixels = grownMaskPixels(
+            components: filtered,
+            raster: raster,
+            bounds: searchBounds,
+            bubbleMask: bubbleMask
+        )
+        let polygons = mergedPixelRectangles(for: maskPixels).map { pixelRectangle -> [NormalizedPoint] in
+            let bounds = pixelRectangle
+                .expanded(by: componentPaddingPixels)
+                .intersection(clippingBounds)
+                .intersection(imageBounds)
+            let minX = Double(bounds.minX) / Double(raster.width)
+            let minY = Double(bounds.minY) / Double(raster.height)
+            let maxX = Double(bounds.maxX) / Double(raster.width)
+            let maxY = Double(bounds.maxY) / Double(raster.height)
+            return [
+                NormalizedPoint(x: minX, y: minY),
+                NormalizedPoint(x: maxX, y: minY),
+                NormalizedPoint(x: maxX, y: maxY),
+                NormalizedPoint(x: minX, y: maxY)
+            ]
+        }
         return PixelMaskRefinement(
             polygons: polygons,
+            writingDirection: MangaTextDirectionDetector.direction(
+                forGlyphBoxes: filtered.map {
+                    CGRect(
+                        x: Double($0.bounds.minX),
+                        y: Double($0.bounds.minY),
+                        width: Double($0.bounds.width),
+                        height: Double($0.bounds.height)
+                    )
+                }
+            ),
+            glyphBounds: Self.normalizedBounds(
+                of: filtered.map(\.bounds),
+                width: raster.width,
+                height: raster.height
+            ),
             coverageRatio: coverageRatio,
             coverageComplete: coverageRatio >= 0.9 && !touchesSearchBoundary,
             coveredForegroundCount: coveredForegroundCount,
             touchesSearchBoundary: touchesSearchBoundary
         )
+    }
+
+    /// 以字形像素為種子，向外長出實際要塗掉的遮罩。
+    ///
+    /// 先做遲滯擴張：只吃仍然偏暗的鄰接像素，把抗鋸齒過渡帶整圈收進遮罩，
+    /// 網點與留白因為夠亮不會被捲進來。再無條件外擴固定像素，覆蓋 JPEG 在
+    /// 高對比邊緣留下的 ringing —— 那圈殘留常常已經亮過遲滯門檻。
+    private func grownMaskPixels(
+        components: [PixelComponent],
+        raster: GrayscaleRaster,
+        bounds: PixelBounds,
+        bubbleMask: BubbleMask?
+    ) -> [PixelCoordinate] {
+        let width = bounds.width
+        let height = bounds.height
+        guard width > 0, height > 0 else { return [] }
+
+        var marked = [Bool](repeating: false, count: width * height)
+        for component in components {
+            for rectangle in component.pixelRectangles {
+                for y in rectangle.minY..<rectangle.maxY {
+                    let localY = y - bounds.minY
+                    guard localY >= 0, localY < height else { continue }
+                    for x in rectangle.minX..<rectangle.maxX {
+                        let localX = x - bounds.minX
+                        guard localX >= 0, localX < width else { continue }
+                        marked[localY * width + localX] = true
+                    }
+                }
+            }
+        }
+
+        for round in 0..<(Self.softEdgeGrowthLimit + maskDilationPixels) {
+            // 前幾輪看亮度，之後幾輪無條件外擴。
+            let requiresDarkPixel = round < Self.softEdgeGrowthLimit
+            var next = marked
+            var grew = false
+            for localY in 0..<height {
+                for localX in 0..<width {
+                    let index = localY * width + localX
+                    if marked[index] { continue }
+                    if requiresDarkPixel {
+                        let value = Int(raster[bounds.minX + localX, bounds.minY + localY])
+                        guard value <= Self.softEdgeThreshold else { continue }
+                    }
+                    guard hasMarkedNeighbour(
+                        marked,
+                        localX: localX,
+                        localY: localY,
+                        width: width,
+                        height: height
+                    ) else { continue }
+                    next[index] = true
+                    grew = true
+                }
+            }
+            marked = next
+            // 遲滯階段長不動就直接進入無條件外擴，不要空轉。
+            if !grew, requiresDarkPixel { continue }
+            if !grew { break }
+        }
+
+        var pixels: [PixelCoordinate] = []
+        pixels.reserveCapacity(marked.lazy.filter { $0 }.count)
+        for localY in 0..<height {
+            for localX in 0..<width where marked[localY * width + localX] {
+                let x = bounds.minX + localX
+                let y = bounds.minY + localY
+                // 膨脹餘裕同樣不得越過氣泡形狀，否則邊緣的字又會把外框吃進來。
+                if let bubbleMask, !bubbleMask.contains(x: x, y: y) { continue }
+                pixels.append(PixelCoordinate(x: x, y: y))
+            }
+        }
+        return pixels
+    }
+
+    private func hasMarkedNeighbour(
+        _ marked: [Bool],
+        localX: Int,
+        localY: Int,
+        width: Int,
+        height: Int
+    ) -> Bool {
+        for offsetY in -1...1 {
+            let neighbourY = localY + offsetY
+            guard neighbourY >= 0, neighbourY < height else { continue }
+            for offsetX in -1...1 where offsetX != 0 || offsetY != 0 {
+                let neighbourX = localX + offsetX
+                guard neighbourX >= 0, neighbourX < width else { continue }
+                if marked[neighbourY * width + neighbourX] { return true }
+            }
+        }
+        return false
     }
 
     private func connectedComponents(
@@ -424,6 +553,77 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
     }
 }
 
+/// 對話框的實際形狀，光柵化成布林表供逐像素查詢。
+///
+/// 圓形對話框的矩形框四角其實是畫面內容。只用矩形裁切，人物頭髮與網點會被
+/// 當成文字元件擦掉 —— 那就是遮罩溢出到臉上的來源。
+private struct BubbleMask {
+    let bounds: PixelBounds
+    private let inside: [Bool]
+
+    init?(polygons: [[NormalizedPoint]], imageWidth: Int, imageHeight: Int) {
+        var rectangles: [PixelBounds] = []
+        for polygon in polygons where polygon.count >= 4 {
+            let xValues = polygon.map(\.x)
+            let yValues = polygon.map(\.y)
+            guard let minimumX = xValues.min(), let maximumX = xValues.max(),
+                  let minimumY = yValues.min(), let maximumY = yValues.max() else { continue }
+            let rectangle = PixelBounds(
+                minX: Int(floor(minimumX * Double(imageWidth))),
+                minY: Int(floor(minimumY * Double(imageHeight))),
+                maxX: Int(ceil(maximumX * Double(imageWidth))),
+                maxY: Int(ceil(maximumY * Double(imageHeight)))
+            )
+            guard rectangle.width > 0, rectangle.height > 0 else { continue }
+            rectangles.append(rectangle)
+        }
+        guard let first = rectangles.first else { return nil }
+        let union = rectangles.dropFirst().reduce(first) {
+            PixelBounds(
+                minX: min($0.minX, $1.minX),
+                minY: min($0.minY, $1.minY),
+                maxX: max($0.maxX, $1.maxX),
+                maxY: max($0.maxY, $1.maxY)
+            )
+        }
+        guard union.width > 0, union.height > 0 else { return nil }
+        var buffer = [Bool](repeating: false, count: union.width * union.height)
+        for rectangle in rectangles {
+            for y in rectangle.minY..<rectangle.maxY {
+                let localY = y - union.minY
+                guard localY >= 0, localY < union.height else { continue }
+                for x in rectangle.minX..<rectangle.maxX {
+                    let localX = x - union.minX
+                    guard localX >= 0, localX < union.width else { continue }
+                    buffer[localY * union.width + localX] = true
+                }
+            }
+        }
+        bounds = union
+        inside = buffer
+    }
+
+    func contains(x: Int, y: Int) -> Bool {
+        let localX = x - bounds.minX
+        let localY = y - bounds.minY
+        guard localX >= 0, localX < bounds.width,
+              localY >= 0, localY < bounds.height else { return false }
+        return inside[localY * bounds.width + localX]
+    }
+
+    func coverage(of component: PixelComponent) -> Double {
+        var insideCount = 0
+        for rectangle in component.pixelRectangles {
+            for y in rectangle.minY..<rectangle.maxY {
+                for x in rectangle.minX..<rectangle.maxX where contains(x: x, y: y) {
+                    insideCount += 1
+                }
+            }
+        }
+        return Double(insideCount) / Double(max(component.area, 1))
+    }
+}
+
 private struct PixelBounds: Equatable {
     var minX: Int
     var minY: Int
@@ -479,6 +679,10 @@ private struct PixelSpan: Hashable {
 
 private struct PixelMaskRefinement {
     var polygons: [[NormalizedPoint]]
+    /// 由字形排列量出的書寫方向。字太少或排列模稜兩可時為 `automatic`。
+    var writingDirection: WritingDirection
+    /// 膨脹前的字形外框。遮罩可以帶餘裕，文字區域與合理性判斷不行。
+    var glyphBounds: NormalizedRect?
     var coverageRatio: Double
     var coverageComplete: Bool
     var coveredForegroundCount: Int

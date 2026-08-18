@@ -17,21 +17,27 @@ public actor MangaBubbleMaskRegionDetector: SemanticRegionDetecting {
     ) async throws -> [DialogueRegion] {
         progress(0.05)
         let source = try CGImageIO.load(from: pageURL)
-        let bounds: [NormalizedRect]
+        let detections: [BubbleDetection]
         if let bubbleSegmenter {
             do {
-                bounds = try bubbleSegmenter.detect(in: source)
+                detections = try bubbleSegmenter.detectBubbles(in: source)
             } catch {
-                bounds = try fallbackCandidateDetector.detect(in: source)
+                detections = try fallbackCandidateDetector.detect(in: source).map {
+                    BubbleDetection(bounds: $0)
+                }
             }
         } else {
-            bounds = try fallbackCandidateDetector.detect(in: source)
+            detections = try fallbackCandidateDetector.detect(in: source).map {
+                BubbleDetection(bounds: $0)
+            }
         }
         progress(0.7)
-        let regions = bounds.map { bounds in
+        let regions = detections.map { detection in
             DialogueRegion(
-                bounds: bounds,
-                bubbleBounds: bounds,
+                bounds: detection.bounds,
+                bubbleBounds: detection.bounds,
+                bubbleMaskPolygons: detection.maskPolygons,
+                bubbleLayoutBounds: detection.layoutBounds,
                 sourceText: "",
                 confidence: 0.5,
                 automaticMaskEnabled: false

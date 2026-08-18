@@ -33,10 +33,10 @@ Project
    └─ 遞迴掃描、自然排序、保留相對路徑
 
 2. MangaBubbleSegmentationCoreMLRuntime + MangaBubbleMaskRegionDetector／外部 MCP Agent + MangaTextMaskRefiner
-   ├─ 內建 Core ML 氣泡分割模型優先以 Apple Neural Engine 產生對話框 BBOX，不辨識文字
-   ├─ 對話框 BBOX 直接作為像素搜尋範圍，不直接成為遮罩
-   ├─ Otsu／連通元件把搜尋結果縮減成字形級多邊形，並將文字 bounds 同步縮到字形外框
-   └─ 自動區域 + add/erase 向量筆劃 → dialogue-mask.png + 傳統 CPU／GPU 去字校對預覽 + page.str
+   ├─ 內建 Core ML 氣泡分割模型優先以 Apple Neural Engine 產生對話框 BBOX 與形狀，不辨識文字
+   ├─ 氣泡 instance mask 裁切 BBOX，保存 `bubbleMaskPolygons` 與供排版使用的 `bubbleLayoutBounds`
+   ├─ Otsu／連通元件把搜尋結果縮減成字形級像素遮罩，並將文字 bounds 同步縮到字形外框
+   └─ 像素層膨脹 + add/erase 畫筆 → 二值 `dialogue-mask.png` + CPU／GPU 去字校對預覽 + page.str
 
 3. ImageToTextGenerating
    ├─ VLMRegionTranscriptionService 在既有 BBOX 內分類、轉錄並排除擬聲字等非翻譯項目
@@ -66,14 +66,14 @@ Project
 - `MLXVLMRuntime`：載入本機 Hugging Face VLM 目錄、縮放輸入圖片、串流產生翻譯 JSON；container 跨頁重用。
 - `QwenExternalImageEditRuntime`：以 JSONL 監看獨立 Swift/MLX worker，傳遞進度、錯誤與取消訊號。
 - `MaskedImageCompositor`：將生成候選圖縮放回原頁，再只採用 mask 白區，避免生成模型改動未授權區域。
-- `MangaBubbleSegmentationCoreMLRuntime`：內建由 `manga109-segmentation-bubble` 匯出的 Core ML YOLO 分割模型。模型固定以 `1600 × 1600` letterbox 輸入，優先採用 `cpuAndNeuralEngine`；輸出會反算回原圖座標並經 NMS 產生標題框／對話泡泡 BBOX。模型無法載入或推論失敗時，才由 `MangaBubbleCandidateDetector` 的封閉白色連通區演算法後備。
-- `MangaBubbleMaskRegionDetector`：在步驟二將 Core ML BBOX 寫入 `DialogueRegion.bounds` 與 `bubbleBounds`，不載入或呼叫 VLM；`MangaTextMaskRefiner` 隨即依原圖像素將遮罩與文字 bounds 收斂到實際字形。
+- `MangaBubbleSegmentationCoreMLRuntime`：內建由 `manga109-segmentation-bubble` 匯出的 Core ML YOLO 分割模型。模型依 image constraint 進行方形 letterbox，優先採用 `cpuAndNeuralEngine`；輸出反算回原圖座標並經 NMS 產生 BBOX，若有 prototype 則同步解出 `bubbleMaskPolygons` 與 `bubbleLayoutBounds`。模型無法載入或推論失敗時，才由 `MangaBubbleCandidateDetector` 的封閉白色連通區演算法後備。
+- `MangaBubbleMaskRegionDetector`：在步驟二將 Core ML BBOX 與氣泡形狀寫入 `DialogueRegion.bounds`、`bubbleBounds`、`bubbleMaskPolygons` 及 `bubbleLayoutBounds`，不載入或呼叫 VLM；`MangaTextMaskRefiner` 隨即依原圖像素將遮罩與文字 bounds 收斂到實際字形。
 - `VLMRegionTranscriptionService`：在步驟三才將既有 BBOX 裁成候選卡片，由 VLM 分類為 `title`、`dialogue`、`caption` 或 `ignore` 並轉錄文字。接受的候選保留原 ID、BBOX、像素遮罩與人工筆劃；擬聲字、頁碼、浮水印、人物與空白區不進入翻譯或最終合成。
 - 外部 MCP Agent：讀取原圖及目前 page resource 後，可用 `page.supplement_regions` 送入文字粗框、來源原文及可選的對話框邊界／多邊形。沒有多邊形時同樣交由 `MangaTextMaskRefiner`，因此本機 VLM 與外部 Agent 不會形成兩套遮罩格式或演算法。
-- `MangaTextMaskRefiner`：先分析 Core ML BBOX 或 Agent 粗框；若已知完整 `bubbleBounds`，再掃描整個對話框內緣並比較可信前景。搜尋範圍不會直接成為遮罩，最後以 Otsu 閾值及八鄰域連通元件縮減成字形多邊形，並將 `bounds` 同步縮到多邊形外框；擴張搜尋時會排除碰觸安全邊界的泡泡框線／人物輪廓。暗色背景上的亮字則交由 Agent 精確多邊形或遮罩補筆處理。
+- `MangaTextMaskRefiner`：先分析 Core ML BBOX 或 Agent 粗框；若已知 `bubbleMaskPolygons`，會先以氣泡形狀篩選元件。搜尋範圍不會直接成為遮罩，最後以 Otsu 閾值及八鄰域連通元件取得字形像素，並在像素層執行抗鋸齒遲滯與固定像素膨脹，再合併成二值遮罩矩形，避免向量描邊造成灰階毛邊；`bounds` 同步縮到未膨脹的字形外框。暗色背景上的亮字則交由 Agent 精確多邊形或遮罩補筆處理。
 - `VLMRegionTranslationService`：保留整頁影像語境並將已確認來源文字的 region 分批翻譯，讓模型保留人物語氣與上下文，且不再次轉錄來源文字；缺少任一句時整頁不會被標記為翻譯完成。
 - `MetalBubbleCleaner`：執行 Metal compute kernel，作為圖生圖模型不可用時的背景修補。
-- `HTMLDialogueTypesetter`：將步驟三保存的 `translationBounds`、`translationAnchor`、字型、固定／自動字級、粗細及橫排／直排設定交給 WebKit，使用與 WebUI 相同的 HTML/CSS 與自動縮字演算法渲染背景及文字層，再輸出原圖像素尺寸的 PNG。GUI、批次與 MCP 共用此排版器，不再存在另一套 Core Text 輸出規則。
+- `HTMLDialogueTypesetter`：將步驟三保存的 `translationBounds`、`translationAnchor`、字型、固定／自動字級、粗細及橫排／直排設定交給 WebKit；自動方向優先採用字形排列偵測結果，氣泡排版優先使用完全位於 `bubbleMaskPolygons` 內的 `bubbleLayoutBounds`。使用與 WebUI 相同的 HTML/CSS 與自動縮字演算法渲染背景及文字層，再輸出原圖像素尺寸的 PNG。GUI、批次與 MCP 共用此排版器，不再存在另一套 Core Text 輸出規則。
 - `ComicTranslationPipeline`：只負責階段順序與產物路徑，不知道 UI。步驟二的 `SemanticRegionDetecting` 只需 Core ML BBOX／像素遮罩；GUI 在步驟三才要求已載入圖生文模型，且不回退至系統文字辨識。
 
 ### MangaKitchenApp
@@ -118,9 +118,8 @@ Qwen Image Edit 的主套件要求 macOS 26，因此以 `RuntimeSupport/QwenImag
 
 UI 設計前建議依序完成：
 
-1. 氣泡／旁白框 segmentation，將目前的矩形 `bubbleBounds` 升級為精準內緣 polygon。
-2. 以漫畫專用 DBNet／CRAFT 或 segmentation 模型補強暗色、彩色背景與非封閉旁白框；擬聲字目前不納入主工作流，未來若支援需使用獨立偵測與排版策略。
-3. 禁排規則、標點擠壓、直排旋轉字元、ruby 與 fallback font chain。
-4. 翻譯長度預估與二次精簡 prompt，避免只靠縮小字級。
-5. Project JSON 與原始檔 security-scoped bookmark，支援關閉後復原。
-6. 批次輸出命名、格式、色彩描述檔與 metadata 保留。
+1. 以漫畫專用 DBNet／CRAFT 或 segmentation 模型補強暗色、彩色背景與非封閉旁白框；擬聲字目前不納入主工作流，未來若支援需使用獨立偵測與排版策略。
+2. 禁排規則、標點擠壓、直排旋轉字元、ruby 與 fallback font chain。
+3. 翻譯長度預估與二次精簡 prompt，避免只靠縮小字級。
+4. Project JSON 與原始檔 security-scoped bookmark，支援關閉後復原。
+5. 批次輸出命名、格式、色彩描述檔與 metadata 保留。

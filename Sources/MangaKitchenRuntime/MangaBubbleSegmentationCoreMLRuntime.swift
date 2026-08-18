@@ -3,6 +3,32 @@ import CoreML
 import Foundation
 import MangaKitchenCore
 
+/// 一個對話框候選：矩形框，加上分割模型給出的實際形狀。
+///
+/// `maskPolygons` 是軸對齊矩形集合而非輪廓多邊形，下游只需要判斷「這個像素在不在
+/// 氣泡裡」，矩形集合在 CGContext 裁切與像素查表兩邊都比多邊形填充便宜。
+/// 空陣列代表模型沒有輸出 prototype，此時只有 `bounds` 可用。
+public struct BubbleDetection: Sendable {
+    public var bounds: NormalizedRect
+    public var maskPolygons: [[NormalizedPoint]]
+    /// 完全落在氣泡形狀內的最大矩形，供譯文排版使用。
+    ///
+    /// 不能直接拿 `bounds` 排版：圓形對話框的外接矩形四角在氣泡之外，
+    /// 填滿它的譯文會溢出到畫面上。也不能把 `bounds` 縮成這個值 ——
+    /// 它同時是遮罩的搜尋邊界，縮了會讓貼著上下弧線的字沒被遮到。
+    public var layoutBounds: NormalizedRect?
+
+    public init(
+        bounds: NormalizedRect,
+        maskPolygons: [[NormalizedPoint]] = [],
+        layoutBounds: NormalizedRect? = nil
+    ) {
+        self.bounds = bounds
+        self.maskPolygons = maskPolygons
+        self.layoutBounds = layoutBounds
+    }
+}
+
 public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
     private struct LetterboxedImage {
         var image: CGImage
@@ -14,12 +40,19 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
     private struct Candidate {
         var bounds: NormalizedRect
         var confidence: Double
+        /// YOLO-seg 的 32 個遮罩係數，與 prototype 線性組合後才是真正的氣泡形狀。
+        var maskCoefficients: [Float]
+        /// letterbox 座標下的框，用來把 prototype 裁到這個實例。
+        var letterboxBounds: CGRect
     }
 
     private let modelURL: URL
     private let confidenceThreshold: Double
     private let intersectionOverUnionThreshold: Double
     private let maximumCandidates: Int
+    /// 氣泡遮罩往內縮的來源像素數。YOLO 的框與分割遮罩都含框線本身，
+    /// 不內縮的話字形搜尋會把黑色外框當成文字擦掉，邊緣就出現缺口。
+    private let maskErosionPixels: Int
     private let lock = NSLock()
     private var model: MLModel?
 
@@ -27,7 +60,8 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         modelURL: URL,
         confidenceThreshold: Double = 0.25,
         intersectionOverUnionThreshold: Double = 0.5,
-        maximumCandidates: Int = 36
+        maximumCandidates: Int = 36,
+        maskErosionPixels: Int = 3
     ) throws {
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw ModelRuntimeError.modelFileNotFound(modelURL)
@@ -36,9 +70,14 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         self.confidenceThreshold = min(max(confidenceThreshold, 0), 1)
         self.intersectionOverUnionThreshold = min(max(intersectionOverUnionThreshold, 0), 1)
         self.maximumCandidates = max(1, maximumCandidates)
+        self.maskErosionPixels = max(0, maskErosionPixels)
     }
 
     public func detect(in source: CGImage) throws -> [NormalizedRect] {
+        try detectBubbles(in: source).map(\.bounds)
+    }
+
+    public func detectBubbles(in source: CGImage) throws -> [BubbleDetection] {
         lock.lock()
         defer { lock.unlock() }
 
@@ -65,12 +104,30 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         let provider = try MLDictionaryFeatureProvider(dictionary: [input.key: feature])
         let prediction = try loadedModel.prediction(from: provider)
         let rawPredictions = try predictionArray(from: prediction)
-        return nonMaximumSuppressedCandidates(
+        let prototypes = maskPrototypeArray(from: prediction)
+        let candidates = nonMaximumSuppressedCandidates(
             from: rawPredictions,
             sourceWidth: source.width,
             sourceHeight: source.height,
             letterboxed: letterboxed
-        ).map(\.bounds)
+        )
+        return candidates.map { candidate in
+            // 沒有 prototype 就退回矩形框；行為與加上分割前一致，不會整批失效。
+            let shape = prototypes.map {
+                bubbleShape(
+                    for: candidate,
+                    prototypes: $0,
+                    sourceWidth: source.width,
+                    sourceHeight: source.height,
+                    letterboxed: letterboxed
+                )
+            }
+            return BubbleDetection(
+                bounds: candidate.bounds,
+                maskPolygons: shape?.polygons ?? [],
+                layoutBounds: shape?.layoutBounds
+            )
+        }
     }
 
     private func resolvedModel() throws -> MLModel {
@@ -165,6 +222,24 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         throw ModelRuntimeError.featureNotFound("YOLO 氣泡預測輸出")
     }
 
+    /// YOLO-seg 的第二個輸出是 [1, 32, H, W] 的 prototype。與候選框的 32 個係數
+    /// 線性組合再取 sigmoid，才得到該實例的遮罩。
+    private func maskPrototypeArray(from prediction: any MLFeatureProvider) -> MLMultiArray? {
+        for outputName in prediction.featureNames {
+            guard let feature = prediction.featureValue(for: outputName),
+                  feature.type == .multiArray,
+                  let array = feature.multiArrayValue else { continue }
+            let dimensions = array.shape.map(\.intValue)
+            guard dimensions.count == 4,
+                  dimensions[0] == 1,
+                  dimensions[1] > 1,
+                  dimensions[2] > 1,
+                  dimensions[3] > 1 else { continue }
+            return array
+        }
+        return nil
+    }
+
     private func nonMaximumSuppressedCandidates(
         from predictions: MLMultiArray,
         sourceWidth: Int,
@@ -204,7 +279,29 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
                 height: (bottom - top) / Double(sourceHeight)
             ).clamped()
             guard normalized.width > 0, normalized.height > 0 else { continue }
-            candidates.append(Candidate(bounds: normalized, confidence: confidence))
+            var maskCoefficients: [Float] = []
+            if featureCount > 5 {
+                maskCoefficients.reserveCapacity(featureCount - 5)
+                for featureIndex in 5..<featureCount {
+                    maskCoefficients.append(value(
+                        in: predictions,
+                        batch: 0,
+                        feature: featureIndex,
+                        candidate: candidateIndex
+                    ))
+                }
+            }
+            candidates.append(Candidate(
+                bounds: normalized,
+                confidence: confidence,
+                maskCoefficients: maskCoefficients,
+                letterboxBounds: CGRect(
+                    x: centerX - width / 2,
+                    y: centerY - height / 2,
+                    width: width,
+                    height: height
+                )
+            ))
         }
 
         let ordered = candidates.sorted { $0.confidence > $1.confidence }
@@ -226,6 +323,230 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
             }
             return $0.bounds.minX < $1.bounds.minX
         }
+    }
+
+    /// 把單一候選的分割遮罩解出來，轉成來源圖正規化座標的軸對齊矩形集合。
+    ///
+    /// 用矩形集合而不是輪廓多邊形，是因為下游只需要「這個像素在不在氣泡裡」：
+    /// CGContext 可以直接 clip 一組矩形，像素端也只是查表，兩邊都不必做多邊形填充。
+    private func bubbleShape(
+        for candidate: Candidate,
+        prototypes: MLMultiArray,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        letterboxed: LetterboxedImage
+    ) -> (polygons: [[NormalizedPoint]], layoutBounds: NormalizedRect?) {
+        let dimensions = prototypes.shape.map(\.intValue)
+        let prototypeCount = dimensions[1]
+        let prototypeHeight = dimensions[2]
+        let prototypeWidth = dimensions[3]
+        let usableCount = min(prototypeCount, candidate.maskCoefficients.count)
+        guard usableCount > 0 else { return ([], nil) }
+
+        // prototype 的解析度低於 letterbox 輸入，先換算出這個框在 prototype 上的範圍。
+        let letterboxSide = Double(prototypeWidth) // 方形輸入，寬高比例一致
+        let scaleToPrototype = letterboxSide / Double(letterboxed.image.width)
+        let minX = max(0, Int((candidate.letterboxBounds.minX * scaleToPrototype).rounded(.down)))
+        let maxX = min(prototypeWidth, Int((candidate.letterboxBounds.maxX * scaleToPrototype).rounded(.up)))
+        let minY = max(0, Int((candidate.letterboxBounds.minY * scaleToPrototype).rounded(.down)))
+        let maxY = min(prototypeHeight, Int((candidate.letterboxBounds.maxY * scaleToPrototype).rounded(.up)))
+        guard maxX > minX, maxY > minY else { return ([], nil) }
+
+        let strides = prototypes.strides.map(\.intValue)
+        let localWidth = maxX - minX
+        let localHeight = maxY - minY
+        var inside = [Bool](repeating: false, count: localWidth * localHeight)
+        for y in minY..<maxY {
+            for x in minX..<maxX {
+                var total: Float = 0
+                for channel in 0..<usableCount {
+                    let offset = channel * strides[1] + y * strides[2] + x * strides[3]
+                    total += candidate.maskCoefficients[channel] * prototypeValue(prototypes, at: offset)
+                }
+                // sigmoid > 0.5 等價於線性組合 > 0，省掉一次 exp。
+                inside[(y - minY) * localWidth + (x - minX)] = total > 0
+            }
+        }
+
+        // 遮罩含氣泡框線本身，往內縮再交給下游，字形搜尋才不會咬到黑色外框。
+        let prototypePixelsPerSourcePixel = scaleToPrototype * letterboxed.scale
+        // prototype 通常是輸入圖的 1/4 解析度；直接四捨五入會讓 3px 在
+        // 大圖上變成 0，等於完全沒有內縮。只要設定了來源像素內縮，就至少
+        // 內縮一個 prototype 像素，避免框線重新落入文字搜尋範圍。
+        let erosionRounds = maskErosionPixels > 0
+            ? max(
+                1,
+                Int((Double(maskErosionPixels) * prototypePixelsPerSourcePixel).rounded(.up))
+            )
+            : 0
+        for _ in 0..<max(0, erosionRounds) {
+            inside = eroded(inside, width: localWidth, height: localHeight)
+        }
+
+        let polygons = normalizedRunRectangles(
+            inside,
+            width: localWidth,
+            height: localHeight,
+            originX: minX,
+            originY: minY,
+            scaleToPrototype: scaleToPrototype,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            letterboxed: letterboxed
+        )
+        let layoutBounds = maximalInsideRectangle(
+            inside,
+            width: localWidth,
+            height: localHeight
+        ).flatMap { rectangle -> NormalizedRect? in
+            let left = sourceCoordinate(
+                Double(minX + rectangle.minX), scaleToPrototype: scaleToPrototype,
+                padding: letterboxed.horizontalPadding, scale: letterboxed.scale,
+                dimension: sourceWidth
+            )
+            let right = sourceCoordinate(
+                Double(minX + rectangle.maxX), scaleToPrototype: scaleToPrototype,
+                padding: letterboxed.horizontalPadding, scale: letterboxed.scale,
+                dimension: sourceWidth
+            )
+            let top = sourceCoordinate(
+                Double(minY + rectangle.minY), scaleToPrototype: scaleToPrototype,
+                padding: letterboxed.verticalPadding, scale: letterboxed.scale,
+                dimension: sourceHeight
+            )
+            let bottom = sourceCoordinate(
+                Double(minY + rectangle.maxY), scaleToPrototype: scaleToPrototype,
+                padding: letterboxed.verticalPadding, scale: letterboxed.scale,
+                dimension: sourceHeight
+            )
+            guard right > left, bottom > top else { return nil }
+            return NormalizedRect(
+                x: left, y: top, width: right - left, height: bottom - top
+            ).clamped()
+        }
+        return (polygons, layoutBounds)
+    }
+
+    private func sourceCoordinate(
+        _ prototypeValue: Double,
+        scaleToPrototype: Double,
+        padding: Double,
+        scale: Double,
+        dimension: Int
+    ) -> Double {
+        min(max((prototypeValue / scaleToPrototype - padding) / scale / Double(dimension), 0), 1)
+    }
+
+    /// 二值遮罩裡完全為 true 的最大軸對齊矩形。逐列累積高度，再用單調堆疊求
+    /// 每一列直方圖的最大矩形，整體 O(寬 × 高)。
+    private func maximalInsideRectangle(
+        _ mask: [Bool],
+        width: Int,
+        height: Int
+    ) -> (minX: Int, minY: Int, maxX: Int, maxY: Int)? {
+        guard width > 0, height > 0 else { return nil }
+        var heights = [Int](repeating: 0, count: width)
+        var bestArea = 0
+        var best: (minX: Int, minY: Int, maxX: Int, maxY: Int)?
+
+        for y in 0..<height {
+            for x in 0..<width {
+                heights[x] = mask[y * width + x] ? heights[x] + 1 : 0
+            }
+            var stack: [(start: Int, height: Int)] = []
+            for x in 0...width {
+                let currentHeight = x < width ? heights[x] : 0
+                var start = x
+                while let last = stack.last, last.height > currentHeight {
+                    stack.removeLast()
+                    let area = last.height * (x - last.start)
+                    if area > bestArea {
+                        bestArea = area
+                        best = (
+                            minX: last.start,
+                            minY: y - last.height + 1,
+                            maxX: x,
+                            maxY: y + 1
+                        )
+                    }
+                    start = last.start
+                }
+                if stack.last?.height != currentHeight {
+                    stack.append((start: start, height: currentHeight))
+                }
+            }
+        }
+        return best
+    }
+
+    private func prototypeValue(_ array: MLMultiArray, at offset: Int) -> Float {
+        switch array.dataType {
+        case .float32: array.dataPointer.assumingMemoryBound(to: Float.self)[offset]
+        case .double: Float(array.dataPointer.assumingMemoryBound(to: Double.self)[offset])
+        case .float16: Float(array.dataPointer.assumingMemoryBound(to: Float16.self)[offset])
+        default: 0
+        }
+    }
+
+    private func eroded(_ mask: [Bool], width: Int, height: Int) -> [Bool] {
+        var result = [Bool](repeating: false, count: mask.count)
+        for y in 0..<height {
+            for x in 0..<width {
+                let index = y * width + x
+                guard mask[index] else { continue }
+                // 碰到裁切邊界就視為外部，避免框緣殘留一圈。
+                guard x > 0, y > 0, x < width - 1, y < height - 1,
+                      mask[index - 1], mask[index + 1],
+                      mask[index - width], mask[index + width] else { continue }
+                result[index] = true
+            }
+        }
+        return result
+    }
+
+    /// 逐列把連續的 true 併成矩形，再換算回來源圖正規化座標。
+    private func normalizedRunRectangles(
+        _ mask: [Bool],
+        width: Int,
+        height: Int,
+        originX: Int,
+        originY: Int,
+        scaleToPrototype: Double,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        letterboxed: LetterboxedImage
+    ) -> [[NormalizedPoint]] {
+        func sourceX(_ prototypeX: Double) -> Double {
+            (prototypeX / scaleToPrototype - letterboxed.horizontalPadding)
+                / letterboxed.scale / Double(sourceWidth)
+        }
+        func sourceY(_ prototypeY: Double) -> Double {
+            (prototypeY / scaleToPrototype - letterboxed.verticalPadding)
+                / letterboxed.scale / Double(sourceHeight)
+        }
+
+        var rectangles: [[NormalizedPoint]] = []
+        for y in 0..<height {
+            var runStart: Int?
+            for x in 0...width {
+                let filled = x < width && mask[y * width + x]
+                if filled, runStart == nil { runStart = x }
+                guard !filled, let start = runStart else { continue }
+                runStart = nil
+                let left = min(max(sourceX(Double(originX + start)), 0), 1)
+                let right = min(max(sourceX(Double(originX + x)), 0), 1)
+                let top = min(max(sourceY(Double(originY + y)), 0), 1)
+                let bottom = min(max(sourceY(Double(originY + y + 1)), 0), 1)
+                guard right > left, bottom > top else { continue }
+                rectangles.append([
+                    NormalizedPoint(x: left, y: top),
+                    NormalizedPoint(x: right, y: top),
+                    NormalizedPoint(x: right, y: bottom),
+                    NormalizedPoint(x: left, y: bottom)
+                ])
+            }
+        }
+        return rectangles
     }
 
     private func value(

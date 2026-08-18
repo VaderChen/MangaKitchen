@@ -49,8 +49,17 @@ public actor DialogueMaskGenerator: DialogueMaskGenerating {
                 guard rectangle.width > 0, rectangle.height > 0 else { continue }
                 clipRectangle = rectangle
             }
+            // 知道對話框實際形狀時就照形狀裁切。只用矩形，圓形框的四角會把
+            // 人物與網點一起放進遮罩。
+            let bubbleShape = region.bubbleMaskPolygons.compactMap {
+                pixelRectangle(for: $0, width: width, height: height)
+            }
             context.saveGState()
-            if let clipRectangle { context.clip(to: clipRectangle) }
+            if !bubbleShape.isEmpty {
+                context.clip(to: bubbleShape)
+            } else if let clipRectangle {
+                context.clip(to: clipRectangle)
+            }
             context.setFillColor(gray: 1, alpha: 1)
 
             if region.maskPolygons.isEmpty {
@@ -68,18 +77,18 @@ public actor DialogueMaskGenerator: DialogueMaskGenerating {
                 ))
                 context.fillPath()
             } else {
-                let requestedExpansionWidth = max(
-                    0,
-                    expansion * min(
-                        region.bounds.width * Double(width),
-                        region.bounds.height * Double(height)
-                    ) * 2
-                )
-                // 像素級精修後只需向字形外擴 1...3 px；即使舊專案仍保存較大的
-                // maskExpansion，也不會把精修遮罩再次膨脹成整塊矩形。
-                let expansionWidth = region.maskRefinementApplied && expansion > 0
-                    ? min(6, max(2, requestedExpansionWidth))
-                    : requestedExpansionWidth
+                // 精修遮罩的外擴餘裕已由 MangaTextMaskRefiner 在像素層膨脹完成。
+                // 多邊形是逐列拆出的 run rectangle，在這裡對每一條個別描邊，
+                // 斜筆畫那一堆 1px 高的矩形會各自鼓成圓角，邊界就長出扇貝狀毛邊。
+                let expansionWidth = region.maskRefinementApplied
+                    ? 0
+                    : max(
+                        0,
+                        expansion * min(
+                            region.bounds.width * Double(width),
+                            region.bounds.height * Double(height)
+                        ) * 2
+                    )
                 for polygon in region.maskPolygons {
                     guard let path = polygonPath(polygon, width: width, height: height) else { continue }
                     context.addPath(path)
@@ -110,6 +119,26 @@ public actor DialogueMaskGenerator: DialogueMaskGenerating {
             throw ImageProcessingError.cannotCreateBitmap
         }
         try CGImageIO.writePNG(image, to: outputURL)
+    }
+
+    /// 氣泡形狀是軸對齊矩形集合，直接轉成 CGRect 交給 CGContext 裁切。
+    private func pixelRectangle(
+        for polygon: [NormalizedPoint],
+        width: Int,
+        height: Int
+    ) -> CGRect? {
+        guard polygon.count >= 4 else { return nil }
+        let xValues = polygon.map(\.x)
+        let yValues = polygon.map(\.y)
+        guard let minimumX = xValues.min(), let maximumX = xValues.max(),
+              let minimumY = yValues.min(), let maximumY = yValues.max() else { return nil }
+        let rectangle = CGRect(
+            x: minimumX * Double(width),
+            y: (1 - maximumY) * Double(height),
+            width: (maximumX - minimumX) * Double(width),
+            height: (maximumY - minimumY) * Double(height)
+        ).integral
+        return rectangle.width > 0 && rectangle.height > 0 ? rectangle : nil
     }
 
     private func pixelRect(for bounds: NormalizedRect, width: Int, height: Int) -> CGRect {

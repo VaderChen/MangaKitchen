@@ -60,13 +60,15 @@
 - `MaskStroke.mode` 為 `add` 或 `erase`，筆劃依保存順序套用。
 - `rawSourceText` 保留 VLM、MCP Agent 或人工最初提供的原文；`sourceText` 是目前供詞表比對與翻譯使用的來源文字。
 - `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；新流程的 `true` 代表來源文字已由 VLM、MCP Agent 或人工確認，不會觸發任何 OCR 校正服務。
-- **GUI 路徑**：步驟二由內建 `MangaBubbleSegmentationCoreMLRuntime` 以 Apple Neural Engine 優先產生對話框 BBOX，再以原圖像素連通元件將 `bounds` 與遮罩收斂到實際字形；此時不載入或呼叫圖生文模型。模型無法載入或推論失敗時，才後備至 `MangaBubbleCandidateDetector` 的封閉白區演算法。步驟三才由 `VLMRegionTranscriptionService` 在既有 BBOX 中分類、轉錄，接著翻譯；未載入圖生文模型時不會回退至系統文字辨識。
+- **GUI 路徑**：步驟二由內建 `MangaBubbleSegmentationCoreMLRuntime` 以 Apple Neural Engine 優先產生對話框 BBOX 與氣泡形狀，再以原圖像素連通元件將 `bounds` 與遮罩收斂到實際字形；此時不載入或呼叫圖生文模型。模型無法載入或推論失敗時，才後備至 `MangaBubbleCandidateDetector` 的封閉白區演算法。步驟三才由 `VLMRegionTranscriptionService` 在既有 BBOX 中分類、轉錄，接著翻譯；未載入圖生文模型時不會回退至系統文字辨識。
 - **MCP 路徑**：譯文一律由外部 Agent 提供，後端永不呼叫內建圖生文模型翻譯；區域來源以 `region_source` 切換（`agent` 由 Agent 提供／`local` 用本機封閉區域偵測與 VLM）。後端共用像素遮罩收斂、背景修補與排版。詳見〈MCP 介面〉。
-- `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形多邊形，產生遮罩時只再向外擴張 1～3 px。
+- `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形像素遮罩；抗鋸齒遲滯與固定像素膨脹都在像素層完成，不再對逐條矩形做向量描邊，因此輸出的 `dialogue-mask.png` 維持二值邊界。
 - `maskCoverageRatio` 是像素精修保留的前景筆畫比例；`null` 代表精確多邊形由人工／Agent 直接提供，或尚未執行自動檢查。
 - `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線，但仍回報 false，因為它也可能是範圍太窄而被截掉的文字。此時應擴大安全範圍、重算遮罩，或由 Agent／人工補入精確多邊形與畫筆。
-- `bounds` 是涵蓋完整原文的粗搜尋範圍，不直接作為最終遮罩；`bubbleBounds` 必須涵蓋整個對話框內緣，像素搜尋及多邊形都不得越界。
-- `DialogueStyle.fontSize == null` 表示先依原文字形遮罩面積／字數估算接近原稿的起始字級，再於 `minimumFontSize...maximumFontSize` 內自動配適；指定數值代表優先字級，但譯文超出安全框時仍會向下縮小。排版以原文字形中心為錨點，縮字後仍無法容納時才逐步使用更多泡泡空間；同一泡泡內相鄰且重疊的排版區會按錨點中線分割成互不重疊的欄位，最後一律裁切於各自欄位與 `bubbleBounds` 安全內框。
+- `bounds` 是涵蓋完整原文的粗搜尋範圍，不直接作為最終遮罩；`bubbleBounds` 必須涵蓋整個對話框外接範圍，`bubbleMaskPolygons` 則是已知的實際氣泡形狀，像素搜尋、遮罩與裁切都不得越界。
+- `bubbleLayoutBounds` 是完全位於氣泡形狀內的最大軸對齊矩形，只供譯文安全排版；不能用它取代 `bubbleBounds`，否則貼近弧線的原文字形可能無法被遮罩。
+- 自動排版方向優先使用像素字形 BBOX 的實際排列偵測結果；只有字形不足或排列模稜兩可時，才回退既有的自動判定規則。明確指定 `writingDirection` 時仍以使用者設定為準。
+- `DialogueStyle.fontSize == null` 表示先依原文字形遮罩面積／字數估算接近原稿的起始字級，再於 `minimumFontSize...maximumFontSize` 內自動配適；指定數值代表優先字級，但譯文超出安全框時仍會向下縮小。排版以原文字形中心為錨點，縮字後仍無法容納時才逐步使用更多泡泡空間；同一泡泡內相鄰且重疊的排版區會按錨點中線分割成互不重疊的欄位，最後一律裁切於各自欄位與 `bubbleLayoutBounds`／`bubbleBounds` 安全內框。
 - 掃描結果以來源目錄下的 `relativeSourcePath` 自然排序。
 - `.str` 是原圖 sidecar，固定放在原圖旁並使用相同檔名主體；例如來源 `chapter01/003.jpg` 對應來源側的 `chapter01/003.str`。輸出目錄只按相同子目錄結構保存 `chapter01/003.png`。
 - 輸出目錄不得等於來源目錄，也不得位於來源目錄內，避免重新掃描輸出檔或覆寫原圖。

@@ -10,6 +10,8 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
         var translatedText: String
         var bounds: NormalizedRect
         var bubbleBounds: NormalizedRect?
+        var bubbleLayoutBounds: NormalizedRect?
+        var detectedWritingDirection: WritingDirection
         var translationAnchor: NormalizedPoint?
         var translationBounds: NormalizedRect?
         var style: DialogueStyle
@@ -40,6 +42,8 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
                     translatedText: $0.translatedText,
                     bounds: $0.bounds,
                     bubbleBounds: $0.bubbleBounds,
+                    bubbleLayoutBounds: $0.bubbleLayoutBounds,
+                    detectedWritingDirection: $0.detectedWritingDirection,
                     translationAnchor: $0.translationAnchor,
                     translationBounds: $0.translationBounds,
                     style: $0.style
@@ -163,7 +167,12 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
             }
 
             function translationLayoutBounds(region) {
-              return region.translationBounds ?? region.bubbleBounds ?? region.bounds;
+              // bubbleLayoutBounds 是完全在氣泡形狀內的最大矩形；bubbleBounds 是外接
+              // 矩形，圓形氣泡的四角在框外，拿它排版譯文會溢出到畫面上。
+              return region.translationBounds
+                ?? region.bubbleLayoutBounds
+                ?? region.bubbleBounds
+                ?? region.bounds;
             }
 
             function translationAnchor(region) {
@@ -174,6 +183,12 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
 
             function resolvedTranslationDirection(region) {
               if (region.style.writingDirection !== "automatic") return region.style.writingDirection;
+              // 字形排列是實際量出來的，優先於任何猜測。
+              if (region.detectedWritingDirection !== "automatic") {
+                return region.detectedWritingDirection;
+              }
+              // 量不出來時（字太少、擬聲字斜排）才退回長寬比。它描述的是框的形狀
+              // 而不是字的排列，只當最後手段。
               const hasCJK = /[\\u3000-\\u30ff\\u3400-\\u9fff\\uf900-\\ufaff]/u.test(
                 `${region.sourceText}${region.translatedText}`
               );

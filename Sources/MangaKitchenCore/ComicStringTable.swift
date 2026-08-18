@@ -51,6 +51,9 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
     public var order: Int
     public var bounds: NormalizedRect
     public var bubbleBounds: NormalizedRect?
+    public var bubbleMaskPolygons: [[NormalizedPoint]]?
+    public var bubbleLayoutBounds: NormalizedRect?
+    public var detectedWritingDirection: WritingDirection?
     public var rawSourceText: String?
     public var sourceText: String
     public var ocrTextRefined: Bool
@@ -71,6 +74,11 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         self.order = order
         bounds = region.bounds
         bubbleBounds = region.bubbleBounds
+        bubbleMaskPolygons = region.bubbleMaskPolygons.isEmpty ? nil : region.bubbleMaskPolygons
+        bubbleLayoutBounds = region.bubbleLayoutBounds
+        detectedWritingDirection = region.detectedWritingDirection == .automatic
+            ? nil
+            : region.detectedWritingDirection
         rawSourceText = region.rawSourceText
         sourceText = region.sourceText
         ocrTextRefined = region.ocrTextRefined
@@ -92,6 +100,9 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
             id: id,
             bounds: bounds,
             bubbleBounds: bubbleBounds,
+            bubbleMaskPolygons: bubbleMaskPolygons ?? [],
+            bubbleLayoutBounds: bubbleLayoutBounds,
+            detectedWritingDirection: detectedWritingDirection ?? .automatic,
             rawSourceText: rawSourceText,
             sourceText: sourceText,
             ocrTextRefined: ocrTextRefined,
@@ -114,6 +125,9 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         case order
         case bounds
         case bubbleBounds
+        case bubbleMaskPolygons
+        case bubbleLayoutBounds
+        case detectedWritingDirection
         case rawSourceText
         case sourceText
         case ocrTextRefined
@@ -136,6 +150,18 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         order = try values.decode(Int.self, forKey: .order)
         bounds = try values.decode(NormalizedRect.self, forKey: .bounds)
         bubbleBounds = try values.decodeIfPresent(NormalizedRect.self, forKey: .bubbleBounds)
+        bubbleMaskPolygons = try values.decodeIfPresent(
+            [[NormalizedPoint]].self,
+            forKey: .bubbleMaskPolygons
+        )
+        bubbleLayoutBounds = try values.decodeIfPresent(
+            NormalizedRect.self,
+            forKey: .bubbleLayoutBounds
+        )
+        detectedWritingDirection = try values.decodeIfPresent(
+            WritingDirection.self,
+            forKey: .detectedWritingDirection
+        )
         rawSourceText = try values.decodeIfPresent(String.self, forKey: .rawSourceText)
         sourceText = try values.decode(String.self, forKey: .sourceText)
         ocrTextRefined = try values.decodeIfPresent(Bool.self, forKey: .ocrTextRefined) ?? false

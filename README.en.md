@@ -35,13 +35,13 @@ GPLv3 itself permits commercial use and paid distribution, subject to its source
 - A project-specific multilingual glossary. One source term can map to multiple BCP-47 languages, with automatic selection for the current target language.
 - Four-stage workflow: scan, text/mask, translation/typesetting settings, and background restoration/composition, plus full-page and all-page orchestration.
 - One versioned `.str` JSON file per image, storing text, position, font, fixed/automatic size, and mask strokes.
-- Normalized vector brush strokes for adding, erasing, and undoing masks before generating a binary PNG. After stage two, a CPU/GPU mask-cleanup preview with the original text removed appears immediately without starting the image-to-image model.
-- A bundled manga109 bubble-segmentation Core ML model, preferring Apple Neural Engine execution, first produces dialogue BBOX candidates for black-and-white manga; the image-to-text model then classifies and transcribes each candidate. System OCR is no longer used for text recognition or positioning. Sound effects, page numbers, footer credits, people, and empty regions are deliberately excluded from the primary workflow.
-- Accepted VLM regions use the dialogue BBOX as their search boundary, then are refined into glyph polygons from original-image pixels and shrink to the actual glyph extents. Incomplete classification or transcription results are never saved as a complete page.
+- Pixel-layer dilation first absorbs anti-aliased edges, then normalized brush strokes add, erase, and undo masks before generating a binary PNG. The pipeline no longer vector-strokes each run rectangle, avoiding gray fringe artifacts. After stage two, a CPU/GPU mask-cleanup preview with the original text removed appears immediately without starting the image-to-image model.
+- A bundled manga109 bubble-segmentation Core ML model, preferring Apple Neural Engine execution, produces dialogue BBOX candidates and bubble shapes for black-and-white manga. The shape clips mask search and provides an inscribed layout rectangle for HTML typesetting; the image-to-text model then classifies and transcribes each candidate. System OCR is no longer used for text recognition or positioning. Sound effects, page numbers, footer credits, people, and empty regions are deliberately excluded from the primary workflow.
+- Accepted VLM regions use the dialogue BBOX as their search boundary, then are refined into pixel glyph masks from original-image pixels and shrink to the unexpanded glyph extents. Automatic layout direction prefers the measured glyph arrangement. Incomplete classification or transcription results are never saved as a complete page.
 - Page-context prompts and strict JSON response parsing for image-to-text translation models.
 - Direct loading of local Hugging Face MLX VLM directories through `mlx-swift-lm` on Apple Silicon/Metal.
 - Model-manifest loading for `.mlmodelc`, `.mlmodel`, and `.mlpackage`, with Core ML configured for Metal GPU execution.
-- Dialogue masks use one or more polygons to cover the original letters, clip to speech-area boundaries, and accept additive/eraser brush strokes; CPU or Metal GPU repair is available without an image model.
+- Dialogue masks use one or more pixel-level shapes to cover the original letters, clip to speech-area boundaries, and accept additive/eraser brush strokes; CPU or Metal GPU repair is available without an image model.
 - HTML/CSS is the single source of truth for translation layout, including horizontal/vertical writing, fixed or automatic font sizing, dragging, and resizing. WebKit renders that same text layer into the final PNG, so step-three layout is not replaced during output.
 - Source and output images are exposed to the Web UI through restricted custom URL schemes rather than arbitrary file access.
 - Project indexes and states persist as versioned JSON. The previous version is kept as `.bak` before each write and validated on restore.
@@ -56,7 +56,7 @@ MangaKitchen supports two operating modes. They change who performs inference an
 Both modes follow these four steps:
 
 1. **Project and pages**: choose a source directory, scan images recursively, and build a multi-selectable, batch-processable page list.
-2. **Text and masks**: locate dialogue BBOX candidates with the bundled Core ML segmentation model, classify and transcribe them with the local VLM, then refine them into glyph masks. An MCP Agent may instead provide regions and source text directly before mask editing.
+2. **Text and masks**: locate dialogue BBOX candidates and bubble shapes with the bundled Core ML segmentation model, then refine the original-image pixels into glyph masks. The local VLM classifies and transcribes candidates in step 3. An MCP Agent may instead provide regions and source text directly before mask editing.
 3. **Translation and typesetting**: write each region's source text, translated text, position, font, and size to the image's `.str` file.
 4. **Restoration and composition**: remove the original text, restore the background, typeset the translation, and save it to the project's output directory.
 
@@ -73,7 +73,7 @@ Before starting at any stage, each page must be validated against its actual art
 
 Set an image-to-text model and, optionally, an image-to-image model under Settings → Models. Region detection, translation, background restoration, and composition run locally on the Mac. Once model files have been downloaded, comic content does not need to be sent to an external AI service.
 
-- The `imageToText` model is required for local GUI step 2. It classifies title/dialogue BBOX candidates from the bundled Core ML segmentation model and transcribes their source text, then performs page-context translation in step 3. Without a loaded model, the app does not fall back to system OCR; load a model or let an MCP Agent provide regions and source text. Classification, transcription, and translation are batched and validated for every region, while sound effects remain outside the current workflow.
+- The `imageToText` model is required for local GUI step 3. Stage two can complete Core ML BBOX/shape detection and pixel masks without a loaded VLM; the model then classifies and transcribes existing candidates before page-context translation. Without a loaded model, the app does not fall back to system OCR; load a model or let an MCP Agent provide regions and source text. Classification, transcription, and translation are batched and validated for every region, while sound effects remain outside the current workflow.
 - The `imageToImage` model performs background restoration in step 4 and is optional. Without it, Settings → Advanced selects Metal GPU neighborhood repair or CPU dominant-color speech-area repair; GPU failures automatically fall back to CPU.
 - The GUI can run each step separately or use “Process Selected/All.” One-click processing still executes steps 2–4 in order and preserves their intermediate data.
 - Every result is written back to the project and `.str`, so users can correct any stage and rerun only the downstream steps.
@@ -90,7 +90,7 @@ For a new, unprocessed project without a local image-to-text model, an Agent can
 4. Translate each region and write `source_text`, translated text, and typesetting settings through `mangakitchen.region.update`.
 5. Call `mangakitchen.page.compose` to restore the background and generate output.
 
-If a local `imageToText` model is loaded, set `region_source` to `local` to use enclosure detection and VLM transcription in step 2. MCP translations are still always supplied by the Agent through `region.update`. Pure Agent mode uses `detect_masks → supplement_regions → region.update → compose`.
+If a local `imageToText` model is loaded, set `region_source` to `local` to use local Core ML BBOX/shape detection and pixel masks in step 2. MCP source text and translations are still always supplied by the Agent through `region.update`. Pure Agent mode uses `detect_masks → supplement_regions → region.update → compose`.
 
 For an existing project, the Agent should inspect workspace, page, and `.str` resources plus their actual artifacts, then call only the required tools. A `maskReady` page with a valid mask can begin with translation or `region.update`; a `translationReady` page with complete translated text can go directly to `compose`; and a completed page can update one region and recompose without rerunning region or mask detection. If validation finds missing data, the Agent walks backward using the rules above. In pure Agent mode, falling back to step 3 means the Agent supplies translations through `region.update`; it does not force a local model.
 
@@ -205,7 +205,7 @@ See [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md) for the four-
 ## Known Boundaries
 
 - The bundled `manga109-segmentation-bubble` Core ML model is derived from the Apache-2.0 source model. Image-to-text and image-to-image model weights are not bundled; their size, licensing, and distribution policy remain separate concerns.
-- Dialogue BBOX or Agent boxes are refined with luminance and connected components from original-image pixels. Dark/color artwork and non-dialogue text still require precise Agent polygons without changing `DialogueRegion` output.
+- Dialogue BBOX or Agent boxes are refined with luminance and connected components from original-image pixels; segmentation shapes clip the search area and the mask uses pixel-layer dilation. Dark/color artwork and non-dialogue text still require precise Agent polygons without changing `DialogueRegion` output.
 - Metal neighborhood restoration is a fallback. Complex screen tones or text crossing line art should use an inpainting model.
 - Qwen Image Edit INT4 still needs roughly 25 GB of inference memory and runs a full diffusion pass per page; low-memory Macs should disable image-to-image restoration.
 - Direct Swift Package execution does not yet include App Sandbox security-scoped bookmarks, signing, notarization, or production `.app` packaging.

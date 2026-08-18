@@ -175,6 +175,17 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     /// 對話框內緣；已知時自動遮罩與譯文都不得超出。
     /// nil 代表尚未偵測到對話框，此時遮罩只依 maskExpansion 由文字向外擴張。
     public var bubbleBounds: NormalizedRect?
+    /// 對話框的實際形狀，以軸對齊矩形集合表示，座標以左上角為原點。
+    /// 分割模型能給出形狀時才有值；空陣列代表只知道 `bubbleBounds` 這個矩形。
+    /// 圓形對話框的矩形框四角其實是畫面內容，用形狀裁切才不會把人物捲進遮罩。
+    public var bubbleMaskPolygons: [[NormalizedPoint]]
+    /// 完全落在對話框形狀內的最大矩形，譯文排版的預設安全範圍。
+    /// 與 `bubbleBounds` 分開：後者同時是遮罩搜尋邊界，縮小它會讓貼著弧線的字漏遮。
+    public var bubbleLayoutBounds: NormalizedRect?
+    /// 由字形排列量出來的書寫方向，`automatic` 代表量不出來。
+    /// 與 `style.writingDirection` 分開：那是使用者偏好，會被 `defaultStyle` 覆寫；
+    /// 這是對這張圖的觀測結果，只在使用者選 automatic 時用來決定實際排版方向。
+    public var detectedWritingDirection: WritingDirection
     /// VLM、Agent 或人工最初提供的文字，人工修改 sourceText 時不覆寫。
     public var rawSourceText: String?
     /// 供詞表比對與翻譯使用的來源文字。
@@ -201,6 +212,9 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         id: UUID = UUID(),
         bounds: NormalizedRect,
         bubbleBounds: NormalizedRect? = nil,
+        bubbleMaskPolygons: [[NormalizedPoint]] = [],
+        bubbleLayoutBounds: NormalizedRect? = nil,
+        detectedWritingDirection: WritingDirection = .automatic,
         rawSourceText: String? = nil,
         sourceText: String,
         ocrTextRefined: Bool = false,
@@ -219,6 +233,9 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         self.id = id
         self.bounds = bounds
         self.bubbleBounds = bubbleBounds?.clamped()
+        self.bubbleMaskPolygons = bubbleMaskPolygons
+        self.bubbleLayoutBounds = bubbleLayoutBounds?.clamped()
+        self.detectedWritingDirection = detectedWritingDirection
         self.rawSourceText = rawSourceText
         self.sourceText = sourceText
         self.ocrTextRefined = ocrTextRefined
@@ -241,6 +258,9 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         case id
         case bounds
         case bubbleBounds
+        case bubbleMaskPolygons
+        case bubbleLayoutBounds
+        case detectedWritingDirection
         case rawSourceText
         case sourceText
         case ocrTextRefined
@@ -262,6 +282,15 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         id = try values.decode(UUID.self, forKey: .id)
         bounds = try values.decode(NormalizedRect.self, forKey: .bounds)
         bubbleBounds = try values.decodeIfPresent(NormalizedRect.self, forKey: .bubbleBounds)?.clamped()
+        bubbleMaskPolygons = try values.decodeIfPresent(
+            [[NormalizedPoint]].self, forKey: .bubbleMaskPolygons
+        ) ?? []
+        bubbleLayoutBounds = try values.decodeIfPresent(
+            NormalizedRect.self, forKey: .bubbleLayoutBounds
+        )?.clamped()
+        detectedWritingDirection = try values.decodeIfPresent(
+            WritingDirection.self, forKey: .detectedWritingDirection
+        ) ?? .automatic
         rawSourceText = try values.decodeIfPresent(String.self, forKey: .rawSourceText)
         sourceText = try values.decode(String.self, forKey: .sourceText)
         ocrTextRefined = try values.decodeIfPresent(Bool.self, forKey: .ocrTextRefined) ?? false
