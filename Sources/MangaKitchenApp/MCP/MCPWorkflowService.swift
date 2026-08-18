@@ -122,6 +122,8 @@ actor MCPWorkflowService {
     typealias Progress = @Sendable (_ completed: Double, _ message: String) -> Void
 
     private let models: ModelRuntimeHub
+    /// 用來把 Agent 目測的粗框對齊到本機偵測；兩種 region_source 都會用到。
+    private let bubbleSegmenter: MangaBubbleSegmentationCoreMLRuntime?
     /// Agent 提供區域粗框與文字；遮罩由系統產生。
     private let agentPipeline: ComicTranslationPipeline
     /// 區域由本機 Core ML BBOX／氣泡形狀定位；文字與排版仍由 Agent 提供。
@@ -166,6 +168,7 @@ actor MCPWorkflowService {
         let artifactsRoot = root.appendingPathComponent("Artifacts", isDirectory: true)
         // 翻譯位置在兩條管線都是 AgentDrivenTranslator：MCP 永遠不會用
         // 內建圖生文模型翻譯，這一點不隨模式改變。
+        self.bubbleSegmenter = Self.bundledBubbleSegmenter()
         self.agentPipeline = ComicTranslationPipeline(
             regionDetector: AgentDrivenRegionDetector(),
             maskRefiner: MangaTextMaskRefiner(),
@@ -667,6 +670,11 @@ actor MCPWorkflowService {
             )
         }
 
+        accepted = MangaAgentRegionSnapper.snapped(
+            regions: accepted,
+            pageURL: pages[pageIndex].sourceURL,
+            using: bubbleSegmenter
+        )
         accepted = try await pipeline.refineMasks(page: pages[pageIndex], regions: accepted)
         let warnings = accepted.compactMap { region -> String? in
             guard !region.maskCoverageComplete else { return nil }
@@ -799,10 +807,17 @@ actor MCPWorkflowService {
             confidence: 1,
             style: options.defaultStyle
         )
-        pages[pageIndex].regions.append(region)
+        // Agent 目測的粗框比本機偵測鬆，不先對齊就精修會把速度線與網點一起圈進來，
+        // 撐大遮罩外框直到觸發合理性判斷，整個區域被靜靜停用。
+        let snapped = MangaAgentRegionSnapper.snapped(
+            regions: [region],
+            pageURL: pages[pageIndex].sourceURL,
+            using: bubbleSegmenter
+        )
+        pages[pageIndex].regions.append(snapped.first ?? region)
         let refined = try await pipeline.refineMasks(
             page: pages[pageIndex],
-            regions: [region]
+            regions: [pages[pageIndex].regions[pages[pageIndex].regions.count - 1]]
         )
         if let refinedRegion = refined.first {
             pages[pageIndex].regions[pages[pageIndex].regions.count - 1] = refinedRegion
