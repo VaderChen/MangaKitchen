@@ -746,7 +746,8 @@ final class AppStore: ObservableObject {
         pages[pageIndex].regions.append(region)
         markPageEdited(at: pageIndex)
         if automaticMaskEnabled {
-            scheduleMaskRegeneration(pageID: pageID)
+            // 新區域只有粗框，必須對齊並精修後才畫，否則會退回整框塗滿。
+            scheduleMaskRegeneration(pageID: pageID, refineRegionID: region.id)
         } else {
             persistEditedRegion(pageID: pageID)
         }
@@ -915,26 +916,24 @@ final class AppStore: ObservableObject {
             statusMessage = "找不到要更新的對話區域。"
             return
         }
-        let shouldRefineMask = maskPolygons == nil && (bounds != nil || bubbleBounds != nil)
-        if let sourceText {
-            let previous = pages[pageIndex].regions[regionIndex].sourceText
-            pages[pageIndex].regions[regionIndex].rawSourceText =
-                pages[pageIndex].regions[regionIndex].rawSourceText ?? previous
-            pages[pageIndex].regions[regionIndex].sourceText = sourceText
-            pages[pageIndex].regions[regionIndex].ocrTextRefined = true
-            if sourceText != previous, translatedText == nil {
-                pages[pageIndex].regions[regionIndex].translatedText = ""
-            }
-        }
-        if let translatedText { pages[pageIndex].regions[regionIndex].translatedText = translatedText }
-        if let translationAnchor {
-            pages[pageIndex].regions[regionIndex].translationAnchor = translationAnchor.clamped()
-        }
-        if let translationBounds {
-            pages[pageIndex].regions[regionIndex].translationBounds = translationBounds.clamped()
-        }
-        if let bounds { pages[pageIndex].regions[regionIndex].bounds = bounds.clamped() }
-        if let bubbleBounds { pages[pageIndex].regions[regionIndex].bubbleBounds = bubbleBounds.clamped() }
+        var edit = RegionEdit()
+        edit.sourceText = sourceText
+        edit.translatedText = translatedText
+        if let translationAnchor { edit.translationAnchor = .set(translationAnchor) }
+        if let translationBounds { edit.translationBounds = .set(translationBounds) }
+        edit.bounds = bounds
+        if let bubbleBounds { edit.bubbleBounds = .set(bubbleBounds) }
+        edit.fontName = fontName
+        if let fontSize, fontSize.isFinite { edit.fontSize = .set(fontSize) }
+        edit.useAutomaticFontSize = useAutomaticFontSize
+        edit.fontWeight = fontWeight
+        edit.writingDirection = writingDirection
+        edit.automaticMaskEnabled = automaticMaskEnabled
+        var shouldRefineMask = PageRegionEditor.apply(
+            edit,
+            to: &pages[pageIndex].regions[regionIndex]
+        )
+        // 手動多邊形是 App 專屬能力：使用者已經給了精確遮罩，就不要再自動精修蓋掉。
         if let maskPolygons {
             let sanitizedPolygons = maskPolygons
                 .map { $0.map { $0.clamped() } }
@@ -943,34 +942,10 @@ final class AppStore: ObservableObject {
             pages[pageIndex].regions[regionIndex].maskRefinementApplied = !sanitizedPolygons.isEmpty
             pages[pageIndex].regions[regionIndex].maskCoverageRatio = nil
             pages[pageIndex].regions[regionIndex].maskCoverageComplete = !sanitizedPolygons.isEmpty
-        } else if shouldRefineMask {
-            // bounds 是粗搜尋區，bubbleBounds 是不可越界的對話框內緣；
-            // 任一幾何範圍改變後，舊的像素遮罩已失效，必須重新精修。
-            pages[pageIndex].regions[regionIndex].maskPolygons = []
-            pages[pageIndex].regions[regionIndex].maskRefinementApplied = false
-            pages[pageIndex].regions[regionIndex].maskCoverageRatio = nil
-            pages[pageIndex].regions[regionIndex].maskCoverageComplete = false
-        }
-        if let fontName, !fontName.isEmpty {
-            pages[pageIndex].regions[regionIndex].style.fontName = fontName
-        }
-        if useAutomaticFontSize == true {
-            pages[pageIndex].regions[regionIndex].style.fontSize = nil
-        } else if let fontSize, fontSize.isFinite {
-            pages[pageIndex].regions[regionIndex].style.fontSize = min(max(fontSize, 4), 512)
-        }
-        if let fontWeight {
-            pages[pageIndex].regions[regionIndex].style.fontWeight = fontWeight
-        }
-        if let writingDirection {
-            pages[pageIndex].regions[regionIndex].style.writingDirection = writingDirection
-        }
-        if let automaticMaskEnabled {
-            pages[pageIndex].regions[regionIndex].automaticMaskEnabled = automaticMaskEnabled
+            shouldRefineMask = false
         }
         markPageEdited(at: pageIndex)
-        let shouldRegenerateMask = bounds != nil
-            || bubbleBounds != nil
+        let shouldRegenerateMask = shouldRefineMask
             || maskPolygons != nil
             || automaticMaskEnabled != nil
         if shouldRegenerateMask {
@@ -1498,6 +1473,13 @@ final class AppStore: ObservableObject {
         pages[pageIndex].errorMessage = nil
     }
 
+    /// 區域編輯的唯一實作，與 MCP 端共用。
+    private var regionEditor: PageRegionEditor? {
+        pipeline.map {
+            PageRegionEditor(pipeline: $0, bubbleSegmenter: Self.bundledBubbleSegmenter())
+        }
+    }
+
     private func scheduleMaskRegeneration(pageID: UUID, refineRegionID: UUID? = nil) {
         translationPreviewTasks[pageID]?.cancel()
         translationPreviewTasks[pageID] = nil
@@ -1510,23 +1492,19 @@ final class AppStore: ObservableObject {
                   let pipeline = self.pipeline,
                   let page = self.pages.first(where: { $0.id == pageID }) else { return }
             do {
-                var regions = page.regions
-                if let refineRegionID,
-                   let regionIndex = regions.firstIndex(where: { $0.id == refineRegionID }) {
-                    let refined = try await pipeline.refineMasks(
-                        page: page,
-                        regions: [regions[regionIndex]]
-                    )
-                    guard !Task.isCancelled else { return }
-                    if let region = refined.first {
-                        regions[regionIndex] = region
-                    }
-                }
-                let maskURL = try await pipeline.regenerateMask(
+                let outcome = try await PageRegionEditor(
+                    pipeline: pipeline,
+                    bubbleSegmenter: Self.bundledBubbleSegmenter()
+                ).materialize(
+                    regions: page.regions,
+                    refining: refineRegionID.map { [$0] } ?? [],
                     page: page,
-                    regions: regions,
-                    options: self.options
+                    options: self.options,
+                    regeneratesMask: true
                 )
+                guard !Task.isCancelled else { return }
+                let regions = outcome.regions
+                guard let maskURL = outcome.maskURL else { return }
                 guard !Task.isCancelled else { return }
                 let previewURL = try? await pipeline.renderMaskPreview(
                     page: page,

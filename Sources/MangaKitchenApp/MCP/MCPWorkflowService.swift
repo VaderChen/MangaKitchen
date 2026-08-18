@@ -124,6 +124,10 @@ actor MCPWorkflowService {
     private let models: ModelRuntimeHub
     /// 用來把 Agent 目測的粗框對齊到本機偵測；兩種 region_source 都會用到。
     private let bubbleSegmenter: MangaBubbleSegmentationCoreMLRuntime?
+    /// 區域編輯的唯一實作，與 App 端共用。
+    private var regionEditor: PageRegionEditor {
+        PageRegionEditor(pipeline: pipeline, bubbleSegmenter: bubbleSegmenter)
+    }
     /// Agent 提供區域粗框與文字；遮罩由系統產生。
     private let agentPipeline: ComicTranslationPipeline
     /// 區域由本機 Core ML BBOX／氣泡形狀定位；文字與排版仍由 Agent 提供。
@@ -670,12 +674,13 @@ actor MCPWorkflowService {
             )
         }
 
-        accepted = MangaAgentRegionSnapper.snapped(
+        accepted = try await regionEditor.materialize(
             regions: accepted,
-            pageURL: pages[pageIndex].sourceURL,
-            using: bubbleSegmenter
-        )
-        accepted = try await pipeline.refineMasks(page: pages[pageIndex], regions: accepted)
+            refining: accepted.map(\.id),
+            page: pages[pageIndex],
+            options: options,
+            regeneratesMask: false
+        ).regions
         let warnings = accepted.compactMap { region -> String? in
             guard !region.maskCoverageComplete else { return nil }
             let ratio = region.maskCoverageRatio.map { String(format: "%.1f%%", $0 * 100) }
@@ -723,61 +728,31 @@ actor MCPWorkflowService {
               let regionIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
             throw MCPServiceError.regionNotFound
         }
-        if let sourceText {
-            let previous = pages[pageIndex].regions[regionIndex].sourceText
-            pages[pageIndex].regions[regionIndex].rawSourceText =
-                pages[pageIndex].regions[regionIndex].rawSourceText ?? previous
-            pages[pageIndex].regions[regionIndex].sourceText = sourceText
-            pages[pageIndex].regions[regionIndex].ocrTextRefined = true
-            if sourceText != previous, translatedText == nil {
-                pages[pageIndex].regions[regionIndex].translatedText = ""
-            }
-        }
-        if let translatedText { pages[pageIndex].regions[regionIndex].translatedText = translatedText }
-        // 明確傳 null 代表把譯文落點還原成預設（對話框中心／原文位置）。
-        if translationAnchor.isChange {
-            pages[pageIndex].regions[regionIndex].translationAnchor = translationAnchor
-                .applied(to: pages[pageIndex].regions[regionIndex].translationAnchor)?
-                .clamped()
-        }
-        if let bounds { pages[pageIndex].regions[regionIndex].bounds = bounds.clamped() }
-        // 明確傳 null 代表「這個區域沒有對話框」，必須真的清掉；
-        // 遮罩與排版才會退回只依 maskExpansion 由文字外擴。
-        if bubbleBounds.isChange {
-            pages[pageIndex].regions[regionIndex].bubbleBounds = bubbleBounds
-                .applied(to: pages[pageIndex].regions[regionIndex].bubbleBounds)?
-                .clamped()
-        }
-        if let fontName, !fontName.isEmpty { pages[pageIndex].regions[regionIndex].style.fontName = fontName }
-        // automatic_font_size: true 與 font_size: null 等價，都是還原自動配適。
-        if useAutomaticFontSize == true {
-            pages[pageIndex].regions[regionIndex].style.fontSize = nil
-        } else if fontSize.isChange {
-            pages[pageIndex].regions[regionIndex].style.fontSize = fontSize
-                .applied(to: pages[pageIndex].regions[regionIndex].style.fontSize)
-                .map { min(max($0, 4), 512) }
-        }
-        if let fontWeight {
-            pages[pageIndex].regions[regionIndex].style.fontWeight = fontWeight
-        }
-        if let writingDirection {
-            pages[pageIndex].regions[regionIndex].style.writingDirection = writingDirection
-        }
-        let shouldRegenerateMask = sourceText != nil
-            || bounds != nil
-            || bubbleBounds.isChange
-        if sourceText != nil || bounds != nil || bubbleBounds.isChange {
-            pages[pageIndex].regions[regionIndex].maskPolygons = []
-            pages[pageIndex].regions[regionIndex].maskRefinementApplied = false
-            pages[pageIndex].regions[regionIndex].maskCoverageRatio = nil
-            pages[pageIndex].regions[regionIndex].maskCoverageComplete = false
-            let refined = try await pipeline.refineMasks(
+        var edit = RegionEdit()
+        edit.sourceText = sourceText
+        edit.translatedText = translatedText
+        edit.translationAnchor = translationAnchor
+        edit.bounds = bounds
+        edit.bubbleBounds = bubbleBounds
+        edit.fontName = fontName
+        edit.fontSize = fontSize
+        edit.useAutomaticFontSize = useAutomaticFontSize
+        edit.fontWeight = fontWeight
+        edit.writingDirection = writingDirection
+        let geometryChanged = PageRegionEditor.apply(
+            edit,
+            to: &pages[pageIndex].regions[regionIndex]
+        )
+        let shouldRegenerateMask = geometryChanged
+        if geometryChanged {
+            let outcome = try await regionEditor.materialize(
+                regions: pages[pageIndex].regions,
+                refining: [regionID],
                 page: pages[pageIndex],
-                regions: [pages[pageIndex].regions[regionIndex]]
+                options: options,
+                regeneratesMask: false
             )
-            if let region = refined.first {
-                pages[pageIndex].regions[regionIndex] = region
-            }
+            pages[pageIndex].regions = outcome.regions
         }
         pages[pageIndex].outputURL = nil
         if shouldRegenerateMask {
@@ -807,21 +782,13 @@ actor MCPWorkflowService {
             confidence: 1,
             style: options.defaultStyle
         )
-        // Agent 目測的粗框比本機偵測鬆，不先對齊就精修會把速度線與網點一起圈進來，
-        // 撐大遮罩外框直到觸發合理性判斷，整個區域被靜靜停用。
-        let snapped = MangaAgentRegionSnapper.snapped(
-            regions: [region],
-            pageURL: pages[pageIndex].sourceURL,
-            using: bubbleSegmenter
-        )
-        pages[pageIndex].regions.append(snapped.first ?? region)
-        let refined = try await pipeline.refineMasks(
+        let outcome = try await regionEditor.created(
+            region,
+            appendingTo: pages[pageIndex].regions,
             page: pages[pageIndex],
-            regions: [pages[pageIndex].regions[pages[pageIndex].regions.count - 1]]
+            options: options
         )
-        if let refinedRegion = refined.first {
-            pages[pageIndex].regions[pages[pageIndex].regions.count - 1] = refinedRegion
-        }
+        pages[pageIndex].regions = outcome.regions
         try await refreshEditedPage(pageIndex: pageIndex)
         return pages[pageIndex].regions[pages[pageIndex].regions.count - 1]
     }
@@ -930,17 +897,16 @@ actor MCPWorkflowService {
         progress(.detectingText, 0)
         // 絕不覆寫 Agent 已提供的區域：這一步只重算遮罩，不做辨識。
         let regionsForRefinement = Self.resetMaskGeometry(pages[pageIndex].regions)
-        let refined = try await pipeline.refineMasks(
+        let outcome = try await regionEditor.materialize(
+            regions: regionsForRefinement,
+            refining: regionsForRefinement.map(\.id),
             page: pages[pageIndex],
-            regions: regionsForRefinement
+            options: options,
+            regeneratesMask: true
         )
         progress(.detectingText, 0.6)
-        let maskURL = try await pipeline.regenerateMask(
-            page: pages[pageIndex],
-            regions: refined,
-            options: options
-        )
-        pages[pageIndex].regions = refined
+        guard let maskURL = outcome.maskURL else { return }
+        pages[pageIndex].regions = outcome.regions
         pages[pageIndex].maskURL = maskURL
         pages[pageIndex].backgroundURL = nil
         pages[pageIndex].outputURL = nil
