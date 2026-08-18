@@ -10,12 +10,12 @@ import MangaKitchenCore
 ///
 /// 這一層改以墨色連通元件為主訊號：不論有沒有外框，字都在。封閉白區降級為
 /// 加分項，只在存在時提供 `bubbleBounds`。
-struct MangaTextClusterDetector {
-    struct TextCluster {
-        var bounds: NormalizedRect
-        var glyphCount: Int
+public struct MangaTextClusterDetector {
+    public struct TextCluster {
+        public var bounds: NormalizedRect
+        public var glyphCount: Int
         /// 群集內字形的中位尺寸（像素），供聚類距離與後續診斷使用。
-        var medianGlyphSize: Int
+        public var medianGlyphSize: Int
     }
 
     private struct PixelBounds {
@@ -69,7 +69,7 @@ struct MangaTextClusterDetector {
     private let minimumGlyphsPerCluster: Int
     private let maximumClusters: Int
 
-    init(
+    public init(
         minimumGlyphRatio: Double = 0.006,
         maximumGlyphRatio: Double = 0.055,
         minimumGlyphFill: Double = 0.12,
@@ -87,7 +87,7 @@ struct MangaTextClusterDetector {
         self.maximumClusters = max(1, maximumClusters)
     }
 
-    func detect(in image: CGImage) throws -> [TextCluster] {
+    public func detect(in image: CGImage) throws -> [TextCluster] {
         let raster = try TextGrayscaleRaster(image: image)
         let width = raster.width
         let height = raster.height
@@ -228,26 +228,23 @@ struct MangaTextClusterDetector {
             }
         }
 
-        var grouped: [Int: (bounds: PixelBounds, sizes: [Int])] = [:]
+        var grouped: [Int: [Glyph]] = [:]
         for index in glyphs.indices {
-            let key = root(index)
-            let glyph = glyphs[index]
-            if var existing = grouped[key] {
-                existing.bounds.formUnion(glyph.bounds)
-                existing.sizes.append(glyph.size)
-                grouped[key] = existing
-            } else {
-                grouped[key] = (glyph.bounds, [glyph.size])
-            }
+            grouped[root(index), default: []].append(glyphs[index])
         }
 
         var clusters = grouped.values.compactMap { entry -> TextCluster? in
-            guard entry.sizes.count >= minimumGlyphsPerCluster else { return nil }
-            let sorted = entry.sizes.sorted()
-            let median = sorted[sorted.count / 2]
+            guard entry.count >= minimumGlyphsPerCluster else { return nil }
+            let sizes = entry.map(\.size).sorted()
+            let median = sizes[sizes.count / 2]
+
+            var union = entry[0].bounds
+            for glyph in entry.dropFirst() { union.formUnion(glyph.bounds) }
+
+
             // 往外留一點邊，讓後續像素精修有搜尋餘裕。
             let padding = max(2, median / 3)
-            let bounds = entry.bounds.expanded(by: padding)
+            let bounds = union.expanded(by: padding)
             let minX = Double(max(0, bounds.minX)) / Double(width)
             let minY = Double(max(0, bounds.minY)) / Double(height)
             let maxX = Double(min(width, bounds.maxX)) / Double(width)
@@ -257,7 +254,7 @@ struct MangaTextClusterDetector {
                 bounds: NormalizedRect(
                     x: minX, y: minY, width: maxX - minX, height: maxY - minY
                 ).clamped(),
-                glyphCount: entry.sizes.count,
+                glyphCount: entry.count,
                 medianGlyphSize: median
             )
         }

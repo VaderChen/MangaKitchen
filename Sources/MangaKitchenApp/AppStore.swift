@@ -66,8 +66,10 @@ final class AppStore: ObservableObject {
                 metal: metal,
                 compositingBackend: imageCompositingBackend
             )
+            let bubbleSegmenter = Self.bundledBubbleSegmenter()
             let pipeline = ComicTranslationPipeline(
-                regionDetector: VLMSupplementalRegionDetector(model: models),
+                regionDetector: MangaBubbleMaskRegionDetector(bubbleSegmenter: bubbleSegmenter),
+                textRecognizer: VLMRegionTranscriptionService(model: models),
                 maskRefiner: MangaTextMaskRefiner(),
                 translator: VLMRegionTranslationService(model: models),
                 maskGenerator: DialogueMaskGenerator(),
@@ -115,6 +117,17 @@ final class AppStore: ObservableObject {
     }
 
     var applicationDataDirectoryPath: String? { applicationRoot?.path }
+
+    private static func bundledBubbleSegmenter() -> MangaBubbleSegmentationCoreMLRuntime? {
+        guard let modelURL = Bundle.module.url(
+            forResource: "MangaBubbleSegmentation",
+            withExtension: "mlpackage",
+            subdirectory: "Models"
+        ) else {
+            return nil
+        }
+        return try? MangaBubbleSegmentationCoreMLRuntime(modelURL: modelURL)
+    }
 
     func setImageCompositingBackend(_ backend: ImageCompositingBackend) {
         guard let backgroundRestorer else { return }
@@ -1162,7 +1175,13 @@ final class AppStore: ObservableObject {
 
     private func hasTranslationData(pageID: UUID) -> Bool {
         guard let page = pages.first(where: { $0.id == pageID }),
-              !page.regions.isEmpty else { return false }
+              hasTranslatedRegions(page),
+              let previewURL = page.translationPreviewURL else { return false }
+        return FileManager.default.fileExists(atPath: previewURL.path)
+    }
+
+    private func hasTranslatedRegions(_ page: ComicPage) -> Bool {
+        guard !page.regions.isEmpty else { return false }
         return page.regions.allSatisfy {
             !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && !$0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1180,10 +1199,6 @@ final class AppStore: ObservableObject {
         guard let pipeline,
               let page = pages.first(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
-        }
-        guard await models?.isLoaded(.imageToText) == true else {
-            try await prepareEmptyMask(pageID: pageID, page: page, pipeline: pipeline)
-            return
         }
         let result = try await pipeline.detectMasks(
             page: page,
@@ -1283,14 +1298,22 @@ final class AppStore: ObservableObject {
             throw AppWorkflowError.pageNotFound
         }
         guard !page.regions.isEmpty else { throw AppWorkflowError.maskRequired }
-        let regions = try await pipeline.translate(
-            page: page,
-            regions: page.regions,
-            options: options,
-            glossary: glossary,
-            activity: activityHandler(pageID: pageID),
-            progress: progressHandler(pageID: pageID)
-        )
+        let regions: [DialogueRegion]
+        if hasTranslatedRegions(page) {
+            regions = page.regions
+        } else {
+            guard await models?.isLoaded(.imageToText) == true else {
+                throw ModelRuntimeError.capabilityNotLoaded(.imageToText)
+            }
+            regions = try await pipeline.translate(
+                page: page,
+                regions: page.regions,
+                options: options,
+                glossary: glossary,
+                activity: activityHandler(pageID: pageID),
+                progress: progressHandler(pageID: pageID)
+            )
+        }
         try Task.checkCancellation()
         guard let translatedIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
         pages[translatedIndex].regions = regions
@@ -1304,6 +1327,7 @@ final class AppStore: ObservableObject {
             page: page,
             regions: regions,
             options: options,
+            existingMaskURL: page.maskURL,
             activity: activityHandler(pageID: pageID),
             progress: translationLayoutProgressHandler(pageID: pageID)
         )
@@ -1326,8 +1350,14 @@ final class AppStore: ObservableObject {
     }
 
     private func runComposition(pageID: UUID) async throws {
+        guard let pipeline else {
+            throw AppWorkflowError.runtimeUnavailable
+        }
         guard let outputDirectoryURL else {
             throw AppWorkflowError.outputDirectoryRequired
+        }
+        if let maskTask = maskRegenerationTasks[pageID] {
+            await maskTask.value
         }
         if let previewTask = translationPreviewTasks[pageID] {
             await previewTask.value
@@ -1354,8 +1384,18 @@ final class AppStore: ObservableObject {
         guard paths.outputURL.standardizedFileURL != page.sourceURL.standardizedFileURL else {
             throw AppWorkflowError.outputWouldOverwriteSource
         }
-        guard let previewURL = page.translationPreviewURL,
-              FileManager.default.fileExists(atPath: previewURL.path) else {
+        let backgroundURL: URL
+        if let currentBackgroundURL = page.backgroundURL,
+           FileManager.default.fileExists(atPath: currentBackgroundURL.path) {
+            backgroundURL = currentBackgroundURL
+        } else if let maskURL = page.maskURL,
+                  FileManager.default.fileExists(atPath: maskURL.path) {
+            backgroundURL = try await pipeline.renderMaskPreview(
+                page: page,
+                regions: page.regions,
+                maskURL: maskURL
+            )
+        } else {
             throw AppWorkflowError.translationPreviewRequired
         }
         try FileManager.default.createDirectory(
@@ -1365,9 +1405,13 @@ final class AppStore: ObservableObject {
         if FileManager.default.fileExists(atPath: paths.outputURL.path) {
             try FileManager.default.removeItem(at: paths.outputURL)
         }
-        try FileManager.default.copyItem(at: previewURL, to: paths.outputURL)
+        try await pipeline.rerender(
+            backgroundURL: backgroundURL,
+            regions: page.regions,
+            outputURL: paths.outputURL
+        )
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
-        pages[index].translationPreviewURL = previewURL
+        pages[index].backgroundURL = backgroundURL
         pages[index].outputURL = paths.outputURL
         pages[index].stage = .completed
         pages[index].progress = 1

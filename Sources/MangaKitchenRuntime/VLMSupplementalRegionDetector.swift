@@ -9,7 +9,7 @@ import MangaKitchenCore
 /// 白區在原理上就看不見它們，文字會在進入 VLM 之前就消失。改以文字定位後，
 /// 有沒有外框只影響 bubbleBounds 精不精確，不再決定能否被偵測到。
 ///
-/// VLM 的 visual grounding 只限定後續像素精修的搜尋區；真正遮罩仍由圖像連通元件產生。
+/// 氣泡模型的 BBOX 限定後續像素精修的搜尋區；真正遮罩仍由圖像連通元件產生。
 public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
     private struct IndexedCandidate {
         var index: Int
@@ -17,9 +17,7 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         var bounds: NormalizedRect
         /// 包住這個文字塊的封閉白區；沒有就是無框台詞，維持 nil。
         var bubbleBounds: NormalizedRect?
-        /// 封閉白區只是氣泡候選，必須有 VLM 文字框才能進入像素精修。
-        var requiresGrounding: Bool
-        /// VLM 漏回座標時，以本機字形群集當安全後備，不得退回整個氣泡。
+        /// 沒有氣泡 BBOX 的補充候選以本機字形群集作為後備。
         var fallbackTextBounds: NormalizedRect?
     }
 
@@ -28,17 +26,12 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         var text: String
         var kind: String
         var direction: String?
-        var textBoxes: [[Double]]?
 
         private enum CodingKeys: String, CodingKey {
             case index
             case text
             case kind
             case direction
-            case textBoxes = "text_boxes"
-            case textBBoxes = "text_bboxes"
-            case textBBox = "text_bbox"
-            case bbox2D = "bbox_2d"
         }
 
         init(from decoder: any Decoder) throws {
@@ -47,20 +40,6 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
             text = try values.decode(String.self, forKey: .text)
             kind = try values.decode(String.self, forKey: .kind)
             direction = try values.decodeIfPresent(String.self, forKey: .direction)
-
-            func boxes(for key: CodingKeys) -> [[Double]]? {
-                if let boxes = try? values.decode([VLMGroundingBox].self, forKey: key) {
-                    return boxes.map(\.coordinates)
-                }
-                if let box = try? values.decode(VLMGroundingBox.self, forKey: key) {
-                    return [box.coordinates]
-                }
-                return nil
-            }
-            textBoxes = boxes(for: .textBoxes)
-                ?? boxes(for: .textBBoxes)
-                ?? boxes(for: .textBBox)
-                ?? boxes(for: .bbox2D)
         }
     }
 
@@ -68,11 +47,6 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         var text: String
         var kind: String
         var direction: String?
-        var textBounds: NormalizedRect?
-    }
-
-    private struct CandidateCrop {
-        var sourceRect: CGRect
     }
 
     /// 文字塊要幾乎整個落在封閉白區內，才算那個對話框的內容。
@@ -165,11 +139,16 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
     private static let maximumAreaPerTranscriptCharacter = 0.008
     private let model: any ImageToTextGenerating
     private let textClusterDetector = MangaTextClusterDetector()
-    private let candidateDetector: MangaBubbleCandidateDetector
+    private let bubbleSegmenter: MangaBubbleSegmentationCoreMLRuntime?
+    private let fallbackCandidateDetector: MangaBubbleCandidateDetector
 
-    public init(model: any ImageToTextGenerating) {
+    public init(
+        model: any ImageToTextGenerating,
+        bubbleSegmenter: MangaBubbleSegmentationCoreMLRuntime? = nil
+    ) {
         self.model = model
-        candidateDetector = MangaBubbleCandidateDetector()
+        self.bubbleSegmenter = bubbleSegmenter
+        fallbackCandidateDetector = MangaBubbleCandidateDetector()
     }
 
     public func detectRegions(
@@ -180,43 +159,45 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
     ) async throws -> [DialogueRegion] {
         try Task.checkCancellation()
         let source = try CGImageIO.load(from: pageURL)
-        // NOTE: 文字優先（MangaTextClusterDetector）還在調校中，尚未接上主流程。
-        // 目前仍以封閉白區為主訊號 —— 已知在白底頁面會漏掉開口氣泡與無框台詞。
-        // 封閉白區在兩種模式下都會算，但用途不同：
-        // 快速模式當候選來源，精細掃描只拿它當 bubbleBounds 的供應者。
-        let enclosures = try candidateDetector.detect(in: source)
+        let enclosures: [NormalizedRect]
+        if let bubbleSegmenter {
+            do {
+                enclosures = try bubbleSegmenter.detect(in: source)
+            } catch {
+                enclosures = try fallbackCandidateDetector.detect(in: source)
+            }
+        } else {
+            enclosures = try fallbackCandidateDetector.detect(in: source)
+        }
         let pageTextClusters = fineScanEnabled
             ? []
             : ((try? textClusterDetector.detect(in: source)) ?? [])
         var candidates: [IndexedCandidate] = []
 
         if fineScanEnabled {
-            // 精細掃描：先切 3×3 格，在每格內找字形群集定位，再把貼緊文字的裁切
-            // 交給 VLM 辨識與二次粗定位。即使 grounding 失敗，仍可用幾何群集當後備。
+            // 精細掃描：整頁切 3×3，每格當成一張 grounding 卡片送給 VLM。
             //
-            // 為什麼要分格：整頁跑群集會被線稿淹沒（實測 39 組）；格子尺度小，
-            // 字形大小分布集中，聚類穩定得多。誤判的線稿群集仍會成為卡片，
-            // 但那正是 VLM 分類擅長的事 —— 實測它把人臉、鞭子全判成 ignore。
-            var located: [NormalizedRect] = []
+            // 為什麼是格子而不是幾何候選：開放式台詞沒有封閉框、也不見得能靠
+            // 字形群集穩定抓到（實測結構化條件在真實頁面上分不開文字與線稿），
+            // 但規則網格覆蓋整頁、沒有死角。位置由「哪一格」提供，模型只需在
+            // 一張 1/9 大小的圖裡指位置 —— 實測單格 grounding 可用（「ふふ…」
+            // 這顆每個幾何方法都抓不到的，單格一次就讀出來且位置正確），而
+            // 整頁 grounding 不可用（不同台詞會拿到同一組座標）。
+            //
+            // 模型漏回座標時，退回該格內字形最多的群集當安全後備，
+            // 絕不退回整格 —— 整格會讓像素精修把線稿一起收進遮罩。
             for tile in Self.gridTiles(columns: 3, rows: 3) {
-                for cluster in Self.textClusters(
+                let fallback = Self.textClusters(
                     within: tile, of: source, using: textClusterDetector
-                ) {
-                    // 跨格重疊的同一段文字只保留一次。
-                    guard !located.contains(where: {
-                        Self.containmentRatio(of: cluster, in: $0) >= 0.5
-                            || Self.containmentRatio(of: $0, in: cluster) >= 0.5
-                    }) else { continue }
-                    located.append(cluster)
+                ).max { lhs, rhs in
+                    lhs.width * lhs.height < rhs.width * rhs.height
                 }
-            }
-            for bounds in located.prefix(Self.maximumFineScanCards) {
                 candidates.append(IndexedCandidate(
                     index: candidates.count + 1,
-                    bounds: bounds,
-                    bubbleBounds: Self.enclosure(containing: bounds, in: enclosures),
-                    requiresGrounding: false,
-                    fallbackTextBounds: bounds
+                    bounds: tile,
+                    // 網格不代表對話框邊界；這個後備模式僅依本機文字群集限縮範圍。
+                    bubbleBounds: nil,
+                    fallbackTextBounds: fallback
                 ))
             }
         } else {
@@ -232,7 +213,6 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
                     index: candidates.count + 1,
                     bounds: enclosure,
                     bubbleBounds: enclosure,
-                    requiresGrounding: true,
                     fallbackTextBounds: fallbackTextBounds
                 ))
             }
@@ -249,7 +229,6 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
                     index: candidates.count + 1,
                     bounds: cluster.bounds,
                     bubbleBounds: Self.enclosure(containing: cluster.bounds, in: enclosures),
-                    requiresGrounding: false,
                     fallbackTextBounds: cluster.bounds
                 ))
             }
@@ -287,14 +266,13 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
                     index: $0.offset + 1,
                     bounds: $0.element.bounds,
                     bubbleBounds: $0.element.bubbleBounds,
-                    requiresGrounding: $0.element.requiresGrounding,
                     fallbackTextBounds: $0.element.fallbackTextBounds
                 )
             }
             guard let requestCandidate = requestCandidates.first else { continue }
             let cropURL = temporaryDirectoryURL
                 .appendingPathComponent(String(format: "crop-%03d.png", batchIndex + 1))
-            let candidateCrop = try Self.writeCandidateCrop(
+            try Self.writeCandidateCrop(
                 source: source,
                 candidate: requestCandidate,
                 to: cropURL
@@ -312,7 +290,7 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
                         expectedIndices: requestCandidates.map(\.index),
                         attempt: attempt
                     ),
-                    maximumOutputTokens: 2_048,
+                    maximumOutputTokens: 512,
                     progress: { value in
                         let local = VLMStructuredResponseDecoder.mappedProgress(
                             attempt: attempt,
@@ -354,25 +332,10 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
                 let localIndex = item.index - 1
                 guard batch.indices.contains(localIndex) else { continue }
                 let candidate = batch[localIndex]
-                let clippingBounds = candidate.bubbleBounds
-                    ?? candidate.bounds.expanded(by: 0.5)
-                let groundedBounds = VLMTextGrounding.pageBounds(
-                    modelBoxes: item.textBoxes ?? [],
-                    cropRect: candidateCrop.sourceRect,
-                    imageWidth: source.width,
-                    imageHeight: source.height,
-                    clippingBounds: clippingBounds
-                )
-                // 本機字形群集是像素精修的可信種子；VLM 座標只在本機沒有找到
-                // 文字時補位。反過來會讓偶爾漂到分鏡底線的粗框蓋過正確定位。
-                let textBounds = candidate.fallbackTextBounds
-                    ?? groundedBounds
-                    ?? (candidate.requiresGrounding ? nil : candidate.bounds)
                 classifiedByIndex[candidate.index] = ResolvedClassifiedItem(
                     text: item.text,
                     kind: item.kind,
-                    direction: item.direction,
-                    textBounds: textBounds
+                    direction: item.direction
                 )
             }
             progress(Double(batchIndex + 1) / Double(batchCount))
@@ -383,10 +346,14 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
             let kind = item.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard Self.isModelAcceptedKind(kind) else { return nil }
             let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let bounds = item.textBounds,
-                  !text.isEmpty,
+            let bounds = candidate.bubbleBounds
+                ?? candidate.fallbackTextBounds
+                ?? candidate.bounds
+            guard !text.isEmpty,
                   !Self.isSoundEffectTranscript(text),
-                  Self.isPlausibleTranscript(text, in: bounds) else { return nil }
+                  candidate.bubbleBounds != nil || Self.isPlausibleTranscript(text, in: bounds) else {
+                return nil
+            }
             var style = DialogueStyle()
             style.writingDirection = item.direction
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -543,15 +510,12 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
           the source language's reading order.
         - direction must describe the source text in the card: vertical for top-to-bottom columns,
           horizontal for left-to-right or right-to-left rows.
-        - For every accepted item, bbox_2d must be one tight rectangle enclosing all transcribed
-          glyphs. Coordinates are [x1,y1,x2,y2], relative to the entire supplied crop, from 0 to 1000.
-        - Exclude balloon outlines, panel borders, faces, hair, clothing, illustrations, speed
-          lines, and sound effects from bbox_2d.
-        - For ignore, return an empty text string and an empty bbox_2d array.
+        - Do not return coordinates, bounding boxes, masks, explanations, or Markdown.
+        - For ignore, return an empty text string.
         - Never translate, explain, omit, duplicate, or renumber a REGION.
 
         Return only a syntactically valid JSON array in this exact shape:
-        [{"index":1,"text":"source text","kind":"dialogue","direction":"vertical","bbox_2d":[480,110,760,720]}]
+        [{"index":1,"text":"source text","kind":"dialogue","direction":"vertical"}]
         \(VLMStructuredResponseDecoder.retryInstruction(attempt: attempt))
         """
     }
@@ -560,7 +524,7 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         source: CGImage,
         candidate: IndexedCandidate,
         to outputURL: URL
-    ) throws -> CandidateCrop {
+    ) throws {
         let visibleBounds = candidate.bubbleBounds
             .map { $0.union(with: candidate.bounds) }
             ?? candidate.bounds
@@ -573,7 +537,6 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
             throw ImageProcessingError.cannotCreateBitmap
         }
         try CGImageIO.writePNG(crop, to: outputURL)
-        return CandidateCrop(sourceRect: sourceRect)
     }
 
     private static func expandedPixelRect(

@@ -55,6 +55,7 @@ let package = Package(
                 "Resources/AppIcon"
             ],
             resources: [
+                .copy("Resources/Models"),
                 .copy("Resources/WebUI")
             ]
         ),

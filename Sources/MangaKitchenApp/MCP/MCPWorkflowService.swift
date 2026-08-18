@@ -178,7 +178,9 @@ actor MCPWorkflowService {
             outputRoot: artifactsRoot
         )
         self.localDetectionPipeline = ComicTranslationPipeline(
-            regionDetector: VLMSupplementalRegionDetector(model: models),
+            regionDetector: MangaBubbleMaskRegionDetector(
+                bubbleSegmenter: Self.bundledBubbleSegmenter()
+            ),
             maskRefiner: MangaTextMaskRefiner(),
             translator: AgentDrivenTranslator(),
             maskGenerator: DialogueMaskGenerator(),
@@ -190,6 +192,17 @@ actor MCPWorkflowService {
             typesetter: HTMLDialogueTypesetter(),
             outputRoot: root.appendingPathComponent("Artifacts", isDirectory: true)
         )
+    }
+
+    private static func bundledBubbleSegmenter() -> MangaBubbleSegmentationCoreMLRuntime? {
+        guard let modelURL = Bundle.module.url(
+            forResource: "MangaBubbleSegmentation",
+            withExtension: "mlpackage",
+            subdirectory: "Models"
+        ) else {
+            return nil
+        }
+        return try? MangaBubbleSegmentationCoreMLRuntime(modelURL: modelURL)
     }
 
     func openWorkspace(
@@ -976,15 +989,12 @@ actor MCPWorkflowService {
         progress(.maskReady, 1)
     }
 
-    /// 本機區域模式：封閉區域演算法定位，再由圖生文模型做語意分類與轉錄。
+    /// 本機區域模式：只以氣泡 BBOX 與像素精修建立遮罩。
     /// 這一步會**重新產生區域並覆寫**該頁既有結果（含已寫入的譯文）。
     private func detectByLocalPipeline(
         pageIndex: Int,
         progress: @escaping PagePipelineProgress
     ) async throws {
-        guard await models.isLoaded(.imageToText) else {
-            throw ModelRuntimeError.capabilityNotLoaded(.imageToText)
-        }
         let result = try await pipeline.detectMasks(
             page: pages[pageIndex],
             options: options,
@@ -1036,6 +1046,7 @@ actor MCPWorkflowService {
             regions: pages[index].regions,
             options: options,
             outputURL: paths.outputURL,
+            existingMaskURL: pages[index].maskURL,
             progress: progress
         )
         pages[index].regions = result.regions

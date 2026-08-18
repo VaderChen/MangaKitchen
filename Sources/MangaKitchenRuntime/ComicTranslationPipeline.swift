@@ -3,6 +3,7 @@ import MangaKitchenCore
 
 public actor ComicTranslationPipeline {
     private let regionDetector: any SemanticRegionDetecting
+    private let textRecognizer: (any RegionTextRecognizing)?
     private let maskRefiner: any DialogueMaskRefining
     private let translator: any RegionTranslating
     private let maskGenerator: any DialogueMaskGenerating
@@ -12,6 +13,7 @@ public actor ComicTranslationPipeline {
 
     public init(
         regionDetector: any SemanticRegionDetecting,
+        textRecognizer: (any RegionTextRecognizing)? = nil,
         maskRefiner: any DialogueMaskRefining,
         translator: any RegionTranslating,
         maskGenerator: any DialogueMaskGenerating,
@@ -20,6 +22,7 @@ public actor ComicTranslationPipeline {
         outputRoot: URL
     ) {
         self.regionDetector = regionDetector
+        self.textRecognizer = textRecognizer
         self.maskRefiner = maskRefiner
         self.translator = translator
         self.maskGenerator = maskGenerator
@@ -87,7 +90,6 @@ public actor ComicTranslationPipeline {
             sourceLanguageCodes: options.sourceLanguageCodes,
             fineScanEnabled: options.fineScanEnabled
         ) { value in
-            if value > 0 { activity(.detectingRegions) }
             progress(.detectingText, min(max(value, 0), 1) * 0.2)
         }
         activity(.mergingRegions)
@@ -203,7 +205,26 @@ public actor ComicTranslationPipeline {
         progress: @escaping PagePipelineProgress
     ) async throws -> [DialogueRegion] {
         try Task.checkCancellation()
-        guard regions.allSatisfy({
+        guard !regions.isEmpty else {
+            progress(.translationReady, 1)
+            return []
+        }
+        let recognizedRegions: [DialogueRegion]
+        if let textRecognizer {
+            activity(.preparingTextModel)
+            progress(.translating, 0)
+            recognizedRegions = try await textRecognizer.recognizeRegions(
+                pageURL: page.sourceURL,
+                regions: regions,
+                sourceLanguageCodes: options.sourceLanguageCodes
+            ) { value in
+                if value > 0 { activity(.detectingRegions) }
+                progress(.translating, min(max(value, 0), 1) * 0.4)
+            }
+        } else {
+            recognizedRegions = regions
+        }
+        guard recognizedRegions.allSatisfy({
             !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }) else {
             throw ComicTranslationPipelineError.sourceTextRequired
@@ -211,18 +232,18 @@ public actor ComicTranslationPipeline {
         activity(.applyingGlossary)
         let glossaryTerms = glossary.resolvedTerms(
             for: options.targetLanguageCode,
-            sourceTexts: regions.map(\.sourceText)
+            sourceTexts: recognizedRegions.map(\.sourceText)
         )
         activity(.preparingTextModel)
-        progress(.translating, 0)
+        progress(.translating, textRecognizer == nil ? 0 : 0.4)
         let translated = try await translator.translate(
-            regions: regions,
+            regions: recognizedRegions,
             pageURL: page.sourceURL,
             targetLanguageCode: options.targetLanguageCode,
             glossaryTerms: glossaryTerms
         ) { value in
             if value > 0 { activity(.translatingRegions) }
-            progress(.translating, value)
+            progress(.translating, 0.4 + min(max(value, 0), 1) * 0.6)
         }
         progress(.translationReady, 1)
         return translated
@@ -234,6 +255,7 @@ public actor ComicTranslationPipeline {
         regions: [DialogueRegion],
         options: ProcessingOptions,
         outputURL requestedOutputURL: URL? = nil,
+        existingMaskURL: URL? = nil,
         activity: @escaping PagePipelineActivity = { _ in },
         progress: @escaping PagePipelineProgress
     ) async throws -> PageCompositionResult {
@@ -248,26 +270,40 @@ public actor ComicTranslationPipeline {
         let renderedRegionIDs = Set(regions.filter {
             !$0.translatedText.isEmpty || !options.preserveUntranslatedRegions
         }.map(\.id))
-        let prepared = try await preparePixelMasksForComposition(
-            page: page,
-            regions: regions,
-            renderedRegionIDs: renderedRegionIDs
-        )
+        let reusableMaskURL = existingMaskURL.flatMap { url in
+            FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+        let prepared: (regions: [DialogueRegion], warnings: [String])
+        if reusableMaskURL == nil {
+            prepared = try await preparePixelMasksForComposition(
+                page: page,
+                regions: regions,
+                renderedRegionIDs: renderedRegionIDs
+            )
+        } else {
+            prepared = (regions: regions, warnings: [])
+        }
         let renderedRegions = prepared.regions.filter { renderedRegionIDs.contains($0.id) }
         activity(.generatingMask)
         progress(.composing, 0)
-        try await maskGenerator.generateMask(
-            sourceURL: page.sourceURL,
-            regions: renderedRegions,
-            expansion: options.maskExpansion,
-            outputURL: urls.mask
-        )
+        let maskURL: URL
+        if let reusableMaskURL {
+            maskURL = reusableMaskURL
+        } else {
+            maskURL = urls.mask
+            try await maskGenerator.generateMask(
+                sourceURL: page.sourceURL,
+                regions: renderedRegions,
+                expansion: options.maskExpansion,
+                outputURL: maskURL
+            )
+        }
         progress(.composing, 0.12)
 
         activity(.restoringBackground)
         let restorationWarnings = try await backgroundRestorer.restoreBackground(
             sourceURL: page.sourceURL,
-            maskURL: urls.mask,
+            maskURL: maskURL,
             regions: renderedRegions,
             outputURL: urls.background,
             preferGenerativeModel: options.useImageToImageRestoration
@@ -285,7 +321,7 @@ public actor ComicTranslationPipeline {
 
         return PageCompositionResult(
             regions: prepared.regions,
-            maskURL: urls.mask,
+            maskURL: maskURL,
             backgroundURL: urls.background,
             outputURL: outputURL,
             warnings: prepared.warnings + restorationWarnings
@@ -358,7 +394,7 @@ public enum ComicTranslationPipelineError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .sourceTextRequired:
-            "翻譯前每個區域都必須有由圖生文模型、AI Agent 或人工提供的來源文字；請重新執行步驟二或補齊文字。"
+            "翻譯前每個區域都必須有由圖生文模型、AI Agent 或人工提供的來源文字；請執行步驟三或補齊文字。"
         }
     }
 }

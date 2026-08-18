@@ -275,7 +275,7 @@ function selectedWorkflowPages() {
 
 function hasWorkflowStepData(page, step) {
   if (step === "mask") {
-    return Boolean(page.maskPreviewURL && page.maskAppliedPreviewURL);
+    return Boolean(page.maskPreviewURL);
   }
   if (step === "translate") {
     return Boolean(page.translationPreviewURL || page.outputPreviewURL);

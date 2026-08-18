@@ -38,13 +38,22 @@ public protocol ImageToImageGenerating: Sendable {
     ) async throws
 }
 
-/// 從封閉區域候選辨識、分類並轉錄工作流要處理的主要文字區域。
-/// 失敗時呼叫端必須讓本階段失敗，不可把未完成的局部結果當成完整清單。
+/// 從影像候選建立供像素遮罩精修使用的區域。
 public protocol SemanticRegionDetecting: Sendable {
     func detectRegions(
         pageURL: URL,
         sourceLanguageCodes: [String],
         fineScanEnabled: Bool,
+        progress: @escaping InferenceProgress
+    ) async throws -> [DialogueRegion]
+}
+
+/// 在既有遮罩區域內分類並轉錄原文，不得更動區域 ID、遮罩或人工筆劃。
+public protocol RegionTextRecognizing: Sendable {
+    func recognizeRegions(
+        pageURL: URL,
+        regions: [DialogueRegion],
+        sourceLanguageCodes: [String],
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion]
 }

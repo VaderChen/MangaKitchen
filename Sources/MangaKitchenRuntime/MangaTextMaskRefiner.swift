@@ -8,13 +8,15 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
     /// 字形遮罩外框相對於整頁的最大面積。過度寬鬆時，分鏡底線只要和幾個
     /// 黑色元件相連，就可能形成橫跨多格的帶狀遮罩。
     private static let maximumMaskAreaPerTextCharacter = 0.003
+    private static let inkThresholdOffset = 6
+    private static let maximumInkThreshold = 192
     private let searchPaddingPixels: Int
     private let componentPaddingPixels: Int
     private let maximumComponentsPerRegion: Int
 
     public init(
         searchPaddingPixels: Int = 2,
-        componentPaddingPixels: Int = 1,
+        componentPaddingPixels: Int = 0,
         maximumComponentsPerRegion: Int = 256
     ) {
         self.searchPaddingPixels = max(0, searchPaddingPixels)
@@ -103,7 +105,9 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             guard !character.isWhitespace, !character.isNewline else { return }
             count += 1
         }
-        guard visibleCharacterCount > 0 else { return false }
+        guard visibleCharacterCount > 0 else {
+            return bounds.width > 0 && bounds.height > 0 && bounds.width * bounds.height <= 0.15
+        }
         let areaPerCharacter = bounds.width * bounds.height / Double(visibleCharacterCount)
         return areaPerCharacter <= maximumMaskAreaPerTextCharacter
     }
@@ -173,7 +177,10 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         guard searchBounds.width > 0, searchBounds.height > 0 else { return nil }
 
         let histogram = raster.histogram(in: searchBounds)
-        let threshold = min(210, max(48, otsuThreshold(histogram) + 18))
+        let threshold = min(
+            Self.maximumInkThreshold,
+            max(48, otsuThreshold(histogram) + Self.inkThresholdOffset)
+        )
         let sampleCount = max(searchBounds.width * searchBounds.height, 1)
         let foregroundCount = histogram.prefix(threshold + 1).reduce(0, +)
         let foregroundRatio = Double(foregroundCount) / Double(sampleCount)

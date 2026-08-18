@@ -57,17 +57,34 @@ enum VLMTextGrounding {
                   values.allSatisfy({ (0...coordinateMaximum).contains($0) }) else {
                 return nil
             }
-            let left = min(values[0], values[2]) / coordinateMaximum
-            let top = min(values[1], values[3]) / coordinateMaximum
-            let right = max(values[0], values[2]) / coordinateMaximum
-            let bottom = max(values[1], values[3]) / coordinateMaximum
-            guard right - left >= 0.002, bottom - top >= 0.002 else { return nil }
+            let localLeft = denormalizedCoordinate(
+                min(values[0], values[2]),
+                dimension: cropRect.width
+            )
+            let localTop = denormalizedCoordinate(
+                min(values[1], values[3]),
+                dimension: cropRect.height
+            )
+            let localRight = denormalizedCoordinate(
+                max(values[0], values[2]),
+                dimension: cropRect.width
+            )
+            let localBottom = denormalizedCoordinate(
+                max(values[1], values[3]),
+                dimension: cropRect.height
+            )
+            guard localRight > localLeft, localBottom > localTop else { return nil }
+
+            let pageLeft = cropRect.minX + localLeft
+            let pageTop = cropRect.minY + localTop
+            let pageRight = cropRect.minX + localRight
+            let pageBottom = cropRect.minY + localBottom
 
             let raw = NormalizedRect(
-                x: (cropRect.minX + left * cropRect.width) / Double(imageWidth),
-                y: (cropRect.minY + top * cropRect.height) / Double(imageHeight),
-                width: (right - left) * cropRect.width / Double(imageWidth),
-                height: (bottom - top) * cropRect.height / Double(imageHeight)
+                x: Double(pageLeft) / Double(imageWidth),
+                y: Double(pageTop) / Double(imageHeight),
+                width: Double(pageRight - pageLeft) / Double(imageWidth),
+                height: Double(pageBottom - pageTop) / Double(imageHeight)
             ).clamped()
             let padded = raw.expanded(by: paddingFraction)
             if let clippingBounds {
@@ -85,5 +102,11 @@ enum VLMTextGrounding {
         }
         guard let first = rectangles.first else { return nil }
         return rectangles.dropFirst().reduce(first) { $0.union(with: $1) }
+    }
+
+    /// 將 Qwen 的 0...1000 正規化座標，映射到實際裁切圖像的像素座標。
+    private static func denormalizedCoordinate(_ coordinate: Double, dimension: CGFloat) -> CGFloat {
+        let scaled = coordinate / coordinateMaximum * Double(dimension)
+        return CGFloat(scaled.rounded(.toNearestOrEven))
     }
 }

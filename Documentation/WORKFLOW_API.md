@@ -2,14 +2,14 @@
 
 ## 設計目標
 
-工作流由四個可獨立執行、可重做、可持久化的階段組成。HTML/JavaScript Bridge、Swift App 與 MCP server 都呼叫相同的 `ComicTranslationPipeline`，不各自實作 OCR、翻譯或合成演算法。
+工作流由四個可獨立執行、可重做、可持久化的階段組成。HTML/JavaScript Bridge、Swift App 與 MCP server 都呼叫相同的 `ComicTranslationPipeline`，不各自實作區域辨識、翻譯或合成演算法。
 
 ```text
 1. scan directory
       ↓ ComicPage[]
-2. OCR + enclosed-region candidates → optional VLM merge/classification → glyph mask refinement → one-pass LLM/Agent OCR correction ⇄ edit mask strokes
-      ↓ DialogueRegion[]（raw + corrected source text）+ dialogue-mask.png + 去字校對預覽 + page.str
-3. translate + auto layout ⇄ edit text/style
+2. Core ML dialogue BBOXes → glyph mask refinement ⇄ edit mask strokes
+      ↓ DialogueRegion[]（未確認原文）+ dialogue-mask.png + 去字校對預覽 + page.str
+3. VLM classification/transcription → translate + auto layout ⇄ edit text/style
       ↓ page.str + translation preview.png
 4. save output
       ↓ copy confirmed translation preview to translated page.png
@@ -58,11 +58,11 @@
 - `NormalizedPoint` 與 `NormalizedRect` 都以原圖左上角為原點，範圍為 `0...1`。
 - 遮罩畫筆的 `diameter` 是相對於原圖短邊的比例，範圍為 `0.001...1`。
 - `MaskStroke.mode` 為 `add` 或 `erase`，筆劃依保存順序套用。
-- `rawSourceText` 保留辨識當下的原始值（GUI 為 Vision OCR，MCP 為 Agent 提交的原文）；`sourceText` 是經本機 LLM、MCP Agent 或人工校正後的翻譯輸入。
-- `ocrTextRefined == true` 才表示該區域已完成一次 OCR 校正；翻譯不會再次校正來源文字。
-- **GUI 路徑**：系統 Vision OCR 與封閉白區偵測各自獨立執行。每個 OCR 粗框只歸屬重疊率最高的封閉候選，未歸屬者作為無框文字；所有封閉候選即使沒有 OCR 命中也會送本機 VLM 分類與轉錄。VLM 不產生座標，而是與 OCR 文字／位置及封閉框幾何合併、去重；無 OCR 的直排文字可直接由 VLM 補成區域。擬聲字、頁碼、頁尾資訊、人物與空白區不進入合併清單。未載入圖生文模型時則略過語意合併，系統 OCR 仍可獨立產生區域與遮罩。OCR 校正與翻譯分批呼叫模型，且只有每個輸入 UUID 都有非空結果時才寫入完成狀態。
-- **MCP 路徑**：譯文一律由外部 Agent 提供，後端永不呼叫內建圖生文模型翻譯；區域來源以 `region_source` 切換（`agent` 連 Vision OCR 都不跑／`local` 用本機 Vision＋VLM）。後端只做像素遮罩收斂、背景修補與排版。詳見〈MCP 介面〉。
-- `maskRefinementApplied == true` 表示遮罩已由 OCR 粗框收斂成亮度／連通元件字形多邊形，產生遮罩時只再向外擴張 1～3 px。
+- `rawSourceText` 保留 VLM、MCP Agent 或人工最初提供的原文；`sourceText` 是目前供詞表比對與翻譯使用的來源文字。
+- `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；新流程的 `true` 代表來源文字已由 VLM、MCP Agent 或人工確認，不會觸發任何 OCR 校正服務。
+- **GUI 路徑**：步驟二由內建 `MangaBubbleSegmentationCoreMLRuntime` 以 Apple Neural Engine 優先產生對話框 BBOX，再以原圖像素連通元件將 `bounds` 與遮罩收斂到實際字形；此時不載入或呼叫圖生文模型。模型無法載入或推論失敗時，才後備至 `MangaBubbleCandidateDetector` 的封閉白區演算法。步驟三才由 `VLMRegionTranscriptionService` 在既有 BBOX 中分類、轉錄，接著翻譯；未載入圖生文模型時不會回退至系統文字辨識。
+- **MCP 路徑**：譯文一律由外部 Agent 提供，後端永不呼叫內建圖生文模型翻譯；區域來源以 `region_source` 切換（`agent` 由 Agent 提供／`local` 用本機封閉區域偵測與 VLM）。後端共用像素遮罩收斂、背景修補與排版。詳見〈MCP 介面〉。
+- `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形多邊形，產生遮罩時只再向外擴張 1～3 px。
 - `maskCoverageRatio` 是像素精修保留的前景筆畫比例；`null` 代表精確多邊形由人工／Agent 直接提供，或尚未執行自動檢查。
 - `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線，但仍回報 false，因為它也可能是範圍太窄而被截掉的文字。此時應擴大安全範圍、重算遮罩，或由 Agent／人工補入精確多邊形與畫筆。
 - `bounds` 是涵蓋完整原文的粗搜尋範圍，不直接作為最終遮罩；`bubbleBounds` 必須涵蓋整個對話框內緣，像素搜尋及多邊形都不得越界。
@@ -78,7 +78,7 @@
 | 狀態 | 意義 | 可執行的下一步 |
 |---|---|---|
 | `scanned` | 已掃描原圖 | 偵測遮罩 |
-| `maskReady` | OCR、區域及遮罩已保存 | 人工修遮罩、翻譯 |
+| `maskReady` | VLM／Agent 原文、區域及遮罩已保存 | 人工修遮罩、翻譯 |
 | `translationReady` | 譯文及排版設定已保存 | 人工修文、合成 |
 | `completed` | 已輸出合成圖 | 重做任一步驟 |
 | `failed` | 最近命令失敗 | 修正問題後重做該步驟 |
@@ -105,15 +105,6 @@ let paths = try WorkflowPathResolver().paths(
 ```swift
 let detection = try await pipeline.detectMasks(
     page: page,
-    options: options,
-    refineOCRText: true,
-    progress: progress
-)
-
-// 已有遮罩時，只補做尚未完成的 OCR 校正，不覆寫人工遮罩。
-let correctedRegions = try await pipeline.refineOCRText(
-    page: page,
-    regions: editedRegions,
     options: options,
     progress: progress
 )
@@ -245,7 +236,7 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 
 命令 Promise 代表 Native 已接受命令。長工序的實際狀態、進度及結果由 `window.MangaKitchenNative.receiveState` 持續推送。
 
-`translationAnchor` 使用左上角原點的 0...1 正規化座標，只改變譯文 Layer 與最終排版位置，不會改動 OCR `bounds`、對話框或遮罩。像素遮罩覆蓋檢查只提供警告；人工遮罩或目前自動遮罩仍可繼續翻譯與合成，不會作為硬性阻擋條件。
+`translationAnchor` 使用左上角原點的 0...1 正規化座標，只改變譯文 Layer 與最終排版位置，不會改動來源文字 `bounds`、對話框或遮罩。像素遮罩覆蓋檢查只提供警告；人工遮罩或目前自動遮罩仍可繼續翻譯與合成，不會作為硬性阻擋條件。
 
 介面語言與專案的 `targetLanguageCode` 是兩個獨立設定。改變介面語言只影響 WebUI、原生目錄選擇面板與 MCP menu bar，不會修改譯文語言或專有名詞的對照目標。
 
@@ -299,12 +290,12 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 
 | `region_source` | 區域（文字位置與原文） | 翻譯 | 適用情境 |
 | --- | --- | --- | --- |
-| `agent`（預設） | 由 Agent 提交；後端連 Vision OCR 都不跑 | Agent | 沒有本機模型，或 Agent 的版面判讀較準 |
-| `local` | 本機 Vision OCR 與封閉區域偵測；已載入 imageToText 模型時合併 VLM 分類／轉錄並校正 OCR | Agent | 想使用本機穩定幾何與缺漏區域補完，只把翻譯交給 Agent |
+| `agent`（預設） | 由 Agent 提交；後端不執行本機區域辨識 | Agent | 沒有本機模型，或 Agent 的版面判讀較準 |
+| `local` | 本機 Core ML 氣泡 BBOX 與像素遮罩 | Agent | 想使用本機穩定幾何，再由 Agent 提供原文與譯文 |
 
-`agent` 模式的四個位置全部換成替身（`AgentDrivenTextRecognizer`／`AgentDrivenRegionDetector`／`AgentDrivenOCRTextRefiner`／`AgentDrivenTranslator`）；`local` 模式只換 translator，前三者用回 `VisionOCRService`／`VLMSupplementalRegionDetector`／`VLMOCRTextRefinementService`。
+`agent` 模式使用 `AgentDrivenRegionDetector` 與 `AgentDrivenTranslator`，不啟動本機區域辨識；`local` 模式改用 `MangaBubbleMaskRegionDetector`，但 translator 仍固定為 `AgentDrivenTranslator`。
 
-兩種模式下後端共用像素級遮罩收斂、背景修補與排版。`model.load` 可載入 imageToImage 模型供 `page.compose` 的生成式背景修補使用；imageToText 模型只有在 `region_source: local` 時才會被使用。`local` 模式未載入 imageToText 模型時只執行 Vision OCR；模型已載入時才把 Vision OCR、VLM 與封閉候選合併，因此模型是補強而不是系統 OCR 的必要條件。
+兩種模式下後端共用像素級遮罩收斂、背景修補與排版。`model.load` 可載入 imageToImage 模型供 `page.compose` 的生成式背景修補使用；MCP 的原文與譯文一律由 Agent 提供，`region_source: local` 也不在 `page.detect_masks` 載入 imageToText 模型。
 
 ⚠️ 切到 `local` 後，`page.detect_masks` 會**重新產生區域並覆寫**該頁既有結果（含已寫入的譯文）；`agent` 模式則保證不覆寫。
 
@@ -320,9 +311,9 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 
 `region_source: local`：
 
-1. `page.detect_masks` —— 本機產生區域、原文與遮罩；有 imageToText 模型時合併 Vision OCR、VLM 與封閉候選，沒有模型時使用 Vision OCR 獨立完成。
-2. 讀取 `mangakitchen://page/{page_id}` 取得各區域的 `sourceText`。
-3. `region.update` 寫入 `translated_text`（步驟 2、3 是這個模式下 Agent 唯一要做的事）。
+1. `page.detect_masks` —— 本機偵測氣泡 BBOX，並產生像素級遮罩；不載入 imageToText 模型。
+2. 讀取 `mangakitchen://page/{page_id}` 與原圖 resource，由 Agent 取得各區域原文。
+3. `region.update` 寫入 `source_text` 與 `translated_text`。
 4. `page.compose` 輸出。
 
 `page.translate` 在此模式下不可用，呼叫會回傳可操作的錯誤訊息，指引改用 `region.update` 寫入譯文。`page.run_full` 只有在所有區域都已有譯文時才會成功，否則會停在同一個錯誤。
@@ -345,9 +336,9 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 
 專案（工作區）層級的列表則用 `mangakitchen.workspace.list` 或 `mangakitchen://workspace/list`。
 
-`page.supplement_regions` 是 Agent 提交區域的主要入口。每筆候選需要涵蓋完整原文的粗 `bounds` 與校正後的 `source_text`，也可提供 `writing_direction` 或精確 `mask_polygons`。`bounds` 要貼著文字本身，它同時決定譯文落點與字級推估；`bubble_bounds` 只在文字確實被封閉對話框、旁白框或標題框包住時提供，代表遮罩與譯文都不得越界。無框台詞（直接排在畫面或放射線上的字）請**省略** `bubble_bounds`：省略代表沒有硬邊界，遮罩改為只依 `maskExpansion` 由文字外擴；為無框文字或整格分鏡杜撰一個框，會把譯文推到分鏡中央。既有區域若帶著錯誤的框，可用 `region.update` 傳 `"bubble_bounds": null` 清除。未提供多邊形時，Swift 後端先分析粗框；若對話框內緣仍有可信前景，就擴大搜尋區重算，最終只保存字形級多邊形。覆蓋率不足或文字碰到搜尋邊界時會在 `warnings` 說明，不會以擴大的矩形冒充精確遮罩。候選若與既有或同批區域重疊超過一半就略過，因此同一請求可以安全重送。接受的區域會標記 `ocrTextRefined: true`、合併至頁面、重建完整 mask 並同步 `.str`。
+`page.supplement_regions` 是 Agent 提交區域的主要入口。每筆候選需要涵蓋完整原文的粗 `bounds` 與已確認的 `source_text`，也可提供 `writing_direction` 或精確 `mask_polygons`。`bounds` 要貼著文字本身，它同時決定譯文落點與字級推估；`bubble_bounds` 只在文字確實被封閉對話框、旁白框或標題框包住時提供，代表遮罩與譯文都不得越界。無框台詞（直接排在畫面或放射線上的字）請**省略** `bubble_bounds`：省略代表沒有硬邊界，遮罩改為只依 `maskExpansion` 由文字外擴；為無框文字或整格分鏡杜撰一個框，會把譯文推到分鏡中央。既有區域若帶著錯誤的框，可用 `region.update` 傳 `"bubble_bounds": null` 清除。未提供多邊形時，Swift 後端先分析粗框；若對話框內緣仍有可信前景，就擴大搜尋區重算，最終只保存字形級多邊形。覆蓋率不足或文字碰到搜尋邊界時會在 `warnings` 說明，不會以擴大的矩形冒充精確遮罩。候選若與既有或同批區域重疊超過一半就略過，因此同一請求可以安全重送。接受的區域會保留相容欄位 `ocrTextRefined: true`、合併至頁面、重建完整 mask 並同步 `.str`。
 
-對已存在但尚未校正的 OCR 區域，純 Agent 仍使用 `region.update` 寫回校正後的 `source_text`；寫回來源文字會自動設為已校正。修改來源文字而未同時提供譯文時，既有譯文會清空，避免沿用失效翻譯。
+對已存在但來源文字不完整的區域，Agent 使用 `region.update` 寫回已確認的 `source_text`。修改來源文字而未同時提供譯文時，既有譯文會清空，避免沿用失效翻譯。
 
 `region.update` 對「nil 本身就是有效狀態」的欄位採三態語意：**省略＝維持原值，`null`＝清除回預設，帶值＝設定**。適用欄位與清除後的行為：
 
@@ -376,7 +367,7 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 }
 ```
 
-`page.translate` 若發現既有區域尚未校正，會先以已載入的本機圖生文模型補做校正，且不重跑 OCR 或遮罩。`page.compose` 與 `page.run_full` 會檢查遮罩、OCR 校正、譯文與輸出產物，缺少時才逐級回到必要的前一步；已完成資料不會被重做。
+`page.translate` 只接受每個區域都有非空 `sourceText` 的資料，不會額外重跑文字辨識或改寫來源文字。`page.compose` 與 `page.run_full` 會檢查遮罩、來源文字、譯文與輸出產物，缺少時才逐級回到必要的前一步；已完成資料不會被重做。
 
 ### Resources
 

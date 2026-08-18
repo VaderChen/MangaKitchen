@@ -36,13 +36,13 @@ GPLv3 本身允許商業使用及收費散布，但必須履行其原始碼與 c
 - 四階段工作流：掃描、文字／遮罩、翻譯／排版設定、背景修補／合成；同時保留一鍵完整頁與全部頁面。
 - 每張圖片對應版本化 `.str` JSON，保存文字、位置、字型、固定／自動字級與遮罩筆劃。
 - 遮罩以正規化向量畫筆支援添加、擦除與逐區復原，再輸出二值 PNG；步驟二完成後立即顯示已清除原文字的 CPU／GPU 遮罩校對圖，不提前啟動圖生圖模型。
-- 黑白漫畫會分別執行系統 Vision OCR 與封閉白區偵測；OCR 粗框歸屬最佳封閉候選，未歸屬者保留為無框文字。所有封閉候選即使沒有 OCR 命中仍交給圖生文模型分類、轉錄，再將 OCR、VLM 與封閉框幾何合併、去重；目前主流程刻意排除擬聲字、頁碼、頁尾資訊、人物與空白區。
-- 候選文字會以像素連通元件收斂成字形多邊形，再依整頁語境分批校正 OCR；原始值與校正值都保存，缺任何區域就不會誤標為完成。
+- 內建由 [huyvux3005/manga109-segmentation-bubble](https://huggingface.co/huyvux3005/manga109-segmentation-bubble)（Apache-2.0）匯出的 manga109 氣泡分割 Core ML 模型，優先使用 Apple Neural Engine 在本機推論產生對話框 BBOX，再把每個候選交給圖生文模型分類與轉錄；不再使用系統 OCR 辨識或定位文字。主流程刻意排除擬聲字、頁碼、頁尾資訊、人物與空白區。
+- VLM 接受的對話框 BBOX 會以原圖像素連通元件收斂成字形多邊形，同步把文字定位框縮到實際字形外框；任一候選缺少有效分類或轉錄時，不會寫入不完整結果。
 - 圖生文模型的頁面語境翻譯 Prompt 與嚴格 JSON 回傳解析。
 - 可直接載入本機 Hugging Face MLX VLM 目錄，由 `mlx-swift-lm` 在 Apple Silicon／Metal 執行。
 - 以 model manifest 載入 `.mlmodelc`、`.mlmodel` 或 `.mlpackage`，Core ML 指定 Metal GPU。
 - 對話文字遮罩可由一個或多個多邊形覆蓋原字、裁切於對話框邊界，再疊加畫筆增刪；沒有圖生圖模型時可選 CPU 或 Metal GPU 修補。
-- Core Text 依原文字形位置與大小自動配適，支援橫排／直排、超長譯文優先縮字、同泡泡多區域防重疊分欄及泡泡內緣硬裁切，人工修改後可重新排版。
+- HTML/CSS 是翻譯排版的唯一標準，支援橫排／直排、固定或自動字級、拖曳與尺寸調整；最終 PNG 由 WebKit 直接渲染同一套文字層，步驟三預覽不會在輸出時改成另一套排版。
 - 原圖／輸出圖安全地透過自訂 URL Scheme 提供給 WebUI，不直接暴露任意檔案。
 - 專案索引與各專案狀態自動儲存為版本化 JSON；寫入前保留上一版 `.bak`，重新啟動會驗證來源與輸出檔後復原。
 - 可選的 macOS 26 Swift/MLX Qwen Image Edit worker；mask 同時作為模型條件圖與最終合成限制。
@@ -56,24 +56,24 @@ MangaKitchen 有兩種操作方式。它們只改變「誰負責推論與編排�
 共同的四個步驟為：
 
 1. **專案與頁面**：選取來源目錄、遞迴掃描圖片，建立可複選與批次處理的頁面列表。
-2. **文字與遮罩**：偵測對話區域與原文、將粗框精修成字形遮罩，並由本機 LLM、Agent 或人工校正一次 OCR；使用者或 Agent 可添加、擦除與修正遮罩。
-3. **翻譯與排版**：將每個區域的原文、譯文、位置、字型與字級寫入該圖片對應的 `.str`。
+2. **文字與遮罩**：以內建 Core ML 氣泡分割模型定位對話框 BBOX，再依原圖像素精修成字形遮罩；此步驟不呼叫 VLM。MCP Agent 也可直接提供區域與原文，使用者可添加、擦除與修正遮罩。
+3. **翻譯與排版**：先由 VLM 在既有 BBOX 中分類與轉錄原文，再翻譯、排版，並將每個區域的原文、譯文、位置、字型與字級寫入該圖片對應的 `.str`。
 4. **修補與合成**：移除原字、修補背景、排入譯文，輸出到專案指定目錄。
 
-四步驟是可續作的狀態與產物契約，不是每次都要從步驟一重新執行的固定清單。GUI 與 MCP 都應先讀取頁面狀態與 `.str`，再從目前需要的任意步驟開始：已有遮罩可直接翻譯，已有譯文可直接調整排版或合成，只有某個區域需要修改時也只需更新該區域。除非使用者或 Agent 明確要求重做，已完成的 OCR、遮罩、譯文與人工編修不應被覆蓋。
+四步驟是可續作的狀態與產物契約，不是每次都要從步驟一重新執行的固定清單。GUI 與 MCP 都應先讀取頁面狀態與 `.str`，再從目前需要的任意步驟開始：已有遮罩可直接翻譯，已有譯文可直接調整排版或合成，只有某個區域需要修改時也只需更新該區域。除非使用者或 Agent 明確要求重做，已完成的區域辨識、遮罩、譯文與人工編修不應被覆蓋。
 
 從任意步驟開始前，必須按頁面檢查實際資料，而不能只相信狀態名稱。若目標步驟缺少前置產物，就逐級回到最近一個需要補做的步驟：
 
 - 要執行步驟四時，先檢查有效的 `.str` 譯文／排版資料與遮罩；缺少譯文則回到步驟三，缺少文字區域或遮罩則再回到步驟二。
-- 要執行步驟三時，先檢查來源頁、文字區域、已完成單次校正的 OCR 原文與遮罩；資料不完整就回到步驟二。
+- 要執行步驟三時，先檢查來源頁、文字區域與遮罩；原文尚未確認時會在此步驟由 VLM 轉錄，資料不完整才回到步驟二。
 - 要執行步驟二時，先檢查來源圖片仍存在且專案頁面索引有效；缺少時回到步驟一重新掃描。
 - 回溯只補齊缺少或失效的資料，不重新產生仍有效的前置產物。不同頁面可以從不同步驟開始。
 
 ### 用法 A：下載模型，在本機離線運作
 
-在「設定 → 模型」指定圖生文模型，以及選用的圖生圖模型。OCR、翻譯、背景修補與合成都在 Mac 本機執行；模型完成下載後，工作流不需要把漫畫內容送到外部 AI 服務。
+在「設定 → 模型」指定圖生文模型，以及選用的圖生圖模型。區域辨識、翻譯、背景修補與合成都在 Mac 本機執行；模型完成下載後，工作流不需要把漫畫內容送到外部 AI 服務。
 
-- `imageToText` 模型負責步驟二候選聯絡表的標題／對話語意分類、無 OCR 封閉區域補完、完整 OCR 校正，以及步驟三的頁面語境翻譯；系統 OCR、VLM 與封閉框會先合併去重。未載入模型時系統 OCR 仍可獨立建立遮罩；擬聲字不進入目前的翻譯主流程，校正與翻譯會分批並驗證每個區域都有結果。
+- `imageToText` 模型是 GUI 本機步驟三的必要條件，先在既有對話框 BBOX 中分類與轉錄原文，再依頁面語境翻譯。步驟二可在未載入模型時完成 Core ML BBOX 與像素遮罩；步驟三未載入模型時不會改走系統 OCR。擬聲字不進入目前的翻譯主流程，分類、轉錄與翻譯都會分批並驗證每個區域都有結果。
 - `imageToImage` 模型負責步驟四的背景修補，屬於選用；未設定時依「設定 → 進階」使用 Metal GPU 鄰域修補或 CPU 對話框主色修補，GPU 失敗時會自動退回 CPU。
 - GUI 可分步執行，也可使用「完整處理選取頁／全部頁面」。一鍵功能仍只是依序執行步驟二至四，不會跳過中間資料。
 - 所有結果都回寫專案與 `.str`，可在任何步驟人工修正後重新執行後續階段。
@@ -85,12 +85,12 @@ MangaKitchen 有兩種操作方式。它們只改變「誰負責推論與編排�
 對全新、尚未處理的專案，不下載本機圖生文模型時，Agent 可依下列方式完成翻譯：
 
 1. 呼叫 `mangakitchen.workspace.open` 建立工作區並取得 `workspace_id`。
-2. 呼叫 `mangakitchen.page.detect_masks` 完成 OCR 與遮罩。
-3. 讀取頁面與原圖 resource，比對目前區域；發現漏字或漏框時，以 `mangakitchen.page.supplement_regions` 批次送入遺漏文字粗框與原文。後端會自動精修字形遮罩、去除重複區域並同步 `.str`；Agent 也可直接提供精確多邊形。
-4. 對既有區域，若 `ocrTextRefined` 為 false，Agent 必須先校正 `rawSourceText`，再翻譯，並以 `mangakitchen.region.update` 同時寫回每區的 `source_text`、譯文與排版設定。
+2. 呼叫 `mangakitchen.page.detect_masks` 建立目前 Agent 已提交區域的遮罩；全新頁面會先得到空白遮罩。
+3. 讀取頁面與原圖 resource，以 `mangakitchen.page.supplement_regions` 批次送入文字粗框與原文。後端會自動精修字形遮罩、去除重複區域並同步 `.str`；Agent 也可直接提供精確多邊形。
+4. 翻譯各區原文，並以 `mangakitchen.region.update` 寫回每區的 `source_text`、譯文與排版設定。
 5. 呼叫 `mangakitchen.page.compose` 完成背景修補與輸出。
 
-若本機也已載入 `imageToText` 模型，Agent 可以改呼叫 `mangakitchen.page.translate`，或使用 `mangakitchen.page.run_full` 編排步驟二至四。`page.run_full` 需要本機圖生文模型；純 Agent 翻譯模式應採用 `detect_masks → supplement_regions → region.update → compose`，沒有遺漏區域時可略過 `supplement_regions`。
+若本機也已載入 `imageToText` 模型，可將 `region_source` 設為 `local`，讓步驟二使用本機氣泡 BBOX 與像素遮罩；MCP 的原文與譯文仍由 Agent 以 `region.update` 提供。純 Agent 模式採用 `detect_masks → supplement_regions → region.update → compose`。
 
 對既有專案，Agent 應先讀取 workspace、page 與 `.str` resource 判斷目前進度及實際產物，再只呼叫需要的 tool。例如 `maskReady` 且遮罩檔有效時可直接從翻譯或 `region.update` 開始，`translationReady` 且譯文完整時可直接 `compose`，已輸出的頁面也能只修改單一區域後重新合成。若檢查發現資料缺失，Agent 必須依上述規則逐級回溯；純 Agent 模式回溯到步驟三時，由 Agent 補譯並呼叫 `region.update`，不強制改用本機模型。
 
@@ -191,10 +191,10 @@ MangaKitchenCore
   領域資料、幾何座標、處理選項、模型與工作流協定
 
 MangaKitchenRuntime
-  Vision OCR、閱讀順序、Core ML/Metal、遮罩、背景修補、Core Text 排版
+  氣泡 BBOX、步驟三 VLM 轉錄、閱讀順序、Core ML/Metal、遮罩、背景修補
 
 MangaKitchenApp
-  SwiftUI 視窗、WKWebView、自訂 URL Scheme、JSON Bridge、HTML/JavaScript
+  SwiftUI 視窗、WKWebView、自訂 URL Scheme、JSON Bridge、HTML/JavaScript 排版與 PNG 輸出
 
 MangaKitchenApp/MCP
   同一 GUI process 內可開關的 MCP Streamable HTTP adapter 與服務生命週期
@@ -205,8 +205,8 @@ MangaKitchenApp/MCP
 
 ## 已知邊界
 
-- 專案沒有內附模型權重；模型大小、授權與下載策略應在選定正式模型後加入。
-- 目前的自動候選偵測以黑白漫畫的封閉亮色區域為主；暗色／彩色對話框、非封閉旁白框仍適合再接 segmentation 模型。擬聲字目前刻意不納入翻譯主流程，未來若支援會採獨立偵測與排版策略。
+- 內建氣泡 BBOX Core ML 模型；圖生文與圖生圖模型權重仍需由使用者另行下載與設定。
+- 目前的自動候選偵測使用 `manga109-segmentation-bubble` Core ML 模型；暗色／彩色對話框、非封閉旁白框仍可能需要 Agent 提供精確區域。擬聲字目前刻意不納入翻譯主流程，未來若支援會採獨立偵測與排版策略。
 - Metal 鄰域修補是沒有圖生圖模型時的保底方案，複雜網點或跨越線稿的文字仍建議使用 inpainting 模型。
 - Qwen Image Edit INT4 仍需要約 25GB 級推論記憶體，且一次頁面修補要執行完整 diffusion；低記憶體 Mac 應停用圖生圖修補。
 - Swift Package 直接執行尚未加入 App Sandbox security-scoped bookmark、簽章、notarization 與正式 `.app` 封裝流程。

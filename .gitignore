@@ -45,6 +45,9 @@ DerivedData/
 *.mlmodel
 *.mlmodelc/
 *.mlpackage/
+!Sources/MangaKitchenApp/Resources/Models/
+!Sources/MangaKitchenApp/Resources/Models/MangaBubbleSegmentation.mlpackage/
+!Sources/MangaKitchenApp/Resources/Models/MangaBubbleSegmentation.mlpackage/**
 
 # Runtime worker binaries
 /RuntimeSupport/QwenImageEditWorker/MangaKitchenQwenImageEditWorker
