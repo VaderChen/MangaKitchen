@@ -27,6 +27,7 @@ DerivedData/
 *.p12
 *.mobileprovision
 /Cert/
+/packDMG.command
 
 # Local application data and generated outputs
 /Artifacts/
