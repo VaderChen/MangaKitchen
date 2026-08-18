@@ -61,10 +61,10 @@
 - `rawSourceText` 保留 VLM、MCP Agent 或人工最初提供的原文；`sourceText` 是目前供詞表比對與翻譯使用的來源文字。
 - `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；新流程的 `true` 代表來源文字已由 VLM、MCP Agent 或人工確認，不會觸發任何 OCR 校正服務。
 - **GUI 路徑**：步驟二由內建 `MangaBubbleSegmentationCoreMLRuntime` 以 Apple Neural Engine 優先產生對話框 BBOX 與氣泡形狀，再以原圖像素連通元件將 `bounds` 與遮罩收斂到實際字形；此時不載入或呼叫圖生文模型。模型無法載入或推論失敗時，才後備至 `MangaBubbleCandidateDetector` 的封閉白區演算法。步驟三才由 `VLMRegionTranscriptionService` 在既有 BBOX 中分類、轉錄，接著翻譯；未載入圖生文模型時不會回退至系統文字辨識。
-- **MCP 路徑**：譯文一律由外部 Agent 提供，後端永不呼叫內建圖生文模型翻譯；區域來源以 `region_source` 切換（`agent` 由 Agent 提供／`local` 用本機封閉區域偵測與 VLM）。後端共用像素遮罩收斂、背景修補與排版。詳見〈MCP 介面〉。
+- **MCP 路徑**：遮罩一律由後端依系統 BBOX／氣泡形狀、Agent 粗框與原圖像素產生，不接受 Agent 直接提交 `mask_polygons`；原文、翻譯、字體、排字方向與字級由外部 Agent 透過 `region.update` 提供。`region_source` 只切換區域粗框來源（`agent` 由 Agent 提供／`local` 用本機 Core ML），兩種模式都不呼叫內建 VLM 翻譯。後端共用像素遮罩收斂、背景修補與 HTML 排版。詳見〈MCP 介面〉。
 - `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形像素遮罩；抗鋸齒遲滯與固定像素膨脹都在像素層完成，不再對逐條矩形做向量描邊，因此輸出的 `dialogue-mask.png` 維持二值邊界。
-- `maskCoverageRatio` 是像素精修保留的前景筆畫比例；`null` 代表精確多邊形由人工／Agent 直接提供，或尚未執行自動檢查。
-- `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線，但仍回報 false，因為它也可能是範圍太窄而被截掉的文字。此時應擴大安全範圍、重算遮罩，或由 Agent／人工補入精確多邊形與畫筆。
+- `maskCoverageRatio` 是系統像素精修保留的前景筆畫比例；`null` 代表尚未執行自動檢查。
+- `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線。若未通過，Agent 應擴大 `bounds`／`bubble_bounds` 後重新執行 `page.detect_masks`，而不是提交遮罩幾何。
 - `bounds` 是涵蓋完整原文的粗搜尋範圍，不直接作為最終遮罩；`bubbleBounds` 必須涵蓋整個對話框外接範圍，`bubbleMaskPolygons` 則是已知的實際氣泡形狀，像素搜尋、遮罩與裁切都不得越界。
 - `bubbleLayoutBounds` 是完全位於氣泡形狀內的最大軸對齊矩形，只供譯文安全排版；不能用它取代 `bubbleBounds`，否則貼近弧線的原文字形可能無法被遮罩。
 - 自動排版方向優先使用像素字形 BBOX 的實際排列偵測結果；只有字形不足或排列模稜兩可時，才回退既有的自動判定規則。明確指定 `writingDirection` 時仍以使用者設定為準。
@@ -281,41 +281,39 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `mangakitchen.region.create` | 新增區域 |
 | `mangakitchen.region.update` | 修改文字／位置／字型／字級 |
 | `mangakitchen.region.remove` | 移除區域 |
-| `mangakitchen.mask.add_stroke` | 添加或擦除遮罩筆劃 |
-| `mangakitchen.mask.undo_stroke` | 復原最後一筆遮罩 |
 
-四個頁面工具的 `page_ids` 可省略；省略或傳空陣列代表工作區全部頁面。長工序若收到 MCP `_meta.progressToken`，會發送 `notifications/progress`。MCP 的 request cancellation 會傳遞至 Swift Task 與模型 Pipeline。
+四個頁面工具的 `page_ids` 可省略；省略或傳空陣列代表工作區全部頁面。長工序若收到 MCP `_meta.progressToken`，會發送 `notifications/progress`。MCP 的 request cancellation 會傳遞至 Swift Task 與模型 Pipeline。MCP 不提供遮罩幾何或筆刷修改工具；遮罩只能由後端依系統 BBOX、Agent 粗框與原圖像素產生。使用者若要人工修正，請在 App 的遮罩頁面操作畫筆與橡皮擦。
 
-**MCP 的譯文一律由 Agent 提供。** 後端永遠不會呼叫內建圖生文（imageToText）模型翻譯 —— 這不是靠旗標控制，而是兩條管線的 translator 位置都固定是 `AgentDrivenTranslator`，結構上就無法退回本機翻譯。實務上 Agent 的翻譯品質也遠勝可在本機執行的小模型。
+**MCP 的翻譯與排版一律由 Agent 提供。** 後端永遠不會呼叫內建圖生文（imageToText）模型翻譯或替 Agent 決定字型、排字方向與字級；Agent 應以 `region.update` 寫入 `translated_text`、`writing_direction`、`font_name`、`font_size`、`font_weight`、`automatic_font_size` 與 `translation_anchor`。遮罩則固定由後端產生。
 
 **區域來源可切換**，用 `workspace.configure` 的 `region_source` 設定（工作區層級，隨 session 保存）：
 
-| `region_source` | 區域（文字位置與原文） | 翻譯 | 適用情境 |
+| `region_source` | 區域粗框／候選來源 | 原文、翻譯與排版 | 適用情境 |
 | --- | --- | --- | --- |
-| `agent`（預設） | 由 Agent 提交；後端不執行本機區域辨識 | Agent | 沒有本機模型，或 Agent 的版面判讀較準 |
-| `local` | 本機 Core ML 氣泡 BBOX 與像素遮罩 | Agent | 想使用本機穩定幾何，再由 Agent 提供原文與譯文 |
+| `agent`（預設） | Agent 提交文字粗框與原文；後端產生像素遮罩 | Agent | Agent 已能判讀文字位置，或沒有本機模型 |
+| `local` | 本機 Core ML 氣泡 BBOX／形狀；後端產生像素遮罩 | Agent | 想使用本機穩定幾何，再由 Agent 提供原文、譯文與排版 |
 
-`agent` 模式使用 `AgentDrivenRegionDetector` 與 `AgentDrivenTranslator`，不啟動本機區域辨識；`local` 模式改用 `MangaBubbleMaskRegionDetector`，但 translator 仍固定為 `AgentDrivenTranslator`。
+`agent` 模式使用 `AgentDrivenRegionDetector` 與 `AgentDrivenTranslator`，不啟動本機區域辨識，但收到 Agent 粗框後仍由 `MangaTextMaskRefiner` 產生遮罩；`local` 模式改用 `MangaBubbleMaskRegionDetector`，translator 仍固定為 `AgentDrivenTranslator`。兩種模式都由 Agent 決定翻譯與排版。
 
 兩種模式下後端共用像素級遮罩收斂、背景修補與排版。`model.load` 可載入 imageToImage 模型供 `page.compose` 的生成式背景修補使用；MCP 的原文與譯文一律由 Agent 提供，`region_source: local` 也不在 `page.detect_masks` 載入 imageToText 模型。
 
-⚠️ 切到 `local` 後，`page.detect_masks` 會**重新產生區域並覆寫**該頁既有結果（含已寫入的譯文）；`agent` 模式則保證不覆寫。
+⚠️ 切到 `local` 後，`page.detect_masks` 會**重新產生系統區域與遮罩並覆寫**該頁既有區域；Agent 提供的翻譯與排版資料不應在沒有使用者要求時被重做。
 
 標準流程：
 
 `region_source: agent`（預設）：
 
-1. `page.detect_masks` —— 不做辨識，只把目前已提交的區域收斂成像素級遮罩並輸出遮罩圖，**不會覆寫**既有區域。頁面還沒有區域時輸出空白遮罩。
-2. 讀取 `mangakitchen://page/{page_id}` 與 `/source`，由 Agent 自行辨識。
-3. `page.supplement_regions` 批次提交區域與原文。
-4. `region.update` 寫入 `translated_text`。
+1. 讀取 `mangakitchen://page/{page_id}` 與 `/source`，由 Agent 辨識文字粗框與原文。
+2. `page.supplement_regions` 批次提交 `bounds`、可選的 `bubble_bounds` 與 `source_text`；後端立即產生像素級遮罩。
+3. 如需重算，呼叫 `page.detect_masks`；此步驟只重建系統遮罩，不接受 `mask_polygons`。
+4. `region.update` 寫入 `translated_text` 與字型、排字方向、字級等排版設定。
 5. `page.compose` 輸出。
 
 `region_source: local`：
 
-1. `page.detect_masks` —— 本機偵測氣泡 BBOX，並產生像素級遮罩；不載入 imageToText 模型。
+1. `page.detect_masks` —— 本機 Core ML 偵測氣泡 BBOX／形狀，並產生像素級遮罩；不載入 imageToText 模型。
 2. 讀取 `mangakitchen://page/{page_id}` 與原圖 resource，由 Agent 取得各區域原文。
-3. `region.update` 寫入 `source_text` 與 `translated_text`。
+3. `region.update` 寫入 `source_text`、`translated_text` 與字型、排字方向、字級等排版設定。
 4. `page.compose` 輸出。
 
 `page.translate` 在此模式下不可用，呼叫會回傳可操作的錯誤訊息，指引改用 `region.update` 寫入譯文。`page.run_full` 只有在所有區域都已有譯文時才會成功，否則會停在同一個錯誤。
@@ -338,7 +336,7 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 
 專案（工作區）層級的列表則用 `mangakitchen.workspace.list` 或 `mangakitchen://workspace/list`。
 
-`page.supplement_regions` 是 Agent 提交區域的主要入口。每筆候選需要涵蓋完整原文的粗 `bounds` 與已確認的 `source_text`，也可提供 `writing_direction` 或精確 `mask_polygons`。`bounds` 要貼著文字本身，它同時決定譯文落點與字級推估；`bubble_bounds` 只在文字確實被封閉對話框、旁白框或標題框包住時提供，代表遮罩與譯文都不得越界。無框台詞（直接排在畫面或放射線上的字）請**省略** `bubble_bounds`：省略代表沒有硬邊界，遮罩改為只依 `maskExpansion` 由文字外擴；為無框文字或整格分鏡杜撰一個框，會把譯文推到分鏡中央。既有區域若帶著錯誤的框，可用 `region.update` 傳 `"bubble_bounds": null` 清除。未提供多邊形時，Swift 後端先分析粗框；若對話框內緣仍有可信前景，就擴大搜尋區重算，最終只保存字形級多邊形。覆蓋率不足或文字碰到搜尋邊界時會在 `warnings` 說明，不會以擴大的矩形冒充精確遮罩。候選若與既有或同批區域重疊超過一半就略過，因此同一請求可以安全重送。接受的區域會保留相容欄位 `ocrTextRefined: true`、合併至頁面、重建完整 mask 並同步 `.str`。
+`page.supplement_regions` 是 Agent 提交區域的主要入口。每筆候選需要涵蓋完整原文的粗 `bounds` 與已確認的 `source_text`，可選 `writing_direction`；`bubble_bounds` 只在文字確實被封閉對話框、旁白框或標題框包住時提供，代表系統遮罩與譯文都不得越界。無框台詞請**省略** `bubble_bounds`，代表沒有硬邊界，系統遮罩改為只依 `maskExpansion` 由文字外擴。`bounds` 要貼著文字本身，因為它同時決定譯文落點與字級推估；候選接受後由 Swift 後端分析原圖像素並產生字形級遮罩。Agent 不提交 `mask_polygons`；若覆蓋率不足，請調整 `bounds`／`bubble_bounds` 後重新執行 `page.detect_masks`。候選若與既有或同批區域重疊超過一半就略過，因此同一請求可以安全重送。接受的區域會保留相容欄位 `ocrTextRefined: true`、合併至頁面並同步 `.str`。
 
 對已存在但來源文字不完整的區域，Agent 使用 `region.update` 寫回已確認的 `source_text`。修改來源文字而未同時提供譯文時，既有譯文會清空，避免沿用失效翻譯。
 
@@ -350,7 +348,7 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `translation_anchor` | 譯文落點還原成預設（對話框中心／原文位置） |
 | `font_size` | 恢復自動配適字級，等同 `automatic_font_size: true` |
 
-其餘欄位維持「省略＝不變」。`mask_polygons` 傳空陣列 `[]` 即可清除並讓後端重新精修。
+其餘欄位維持「省略＝不變」。遮罩不提供直接幾何更新欄位；修改 `bounds`、`bubble_bounds` 或 `source_text` 後，系統會自動清除舊遮罩並重新精修。
 
 `page.supplement_regions` 的 `regions` 格式如下，座標皆為左上原點的 0...1 正規化值：
 

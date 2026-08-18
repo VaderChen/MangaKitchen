@@ -171,9 +171,9 @@ public actor ComicTranslationPipeline {
         return urls.background
     }
 
-    /// 將外部 Agent 提供的文字粗框收斂成像素級文字遮罩，不重跑模型偵測。
-    /// Agent 直接提供且未標示為自動精修的多邊形會原樣保留；自動精修未通過
-    /// 覆蓋檢查時則重新運算，避免沿用不完整遮罩。
+    /// 將外部提供的文字粗框收斂成像素級文字遮罩，不重跑模型偵測。
+    /// 已完成的系統遮罩會保留；自動精修未通過覆蓋檢查時則重新運算，避免沿用
+    /// 不完整遮罩。
     public func refineMasks(
         page: ComicPage,
         regions: [DialogueRegion]

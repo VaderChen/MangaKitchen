@@ -85,12 +85,12 @@ Enable MCP under Settings → MCP, configure the port and client IP/CIDR allowli
 For a new, unprocessed project without a local image-to-text model, an Agent can complete translation as follows:
 
 1. Call `mangakitchen.workspace.open` and retain the returned `workspace_id`.
-2. Call `mangakitchen.page.detect_masks` to build masks for regions already submitted by the Agent; a new page initially receives an empty mask.
-3. Read the page and source-image resources, then batch-submit rough text boxes and source text through `mangakitchen.page.supplement_regions`. The backend refines glyph masks, removes duplicates, and synchronizes `.str`; the Agent may alternatively supply exact polygons.
-4. Translate each region and write `source_text`, translated text, and typesetting settings through `mangakitchen.region.update`.
+2. Read the page and source-image resources, then batch-submit rough text boxes and source text through `mangakitchen.page.supplement_regions`; the backend generates masks from the original pixels.
+3. Call `mangakitchen.page.detect_masks` when a mask needs to be recomputed; the Agent does not submit `mask_polygons`.
+4. Translate each region and write `source_text`, translated text, font, writing direction, and size settings through `mangakitchen.region.update`.
 5. Call `mangakitchen.page.compose` to restore the background and generate output.
 
-If a local `imageToText` model is loaded, set `region_source` to `local` to use local Core ML BBOX/shape detection and pixel masks in step 2. MCP source text and translations are still always supplied by the Agent through `region.update`. Pure Agent mode uses `detect_masks → supplement_regions → region.update → compose`.
+If local model resources are available, set `region_source` to `local` to use local Core ML BBOX/shape detection and system-generated pixel masks in step 2. MCP source text, translations, and typesetting are still always supplied by the Agent through `region.update`. Both modes keep mask generation in the backend; pure Agent mode uses `supplement_regions → region.update → compose`.
 
 For an existing project, the Agent should inspect workspace, page, and `.str` resources plus their actual artifacts, then call only the required tools. A `maskReady` page with a valid mask can begin with translation or `region.update`; a `translationReady` page with complete translated text can go directly to `compose`; and a completed page can update one region and recompose without rerunning region or mask detection. If validation finds missing data, the Agent walks backward using the rules above. In pure Agent mode, falling back to step 3 means the Agent supplies translations through `region.update`; it does not force a local model.
 

@@ -85,12 +85,12 @@ MangaKitchen에는 두 가지 사용 방식이 있습니다. 추론과 작업 �
 로컬 이미지→텍스트 모델 없이 새 프로젝트를 번역하는 예:
 
 1. `mangakitchen.workspace.open`을 호출하고 반환된 `workspace_id`를 유지합니다.
-2. `mangakitchen.page.detect_masks`로 Agent가 이미 제출한 영역의 마스크를 생성합니다. 새 페이지는 처음에 빈 마스크를 받습니다.
-3. 페이지와 원본 이미지 resource를 읽고 현재 영역과 비교합니다. 누락된 텍스트가 있으면 `mangakitchen.page.supplement_regions`로 거친 영역과 원문을 일괄 제출합니다. backend는 글자 마스크 정밀화, 중복 제거 및 `.str` 동기화를 수행하며 Agent가 정확한 polygon을 직접 제공할 수도 있습니다.
-4. 각 영역을 번역하고 `mangakitchen.region.update`로 `source_text`, 번역문 및 조판 설정을 기록합니다.
+2. 페이지와 원본 이미지 resource를 읽고 `mangakitchen.page.supplement_regions`로 문자 영역의 거친 상자와 원문을 일괄 제출합니다. 마스크는 backend가 원본 이미지 픽셀에서 생성합니다.
+3. 마스크를 다시 계산해야 하면 `mangakitchen.page.detect_masks`를 호출합니다. Agent는 `mask_polygons`를 제출하지 않습니다.
+4. 각 영역을 번역하고 `mangakitchen.region.update`로 `source_text`, 번역문, 글꼴, 쓰기 방향 및 크기 조판 설정을 기록합니다.
 5. `mangakitchen.page.compose`로 배경 복원과 출력을 수행합니다.
 
-로컬 `imageToText` 모델이 로드되어 있으면 `region_source`를 `local`로 설정하여 2단계에서 로컬 Core ML BBOX／형상 감지와 픽셀 마스크를 사용할 수 있습니다. MCP 원문과 번역문은 여전히 Agent가 `region.update`로 제공합니다. 순수 Agent 모드는 `detect_masks → supplement_regions → region.update → compose`를 사용합니다.
+로컬 모델을 사용할 수 있으면 `region_source`를 `local`로 설정하여 2단계에서 로컬 Core ML BBOX／형상 감지와 시스템 생성 픽셀 마스크를 사용할 수 있습니다. MCP 원문, 번역문 및 조판은 여전히 Agent가 `region.update`로 제공합니다. 두 모드 모두 마스크는 backend가 생성하며, 순수 Agent 모드는 `supplement_regions → region.update → compose`를 사용합니다.
 
 기존 프로젝트에서는 Agent가 workspace, page, `.str` resource와 실제 산출물을 먼저 검사한 뒤 필요한 tool만 호출합니다. 유효한 마스크가 있는 `maskReady` 페이지는 번역 또는 `region.update`부터, 완전한 번역문이 있는 `translationReady` 페이지는 `compose`부터 시작할 수 있습니다. 자료가 누락되면 위 규칙에 따라 단계별로 되돌아갑니다. 순수 Agent 모드에서 3단계로 돌아갈 때는 로컬 모델을 강제하지 않고 Agent가 번역하여 `region.update`에 기록합니다.
 

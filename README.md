@@ -85,12 +85,12 @@ MangaKitchen 有兩種操作方式。它們只改變「誰負責推論與編排�
 對全新、尚未處理的專案，不下載本機圖生文模型時，Agent 可依下列方式完成翻譯：
 
 1. 呼叫 `mangakitchen.workspace.open` 建立工作區並取得 `workspace_id`。
-2. 呼叫 `mangakitchen.page.detect_masks` 建立目前 Agent 已提交區域的遮罩；全新頁面會先得到空白遮罩。
-3. 讀取頁面與原圖 resource，以 `mangakitchen.page.supplement_regions` 批次送入文字粗框與原文。後端會自動精修字形遮罩、去除重複區域並同步 `.str`；Agent 也可直接提供精確多邊形。
-4. 翻譯各區原文，並以 `mangakitchen.region.update` 寫回每區的 `source_text`、譯文與排版設定。
+2. 讀取頁面與原圖 resource，以 `mangakitchen.page.supplement_regions` 批次送入文字粗框與原文；遮罩由後端依原圖像素自動產生。
+3. 如需重算，呼叫 `mangakitchen.page.detect_masks`；Agent 不提供 `mask_polygons`。
+4. 翻譯各區原文，並以 `mangakitchen.region.update` 寫回每區的 `source_text`、譯文、字體、排字方向與字級設定。
 5. 呼叫 `mangakitchen.page.compose` 完成背景修補與輸出。
 
-若本機也已載入 `imageToText` 模型，可將 `region_source` 設為 `local`，讓步驟二使用本機氣泡 BBOX 與像素遮罩；MCP 的原文與譯文仍由 Agent 以 `region.update` 提供。純 Agent 模式採用 `detect_masks → supplement_regions → region.update → compose`。
+若本機也已載入模型，可將 `region_source` 設為 `local`，讓步驟二使用本機 Core ML 氣泡 BBOX／形狀與系統像素遮罩；MCP 的原文、譯文與排版仍由 Agent 以 `region.update` 提供。兩種模式的遮罩都由系統產生，純 Agent 模式採用 `supplement_regions → region.update → compose`。
 
 對既有專案，Agent 應先讀取 workspace、page 與 `.str` resource 判斷目前進度及實際產物，再只呼叫需要的 tool。例如 `maskReady` 且遮罩檔有效時可直接從翻譯或 `region.update` 開始，`translationReady` 且譯文完整時可直接 `compose`，已輸出的頁面也能只修改單一區域後重新合成。若檢查發現資料缺失，Agent 必須依上述規則逐級回溯；純 Agent 模式回溯到步驟三時，由 Agent 補譯並呼叫 `region.update`，不強制改用本機模型。
 

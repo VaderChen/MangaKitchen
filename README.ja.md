@@ -85,12 +85,12 @@ MangaKitchenには2つの利用方法があります。違うのは推論と操�
 ローカル画像テキスト化モデルを使わず、新しい未処理プロジェクトを翻訳する例：
 
 1. `mangakitchen.workspace.open`を呼び、返された`workspace_id`を保持します。
-2. `mangakitchen.page.detect_masks`でAgentが既に提出した領域のマスクを生成します。新規ページでは最初に空のマスクが作られます。
-3. ページと原稿画像resourceを読み、現在の領域と比較します。文字や領域の漏れがあれば、`mangakitchen.page.supplement_regions`で粗い矩形と原文を一括送信します。backendは文字形状maskの精修、重複除去、`.str`同期を行い、Agentから正確なpolygonを直接指定することもできます。
-4. 各領域を翻訳し、`mangakitchen.region.update`で`source_text`、訳文、組版設定を書き戻します。
+2. ページと原稿画像resourceを読み、`mangakitchen.page.supplement_regions`で文字の粗い矩形と原文を一括送信します。maskはbackendが原画像ピクセルから生成します。
+3. maskを再計算する場合は`mangakitchen.page.detect_masks`を呼びます。Agentは`mask_polygons`を送信しません。
+4. 各領域を翻訳し、`mangakitchen.region.update`で`source_text`、訳文、フォント、書字方向、サイズなどの組版設定を書き戻します。
 5. `mangakitchen.page.compose`で背景修復と出力を行います。
 
-ローカル`imageToText`モデルが読み込まれている場合、`region_source`を`local`に設定するとステップ2でローカルCore MLのBBOX／形状検出とピクセルマスクを利用できます。MCPの原文と訳文は引き続きAgentが`region.update`で提供します。純粋なAgentモードは`detect_masks → supplement_regions → region.update → compose`を使用します。
+ローカルモデルが利用できる場合、`region_source`を`local`に設定するとステップ2でローカルCore MLのBBOX／形状検出とシステム生成のピクセルマスクを利用できます。MCPの原文、訳文、組版は引き続きAgentが`region.update`で提供します。どちらのモードでもmaskはbackendが生成し、純粋なAgentモードは`supplement_regions → region.update → compose`を使用します。
 
 既存プロジェクトでは、Agentはworkspace、page、`.str` resourceと実際の生成物を先に確認し、必要なtoolだけを呼びます。有効なマスクを持つ`maskReady`ページは翻訳または`region.update`から、完全な訳文を持つ`translationReady`ページは`compose`から開始できます。データ不足時は上記の規則で段階的に戻ります。純Agentモードでステップ3へ戻る場合は、ローカルモデルを強制せず、Agentが翻訳して`region.update`へ書き込みます。
 

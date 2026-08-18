@@ -8,7 +8,7 @@ struct MCPWorkspaceState: Codable, Sendable {
     var sourceDirectoryURL: URL?
     var outputDirectoryURL: URL?
     var options: ProcessingOptions
-    /// 區域來源；翻譯永遠由 Agent 負責，不受此設定影響。
+    /// 區域候選來源；遮罩永遠由系統產生，翻譯與排版永遠由 Agent 負責。
     var regionSource: MCPRegionSource
     var glossary: ProjectGlossary
     var pages: [ComicPage]
@@ -81,7 +81,7 @@ struct MCPWorkspacePageList: Codable, Sendable {
 
 struct MCPWorkspaceConfiguration: Codable, Sendable {
     var options: ProcessingOptions
-    /// 區域來源；翻譯永遠由 Agent 負責，不受此設定影響。
+    /// 區域候選來源；遮罩永遠由系統產生，翻譯與排版永遠由 Agent 負責。
     var regionSource: MCPRegionSource
 }
 
@@ -96,7 +96,6 @@ struct MCPAgentRegionProposal: Sendable {
     var bounds: NormalizedRect
     var sourceText: String
     var bubbleBounds: NormalizedRect?
-    var maskPolygons: [[NormalizedPoint]]?
     var writingDirection: WritingDirection?
 }
 
@@ -123,10 +122,9 @@ actor MCPWorkflowService {
     typealias Progress = @Sendable (_ completed: Double, _ message: String) -> Void
 
     private let models: ModelRuntimeHub
-    /// 區域也交給 Agent：辨識與語意判讀全部封死。
+    /// Agent 提供區域粗框與文字；遮罩由系統產生。
     private let agentPipeline: ComicTranslationPipeline
-    /// 區域由本機封閉區域演算法定位，再由 VLM 分類與轉錄。
-    /// 翻譯位置同樣是 AgentDrivenTranslator —— 兩條管線都不會用本機模型翻譯。
+    /// 區域由本機 Core ML BBOX／氣泡形狀定位；文字與排版仍由 Agent 提供。
     private let localDetectionPipeline: ComicTranslationPipeline
     private var pipeline: ComicTranslationPipeline {
         switch regionSource {
@@ -642,9 +640,6 @@ actor MCPWorkflowService {
             if let bubbleBounds, bubbleBounds.width <= 0 || bubbleBounds.height <= 0 {
                 throw MCPServiceError.invalidArguments("regions[\(offset)].bubble_bounds 裁切至圖片後不可為空。")
             }
-            let polygons = proposal.maskPolygons?
-                .map { $0.map { $0.clamped() } }
-                .filter { $0.count >= 3 } ?? []
             var style = options.defaultStyle
             if let writingDirection = proposal.writingDirection {
                 style.writingDirection = writingDirection
@@ -656,10 +651,9 @@ actor MCPWorkflowService {
                 ocrTextRefined: true,
                 confidence: 0.5,
                 style: style,
-                maskPolygons: polygons,
-                maskRefinementApplied: !polygons.isEmpty,
+                maskRefinementApplied: false,
                 maskCoverageRatio: nil,
-                maskCoverageComplete: !polygons.isEmpty
+                maskCoverageComplete: false
             ))
             occupiedBounds.append(bounds)
         }
@@ -678,7 +672,7 @@ actor MCPWorkflowService {
             guard !region.maskCoverageComplete else { return nil }
             let ratio = region.maskCoverageRatio.map { String(format: "%.1f%%", $0 * 100) }
                 ?? "無法計算"
-            return "區域 \(region.id.uuidString) 的像素遮罩覆蓋檢查未通過（\(ratio)）；請擴大 bounds／bubble_bounds 後重算，或提交精確 mask_polygons。"
+            return "區域 \(region.id.uuidString) 的像素遮罩覆蓋檢查未通過（\(ratio)）；請擴大 bounds／bubble_bounds 後重新執行 page.detect_masks。"
         }
         pages[pageIndex].regions.append(contentsOf: accepted)
         let maskURL = try await pipeline.regenerateMask(
@@ -709,13 +703,11 @@ actor MCPWorkflowService {
         translationAnchor: MCPFieldUpdate<NormalizedPoint>,
         bounds: NormalizedRect?,
         bubbleBounds: MCPFieldUpdate<NormalizedRect>,
-        maskPolygons: [[NormalizedPoint]]?,
         fontName: String?,
         fontSize: MCPFieldUpdate<Double>,
         fontWeight: DialogueFontWeight?,
         useAutomaticFontSize: Bool?,
-        writingDirection: WritingDirection?,
-        automaticMaskEnabled: Bool?
+        writingDirection: WritingDirection?
     ) async throws -> DialogueRegion {
         try requireWorkspace(workspaceID)
         defer { saveActiveWorkspace() }
@@ -748,15 +740,6 @@ actor MCPWorkflowService {
                 .applied(to: pages[pageIndex].regions[regionIndex].bubbleBounds)?
                 .clamped()
         }
-        if let maskPolygons {
-            let sanitizedPolygons = maskPolygons
-                .map { $0.map { $0.clamped() } }
-                .filter { $0.count >= 3 }
-            pages[pageIndex].regions[regionIndex].maskPolygons = sanitizedPolygons
-            pages[pageIndex].regions[regionIndex].maskRefinementApplied = !sanitizedPolygons.isEmpty
-            pages[pageIndex].regions[regionIndex].maskCoverageRatio = nil
-            pages[pageIndex].regions[regionIndex].maskCoverageComplete = !sanitizedPolygons.isEmpty
-        }
         if let fontName, !fontName.isEmpty { pages[pageIndex].regions[regionIndex].style.fontName = fontName }
         // automatic_font_size: true 與 font_size: null 等價，都是還原自動配適。
         if useAutomaticFontSize == true {
@@ -772,16 +755,10 @@ actor MCPWorkflowService {
         if let writingDirection {
             pages[pageIndex].regions[regionIndex].style.writingDirection = writingDirection
         }
-        if let automaticMaskEnabled {
-            pages[pageIndex].regions[regionIndex].automaticMaskEnabled = automaticMaskEnabled
-        }
-        let shouldRegenerateMask = bounds != nil
+        let shouldRegenerateMask = sourceText != nil
+            || bounds != nil
             || bubbleBounds.isChange
-            || maskPolygons != nil
-            || automaticMaskEnabled != nil
-        if maskPolygons == nil, bounds != nil || bubbleBounds.isChange {
-            // 幾何範圍變更後，舊多邊形不再代表目前的粗框／對話框。
-            // 先清空，否則 pipeline 會把它視為 Agent 提供的精確遮罩而略過重算。
+        if sourceText != nil || bounds != nil || bubbleBounds.isChange {
             pages[pageIndex].regions[regionIndex].maskPolygons = []
             pages[pageIndex].regions[regionIndex].maskRefinementApplied = false
             pages[pageIndex].regions[regionIndex].maskCoverageRatio = nil
@@ -823,8 +800,15 @@ actor MCPWorkflowService {
             style: options.defaultStyle
         )
         pages[pageIndex].regions.append(region)
+        let refined = try await pipeline.refineMasks(
+            page: pages[pageIndex],
+            regions: [region]
+        )
+        if let refinedRegion = refined.first {
+            pages[pageIndex].regions[pages[pageIndex].regions.count - 1] = refinedRegion
+        }
         try await refreshEditedPage(pageIndex: pageIndex)
-        return region
+        return pages[pageIndex].regions[pages[pageIndex].regions.count - 1]
     }
 
     func removeRegion(workspaceID: UUID, pageID: UUID, regionID: UUID) async throws -> ComicPage {
@@ -837,45 +821,6 @@ actor MCPWorkflowService {
         pages[pageIndex].regions.remove(at: regionIndex)
         try await refreshEditedPage(pageIndex: pageIndex)
         return pages[pageIndex]
-    }
-
-    func addStroke(
-        workspaceID: UUID,
-        pageID: UUID,
-        regionID: UUID,
-        mode: MaskStrokeMode,
-        diameter: Double,
-        points: [NormalizedPoint]
-    ) async throws -> DialogueRegion {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
-        guard !points.isEmpty else { throw MCPServiceError.invalidArguments("points 不可為空。") }
-        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
-              let regionIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
-            throw MCPServiceError.regionNotFound
-        }
-        pages[pageIndex].regions[regionIndex].maskStrokes.append(MaskStroke(
-            mode: mode,
-            points: points,
-            diameter: diameter
-        ))
-        try await refreshEditedPage(pageIndex: pageIndex)
-        return pages[pageIndex].regions[regionIndex]
-    }
-
-    func undoStroke(workspaceID: UUID, pageID: UUID, regionID: UUID) async throws -> DialogueRegion {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
-        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
-              let regionIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
-            throw MCPServiceError.regionNotFound
-        }
-        guard !pages[pageIndex].regions[regionIndex].maskStrokes.isEmpty else {
-            throw MCPServiceError.invalidArguments("這個區域沒有可復原的筆劃。")
-        }
-        pages[pageIndex].regions[regionIndex].maskStrokes.removeLast()
-        try await refreshEditedPage(pageIndex: pageIndex)
-        return pages[pageIndex].regions[regionIndex]
     }
 
     func state() async -> MCPWorkspaceState {
@@ -969,9 +914,10 @@ actor MCPWorkflowService {
     ) async throws {
         progress(.detectingText, 0)
         // 絕不覆寫 Agent 已提供的區域：這一步只重算遮罩，不做辨識。
+        let regionsForRefinement = Self.resetMaskGeometry(pages[pageIndex].regions)
         let refined = try await pipeline.refineMasks(
             page: pages[pageIndex],
-            regions: pages[pageIndex].regions
+            regions: regionsForRefinement
         )
         progress(.detectingText, 0.6)
         let maskURL = try await pipeline.regenerateMask(
@@ -989,19 +935,28 @@ actor MCPWorkflowService {
         progress(.maskReady, 1)
     }
 
-    /// 本機區域模式：只以氣泡 BBOX 與像素精修建立遮罩。
-    /// 這一步會**重新產生區域並覆寫**該頁既有結果（含已寫入的譯文）。
+    /// 本機區域模式：只以氣泡 BBOX 與像素精修建立遮罩，並保留 Agent 已寫入的資料。
     private func detectByLocalPipeline(
         pageIndex: Int,
         progress: @escaping PagePipelineProgress
     ) async throws {
+        let previousRegions = pages[pageIndex].regions
         let result = try await pipeline.detectMasks(
             page: pages[pageIndex],
             options: options,
             progress: progress
         )
-        pages[pageIndex].regions = result.regions
-        pages[pageIndex].maskURL = result.maskURL
+        let regions = Self.mergeAgentEditingState(
+            from: previousRegions,
+            into: result.regions
+        )
+        let maskURL = try await pipeline.regenerateMask(
+            page: pages[pageIndex],
+            regions: regions,
+            options: options
+        )
+        pages[pageIndex].regions = regions
+        pages[pageIndex].maskURL = maskURL
         pages[pageIndex].backgroundURL = nil
         pages[pageIndex].outputURL = nil
         pages[pageIndex].stage = .maskReady
@@ -1080,6 +1035,54 @@ actor MCPWorkflowService {
         let candidateArea = max(candidate.width * candidate.height, .leastNonzeroMagnitude)
         let existingArea = max(existing.width * existing.height, .leastNonzeroMagnitude)
         return overlapArea / candidateArea >= 0.5 && overlapArea / existingArea >= 0.5
+    }
+
+    private static func mergeAgentEditingState(
+        from previousRegions: [DialogueRegion],
+        into detectedRegions: [DialogueRegion]
+    ) -> [DialogueRegion] {
+        var matchedRegionIDs = Set<UUID>()
+        return detectedRegions.map { detectedRegion in
+            let match = previousRegions
+                .filter { !matchedRegionIDs.contains($0.id) }
+                .compactMap { previousRegion -> (region: DialogueRegion, score: Double)? in
+                    let intersection = detectedRegion.bounds.intersection(with: previousRegion.bounds)
+                    let intersectionArea = intersection.width * intersection.height
+                    let detectedArea = detectedRegion.bounds.width * detectedRegion.bounds.height
+                    let previousArea = previousRegion.bounds.width * previousRegion.bounds.height
+                    let minimumArea = min(detectedArea, previousArea)
+                    guard intersectionArea > 0, minimumArea > 0 else { return nil }
+                    return (previousRegion, intersectionArea / minimumArea)
+                }
+                .max { left, right in left.score < right.score }
+
+            guard let match, match.score >= 0.25 else { return detectedRegion }
+            matchedRegionIDs.insert(match.region.id)
+            var mergedRegion = detectedRegion
+            mergedRegion.id = match.region.id
+            if !match.region.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                mergedRegion.rawSourceText = match.region.rawSourceText ?? match.region.sourceText
+                mergedRegion.sourceText = match.region.sourceText
+                mergedRegion.ocrTextRefined = match.region.ocrTextRefined
+            }
+            mergedRegion.translatedText = match.region.translatedText
+            mergedRegion.translationAnchor = match.region.translationAnchor
+            mergedRegion.translationBounds = match.region.translationBounds
+            mergedRegion.style = match.region.style
+            mergedRegion.maskStrokes = match.region.maskStrokes
+            return mergedRegion
+        }
+    }
+
+    private static func resetMaskGeometry(_ regions: [DialogueRegion]) -> [DialogueRegion] {
+        regions.map { region in
+            var resetRegion = region
+            resetRegion.maskPolygons = []
+            resetRegion.maskRefinementApplied = false
+            resetRegion.maskCoverageRatio = nil
+            resetRegion.maskCoverageComplete = false
+            return resetRegion
+        }
     }
 
     private func persistStringTable(pageID: UUID) async throws {

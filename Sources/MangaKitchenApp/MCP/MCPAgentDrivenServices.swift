@@ -12,10 +12,9 @@ import MangaKitchenCore
 /// **翻譯不在此列**：兩種模式下譯文都固定由 Agent 以 region.update 寫入，
 /// 後端永遠不會呼叫內建圖生文模型翻譯。
 enum MCPRegionSource: String, Codable, Sendable, CaseIterable {
-    /// 全部交給 Agent：後端不執行本機封閉區域偵測或 VLM 轉錄。
+    /// 區域粗框與原文由 Agent 提供；遮罩仍由後端依粗框與原圖像素產生。
     case agent
-    /// 區域由本機封閉區域演算法定位，再由已載入的圖生文模型分類與轉錄；
-    /// 只有翻譯交給 Agent。座標不由模型產生，因此不會有模型座標漂移。
+    /// 區域 BBOX 與氣泡形狀由本機 Core ML 定位；原文、翻譯與排版仍由 Agent 提供。
     case local
 }
 
