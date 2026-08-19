@@ -55,57 +55,64 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
         let regionCount = max(1, pendingRegions.count)
         for (offset, region) in pendingRegions.enumerated() {
             try Task.checkCancellation()
-            let cropURL = temporaryDirectoryURL
-                .appendingPathComponent(String(format: "crop-%03d.png", offset + 1))
-            try Self.writeCrop(source: source, region: region, to: cropURL)
-            var item: TranscriptItem?
-            for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
-                try Task.checkCancellation()
-                let response = try await model.generateText(
-                    imageURL: cropURL,
-                    prompt: Self.prompt(languageHint: languageHint, attempt: attempt),
-                    maximumOutputTokens: 512,
-                    progress: { value in
-                        let local = VLMStructuredResponseDecoder.mappedProgress(
-                            attempt: attempt,
-                            value: value
-                        )
-                        progress((Double(offset) + local) / Double(regionCount))
+            do {
+                let cropURL = temporaryDirectoryURL
+                    .appendingPathComponent(String(format: "crop-%03d.png", offset + 1))
+                try Self.writeCrop(source: source, region: region, to: cropURL)
+                var item: TranscriptItem?
+                for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
+                    try Task.checkCancellation()
+                    let response = try await model.generateText(
+                        imageURL: cropURL,
+                        prompt: Self.prompt(languageHint: languageHint, attempt: attempt),
+                        maximumOutputTokens: 512,
+                        progress: { value in
+                            let local = VLMStructuredResponseDecoder.mappedProgress(
+                                attempt: attempt,
+                                value: value
+                            )
+                            progress((Double(offset) + local) / Double(regionCount))
+                        }
+                    )
+                    let decodedItems = VLMStructuredResponseDecoder.decodeArrays(
+                        TranscriptItem.self,
+                        from: response
+                    )
+                    for returnedItems in decodedItems {
+                        if let matchedItem = returnedItems.first(where: { $0.index == 1 }) {
+                            item = matchedItem
+                            break
+                        }
                     }
-                )
-                let decodedItems = VLMStructuredResponseDecoder.decodeArrays(
-                    TranscriptItem.self,
-                    from: response
-                )
-                for returnedItems in decodedItems {
-                    if let matchedItem = returnedItems.first(where: { $0.index == 1 }) {
-                        item = matchedItem
-                        break
-                    }
+                    if item != nil { break }
                 }
-                if item != nil { break }
-            }
-            guard let item else {
-                throw VLMRegionTranscriptionError.invalidModelResponse
-            }
-            let kind = item.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard Self.isAcceptedKind(kind), !text.isEmpty, !Self.isSoundEffectTranscript(text) else {
+                guard let item else {
+                    throw VLMRegionTranscriptionError.invalidModelResponse
+                }
+                let kind = item.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard Self.isAcceptedKind(kind), !text.isEmpty, !Self.isSoundEffectTranscript(text) else {
+                    progress(Double(offset + 1) / Double(regionCount))
+                    continue
+                }
+                var recognized = region
+                recognized.rawSourceText = text
+                recognized.sourceText = text
+                recognized.ocrTextRefined = true
+                recognized.detectedWritingDirection = item.direction
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                    .flatMap(WritingDirection.init(rawValue:))
+                    ?? recognized.detectedWritingDirection
+                recognizedByID[recognized.id] = recognized
                 progress(Double(offset + 1) / Double(regionCount))
-                continue
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // 單一區域無法裁切、辨識或解析時保留原區域，繼續處理下一區。
+                progress(Double(offset + 1) / Double(regionCount))
             }
-            var recognized = region
-            recognized.rawSourceText = text
-            recognized.sourceText = text
-            recognized.ocrTextRefined = true
-            recognized.detectedWritingDirection = item.direction
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-                .flatMap(WritingDirection.init(rawValue:))
-                ?? recognized.detectedWritingDirection
-            recognizedByID[recognized.id] = recognized
-            progress(Double(offset + 1) / Double(regionCount))
         }
-        return regions.compactMap { recognizedByID[$0.id] }
+        return regions.map { recognizedByID[$0.id] ?? $0 }
     }
 
     private static func isAcceptedKind(_ kind: String) -> Bool {

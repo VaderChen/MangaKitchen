@@ -39,6 +39,7 @@ struct AgentDrivenTranslator: RegionTranslating {
         pageURL: URL,
         targetLanguageCode: String,
         glossaryTerms: [ResolvedGlossaryTerm],
+        regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
         throw MCPServiceError.agentTranslationRequired

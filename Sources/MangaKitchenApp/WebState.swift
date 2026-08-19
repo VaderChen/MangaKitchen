@@ -21,13 +21,16 @@ struct WebPage: Encodable {
     var stage: PageProcessingStage
     var progress: Double
     var processingActivity: PageProcessingActivity?
+    var processingRegionIndex: Int?
+    var processingRegionCount: Int?
     var errorMessage: String?
 
     init(
         page: ComicPage,
         maskRevision: UInt64 = 0,
         maskRedoRegionIDs: [UUID] = [],
-        processingActivity: PageProcessingActivity? = nil
+        processingActivity: PageProcessingActivity? = nil,
+        processingRegionProgress: ProcessingRegionProgress? = nil
     ) {
         let maskURL = Self.existingFileURL(page.maskURL)
         let backgroundURL = Self.existingFileURL(page.backgroundURL)
@@ -61,6 +64,8 @@ struct WebPage: Encodable {
         stage = page.stage
         progress = page.progress
         self.processingActivity = processingActivity
+        processingRegionIndex = processingRegionProgress?.current
+        processingRegionCount = processingRegionProgress?.total
         errorMessage = page.errorMessage
     }
 
@@ -289,7 +294,8 @@ struct WebAppState: Encodable {
                 page: $0,
                 maskRevision: store.maskRevision(pageID: $0.id),
                 maskRedoRegionIDs: store.maskRedoRegionIDs(pageID: $0.id),
-                processingActivity: store.processingActivities[$0.id]
+                processingActivity: store.processingActivities[$0.id],
+                processingRegionProgress: store.processingRegionProgress[$0.id]
             )
         }
         selectedPageID = store.selectedPageID

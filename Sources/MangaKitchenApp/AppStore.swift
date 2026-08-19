@@ -3,6 +3,11 @@ import Foundation
 import MangaKitchenCore
 import MangaKitchenRuntime
 
+struct ProcessingRegionProgress: Sendable {
+    var current: Int
+    var total: Int
+}
+
 @MainActor
 final class AppStore: ObservableObject {
     @Published private(set) var projects: [ComicProjectSummary] = []
@@ -21,6 +26,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var modelDownloadState: ModelDownloadState?
     @Published private(set) var modelLoadingState: ModelLoadingState?
     @Published private(set) var processingActivities: [UUID: PageProcessingActivity] = [:]
+    @Published private(set) var processingRegionProgress: [UUID: ProcessingRegionProgress] = [:]
     @Published var statusMessage: String?
 
     private let models: ModelRuntimeHub?
@@ -691,6 +697,7 @@ final class AppStore: ObservableObject {
         }
         processingTask?.cancel()
         cancelledPageIDs.forEach { processingActivities[$0] = nil }
+        cancelledPageIDs.forEach { processingRegionProgress[$0] = nil }
         cancelledPageIDs.forEach(restoreStablePageStateAfterCancellation)
         statusMessage = processingTask == nil
             ? "目前沒有執行中的工作。"
@@ -758,6 +765,7 @@ final class AppStore: ObservableObject {
                           self.batchJobs[currentIndex].status == .running else { break }
                     self.batchJobs[currentIndex].currentPageID = pageID
                     self.processingActivities[pageID] = .preparingPage
+                    self.processingRegionProgress[pageID] = nil
                     do {
                         try await self.run(
                             operation,
@@ -768,16 +776,19 @@ final class AppStore: ObservableObject {
                         guard let resultIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }),
                               self.batchJobs[resultIndex].status == .running else {
                             self.processingActivities[pageID] = nil
+                            self.processingRegionProgress[pageID] = nil
                             break
                         }
                         self.batchJobs[resultIndex].completedPageIDs.append(pageID)
                     } catch is CancellationError {
                         self.processingActivities[pageID] = nil
+                        self.processingRegionProgress[pageID] = nil
                         break
                     } catch {
                         guard let resultIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }),
                               self.batchJobs[resultIndex].status == .running else {
                             self.processingActivities[pageID] = nil
+                            self.processingRegionProgress[pageID] = nil
                             break
                         }
                         self.batchJobs[resultIndex].failures.append(
@@ -786,6 +797,7 @@ final class AppStore: ObservableObject {
                         self.markFailed(pageID: pageID, message: error.localizedDescription)
                     }
                     self.processingActivities[pageID] = nil
+                    self.processingRegionProgress[pageID] = nil
                     self.schedulePersistence()
                 }
 
@@ -1396,11 +1408,15 @@ final class AppStore: ObservableObject {
                 options: options,
                 glossary: glossary,
                 activity: activityHandler(pageID: pageID),
+                regionProgress: regionProgressHandler(pageID: pageID),
                 progress: progressHandler(pageID: pageID)
             )
         }
         try Task.checkCancellation()
         guard let translatedIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        let untranslatedRegionCount = regions.count(where: {
+            $0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        })
         pages[translatedIndex].regions = regions
         pages[translatedIndex].stage = .translationReady
         pages[translatedIndex].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
@@ -1428,9 +1444,15 @@ final class AppStore: ObservableObject {
         pages[index].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
         pages[index].errorMessage = nil
         try await persistStringTableNow(pageID: pageID)
-        statusMessage = composition.warnings.isEmpty
+        var warnings = composition.warnings
+        if untranslatedRegionCount > 0 {
+            warnings.append(
+                "有 \(untranslatedRegionCount) 個文字區域翻譯失敗，已保留原有譯文並繼續處理。"
+            )
+        }
+        statusMessage = warnings.isEmpty
             ? "第 \(pages[index].index) 頁翻譯與自動排版完成，可逐區確認或調整。"
-            : composition.warnings.joined(separator: "\n")
+            : warnings.joined(separator: "\n")
         schedulePersistence()
     }
 
@@ -1505,6 +1527,21 @@ final class AppStore: ObservableObject {
         { [weak self] activity in
             Task { @MainActor [weak self] in
                 self?.updateProcessingActivity(pageID: pageID, activity: activity)
+            }
+        }
+    }
+
+    private func regionProgressHandler(pageID: UUID) -> PageRegionProgress {
+        { [weak self] current, total in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.batchJobs.contains(where: {
+                    $0.status == .running && $0.currentPageID == pageID
+                }) else { return }
+                self.processingRegionProgress[pageID] = ProcessingRegionProgress(
+                    current: max(0, current),
+                    total: max(0, total)
+                )
             }
         }
     }
@@ -2269,6 +2306,7 @@ final class AppStore: ObservableObject {
     private func markFailed(pageID: UUID, message: String) {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         processingActivities[pageID] = nil
+        processingRegionProgress[pageID] = nil
         pages[index].stage = .failed
         pages[index].errorMessage = message
         statusMessage = "第 \(pages[index].index) 頁失敗：\(message)"

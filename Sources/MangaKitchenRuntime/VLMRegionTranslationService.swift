@@ -2,8 +2,6 @@ import Foundation
 import MangaKitchenCore
 
 public actor VLMRegionTranslationService: RegionTranslating {
-    private static let maximumRegionsPerRequest = 12
-
     private struct PromptRegion: Encodable {
         var id: UUID
         var sourceText: String
@@ -25,6 +23,7 @@ public actor VLMRegionTranslationService: RegionTranslating {
         pageURL: URL,
         targetLanguageCode: String,
         glossaryTerms: [ResolvedGlossaryTerm],
+        regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
         guard !regions.isEmpty else {
@@ -37,88 +36,86 @@ public actor VLMRegionTranslationService: RegionTranslating {
             throw TranslationRuntimeError.promptEncodingFailed
         }
 
-        let batches = stride(from: 0, to: regions.count, by: Self.maximumRegionsPerRequest).map {
-            Array(regions[$0..<min($0 + Self.maximumRegionsPerRequest, regions.count)])
-        }
-        let batchCount = max(1, batches.count)
-        var indexed: [UUID: String] = [:]
+        let regionCount = regions.count
+        var translatedRegions: [DialogueRegion] = []
+        translatedRegions.reserveCapacity(regionCount)
 
-        for (index, batch) in batches.enumerated() {
+        for (index, region) in regions.enumerated() {
             try Task.checkCancellation()
-            let payload = batch.map { PromptRegion(id: $0.id, sourceText: $0.sourceText) }
-            let data = try JSONEncoder().encode(payload)
-            guard let regionJSON = String(data: data, encoding: .utf8) else {
-                throw TranslationRuntimeError.promptEncodingFailed
+            regionProgress(index + 1, regionCount)
+            progress(Double(index) / Double(regionCount))
+            do {
+                let translatedText = try await translateRegion(
+                    region,
+                    pageURL: pageURL,
+                    targetLanguageCode: targetLanguageCode,
+                    glossaryJSON: glossaryJSON,
+                    progress: { value in
+                        progress((Double(index) + value) / Double(regionCount))
+                    }
+                )
+                var translated = region
+                translated.translatedText = translatedText
+                translatedRegions.append(translated)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // 單一區域失敗時保留原先可用的譯文，讓其餘區域繼續處理。
+                translatedRegions.append(region)
             }
-            let prompt = Self.prompt(
-                targetLanguageCode: targetLanguageCode,
-                glossaryJSON: glossaryJSON,
-                regionsJSON: regionJSON,
-                attempt: 0
-            )
-            let batchIndex = index
-            let expectedIDs = Set(batch.map(\.id))
-            var batchResults: [UUID: String] = [:]
-            var receivedDecodableResponse = false
+            progress(Double(index + 1) / Double(regionCount))
+        }
 
-            for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
-                try Task.checkCancellation()
-                let retryPrompt = attempt == 0 ? prompt : Self.prompt(
+        regionProgress(regionCount, regionCount)
+        progress(1)
+        return translatedRegions
+    }
+
+    private func translateRegion(
+        _ region: DialogueRegion,
+        pageURL: URL,
+        targetLanguageCode: String,
+        glossaryJSON: String,
+        progress: @escaping InferenceProgress
+    ) async throws -> String {
+        let payload = [PromptRegion(id: region.id, sourceText: region.sourceText)]
+        let data = try JSONEncoder().encode(payload)
+        guard let regionJSON = String(data: data, encoding: .utf8) else {
+            throw TranslationRuntimeError.promptEncodingFailed
+        }
+
+        for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
+            try Task.checkCancellation()
+            let response = try await model.generateText(
+                imageURL: pageURL,
+                prompt: Self.prompt(
                     targetLanguageCode: targetLanguageCode,
                     glossaryJSON: glossaryJSON,
                     regionsJSON: regionJSON,
                     attempt: attempt
-                )
-                let response = try await model.generateText(
-                    imageURL: pageURL,
-                    prompt: retryPrompt,
-                    maximumOutputTokens: 2_048,
-                    progress: { value in
-                        let local = VLMStructuredResponseDecoder.mappedProgress(
-                            attempt: attempt,
-                            value: value
-                        )
-                        progress((Double(batchIndex) + local) / Double(batchCount))
-                    }
-                )
-                let decodedCandidates = VLMStructuredResponseDecoder.decodeArrays(
-                    TranslationItem.self,
-                    from: response
-                )
-                if !decodedCandidates.isEmpty { receivedDecodableResponse = true }
-                for items in decodedCandidates {
-                    for item in items where expectedIDs.contains(item.id) {
-                        let text = item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !text.isEmpty { batchResults[item.id] = text }
-                    }
+                ),
+                maximumOutputTokens: 2_048,
+                progress: { value in
+                    let local = VLMStructuredResponseDecoder.mappedProgress(
+                        attempt: attempt,
+                        value: value
+                    )
+                    progress(local)
                 }
-                if expectedIDs.isSubset(of: Set(batchResults.keys)) { break }
+            )
+            let decodedCandidates = VLMStructuredResponseDecoder.decodeArrays(
+                TranslationItem.self,
+                from: response
+            )
+            if let item = decodedCandidates
+                .flatMap({ $0 })
+                .first(where: { $0.id == region.id }),
+               !item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-
-            let missingCount = expectedIDs.subtracting(batchResults.keys).count
-            guard missingCount == 0 else {
-                if receivedDecodableResponse {
-                    throw TranslationRuntimeError.missingTranslations(missingCount)
-                }
-                throw TranslationRuntimeError.invalidModelResponse
-            }
-            indexed.merge(batchResults) { _, new in new }
-            progress(Double(index + 1) / Double(batchCount))
         }
 
-        let missingCount = regions.reduce(into: 0) { count, region in
-            if indexed[region.id] == nil { count += 1 }
-        }
-        guard missingCount == 0 else {
-            throw TranslationRuntimeError.missingTranslations(missingCount)
-        }
-
-        progress(1)
-        return regions.map { region in
-            var translated = region
-            translated.translatedText = indexed[region.id] ?? region.translatedText
-            return translated
-        }
+        throw TranslationRuntimeError.invalidModelResponse
     }
 
     private static func prompt(

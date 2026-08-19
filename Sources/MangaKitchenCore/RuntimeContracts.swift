@@ -3,6 +3,7 @@ import Foundation
 public typealias InferenceProgress = @Sendable (Double) -> Void
 public typealias PagePipelineProgress = @Sendable (PageProcessingStage, Double) -> Void
 public typealias PagePipelineActivity = @Sendable (PageProcessingActivity) -> Void
+public typealias PageRegionProgress = @Sendable (Int, Int) -> Void
 
 public protocol ImageToTextGenerating: Sendable {
     func generateText(
@@ -72,6 +73,7 @@ public protocol RegionTranslating: Sendable {
         pageURL: URL,
         targetLanguageCode: String,
         glossaryTerms: [ResolvedGlossaryTerm],
+        regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion]
 }

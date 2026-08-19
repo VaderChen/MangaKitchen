@@ -26,6 +26,12 @@
 - GPU 模型工作使用單一循序佇列；新工作可以排隊，但不會取消正在執行的前一筆工作。
 - App 非正常結束後，原本為 `queued` 或 `running` 的紀錄會復原為 `cancelled`，不會未經確認自動重跑模型。
 
+### 逐區處理與進度
+
+- 步驟三的 VLM 轉錄與翻譯都以區域為獨立工作單位。單一區域的裁切、模型推論、回應解析或翻譯失敗時，該區保留原有 `DialogueRegion`，其他區域仍會繼續；`CancellationError` 不會被吞掉，取消工作仍會停止整體佇列。
+- `RegionTranslating.translate` 透過 `PageRegionProgress` 回報 1-based 的 `(current, total)`；`ComicTranslationPipeline` 另外透過 `PagePipelineProgress` 回報頁面 0...1 實際進度。兩者不可互相推算，UI 應使用前者顯示文字、後者更新 progress bar。
+- App 的等待 DLG 在逐區翻譯時顯示「第 current / total 區」，進度條則使用目前頁面進度與批次已完成頁面數計算，不會因區域索引跳動而跳格。
+
 ### 專有名詞資料規則
 
 每個專案快照包含獨立的 `ProjectGlossary`。一筆 `GlossaryEntry` 只有一個來源原詞，但可用 BCP-47 語言代碼保存多個譯詞：

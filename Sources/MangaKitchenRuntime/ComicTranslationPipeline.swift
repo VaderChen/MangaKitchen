@@ -202,6 +202,7 @@ public actor ComicTranslationPipeline {
         options: ProcessingOptions,
         glossary: ProjectGlossary = ProjectGlossary(),
         activity: @escaping PagePipelineActivity = { _ in },
+        regionProgress: @escaping PageRegionProgress = { _, _ in },
         progress: @escaping PagePipelineProgress
     ) async throws -> [DialogueRegion] {
         try Task.checkCancellation()
@@ -224,30 +225,39 @@ public actor ComicTranslationPipeline {
         } else {
             recognizedRegions = regions
         }
-        guard recognizedRegions.allSatisfy({
+        let translatableRegions = recognizedRegions.filter {
             !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }) else {
-            throw ComicTranslationPipelineError.sourceTextRequired
+        }
+        let regionCount = translatableRegions.count
+        regionProgress(0, regionCount)
+        guard !translatableRegions.isEmpty else {
+            progress(.translationReady, 1)
+            return recognizedRegions
         }
         let targetLanguageCode = options.resolvedTargetLanguageCode
         activity(.applyingGlossary)
         let glossaryTerms = glossary.resolvedTerms(
             for: targetLanguageCode,
-            sourceTexts: recognizedRegions.map(\.sourceText)
+            sourceTexts: translatableRegions.map(\.sourceText)
         )
         activity(.preparingTextModel)
         progress(.translating, textRecognizer == nil ? 0 : 0.4)
-        let translated = try await translator.translate(
-            regions: recognizedRegions,
+        let translatedCandidates = try await translator.translate(
+            regions: translatableRegions,
             pageURL: page.sourceURL,
             targetLanguageCode: targetLanguageCode,
-            glossaryTerms: glossaryTerms
+            glossaryTerms: glossaryTerms,
+            regionProgress: regionProgress
         ) { value in
             if value > 0 { activity(.translatingRegions) }
             progress(.translating, 0.4 + min(max(value, 0), 1) * 0.6)
         }
+        regionProgress(regionCount, regionCount)
         progress(.translationReady, 1)
-        return translated
+        let translatedByID = translatedCandidates.reduce(into: [UUID: DialogueRegion]()) { result, region in
+            result[region.id] = region
+        }
+        return recognizedRegions.map { translatedByID[$0.id] ?? $0 }
     }
 
     /// 步驟四：依目前遮罩修補背景、排版並輸出；不重跑辨識或翻譯。

@@ -425,19 +425,31 @@ function renderCalculationDialog() {
     elements.calculationMessage.textContent = t("preparingCalculation");
     return;
   }
-  elements.calculationProgress.value = job.progress;
+  const currentPage = state.pages.find((page) => page.id === job.currentPageID);
+  const pageFraction = currentPage
+    ? calculationPageFraction(job.operation, currentPage)
+    : null;
+  elements.calculationProgress.value = pageFraction === null
+    ? job.progress
+    : (job.completedCount + pageFraction) / Math.max(1, job.pageCount);
   if (["completed", "completedWithErrors", "cancelled"].includes(job.status)) {
     closeCalculationDialog();
     return;
   }
-  const currentPage = state.pages.find((page) => page.id === job.currentPageID);
   const activityLabelKey = currentPage?.processingActivity
     ? processingActivityLabelKeys[currentPage.processingActivity]
     : null;
   if (activityLabelKey) {
-    elements.calculationMessage.textContent = t(activityLabelKey, {
-      title: currentPage.title,
-    });
+    const parameters = { title: currentPage.title };
+    const activityKey = currentPage.processingActivity === "translatingRegions"
+      && currentPage.processingRegionCount > 0
+      ? "activityTranslatingRegionProgress"
+      : activityLabelKey;
+    if (activityKey === "activityTranslatingRegionProgress") {
+      parameters.current = currentPage.processingRegionIndex ?? 0;
+      parameters.total = currentPage.processingRegionCount;
+    }
+    elements.calculationMessage.textContent = t(activityKey, parameters);
     return;
   }
   elements.calculationMessage.textContent = job.status === "queued"
@@ -448,7 +460,14 @@ function renderCalculationDialog() {
           step,
           completed: job.completedCount,
           total: job.pageCount,
-        });
+      });
+}
+
+function calculationPageFraction(operation, page) {
+  if (operation === "translate") {
+    return Math.min(Math.max((page.progress - 0.25) / 0.4, 0), 1);
+  }
+  return null;
 }
 
 async function selectOrCalculateWorkflowStep(step, operation, force = false) {
