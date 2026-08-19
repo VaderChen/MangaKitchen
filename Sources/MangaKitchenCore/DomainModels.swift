@@ -390,7 +390,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
 
     public init(
         sourceLanguageCodes: [String] = ["ja-JP", "zh-Hans", "zh-Hant", "en-US"],
-        targetLanguageCode: String = "zh-Hant",
+        targetLanguageCode: String = TargetLanguageResolver.automaticCode,
         readingDirection: ReadingDirection = .rightToLeft,
         defaultStyle: DialogueStyle = DialogueStyle(),
         maskExpansion: Double = 0.035,
@@ -406,6 +406,11 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.useImageToImageRestoration = useImageToImageRestoration
         self.preserveUntranslatedRegions = preserveUntranslatedRegions
         self.fineScanEnabled = fineScanEnabled
+    }
+
+    /// 實際交給翻譯器、詞表與 Agent 的目標語言；手動選擇時維持原值。
+    public var resolvedTargetLanguageCode: String {
+        TargetLanguageResolver.resolve(targetLanguageCode)
     }
 
     private enum CodingKeys: String, CodingKey {

@@ -354,20 +354,18 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
                   candidate.bubbleBounds != nil || Self.isPlausibleTranscript(text, in: bounds) else {
                 return nil
             }
-            var style = DialogueStyle()
-            style.writingDirection = item.direction
+            let detectedWritingDirection = item.direction
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
                 .flatMap(WritingDirection.init(rawValue:))
-                ?? .automatic
             let bubbleBounds = candidate.bubbleBounds
             return DialogueRegion(
                 bounds: bounds,
                 bubbleBounds: bubbleBounds,
+                detectedWritingDirection: detectedWritingDirection ?? .automatic,
                 rawSourceText: text,
                 sourceText: text,
                 ocrTextRefined: true,
                 confidence: 0.75,
-                style: style,
                 // 只有像素精修成功後才開啟自動遮罩；失敗時不可把整個泡泡抹掉。
                 automaticMaskEnabled: false
             )

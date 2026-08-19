@@ -148,6 +148,9 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
               writing-mode: vertical-rl;
               text-orientation: mixed;
             }
+            .translation-text.vertical-korean {
+              text-orientation: sideways;
+            }
           </style>
         </head>
         <body>
@@ -182,20 +185,39 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
             }
 
             function resolvedTranslationDirection(region) {
-              if (region.style.writingDirection !== "automatic") return region.style.writingDirection;
-              // 字形排列是實際量出來的，優先於任何猜測。
-              if (region.detectedWritingDirection !== "automatic") {
-                return region.detectedWritingDirection;
-              }
-              // 量不出來時（字太少、擬聲字斜排）才退回長寬比。它描述的是框的形狀
-              // 而不是字的排列，只當最後手段。
-              const hasCJK = /[\\u3000-\\u30ff\\u3400-\\u9fff\\uf900-\\ufaff]/u.test(
-                `${region.sourceText}${region.translatedText}`
+              // 原文的直排方向不能直接套到英文譯文；拉丁文字在 CSS
+              // vertical-rl 會被旋轉成側寫。自動排版先看譯文腳本。
+              const translatedText = region.translatedText;
+              const hasKoreanTranslation = /[\\u1100-\\u11ff\\u3130-\\u318f\\uac00-\\ud7af]/u.test(
+                translatedText
               );
-              return hasCJK && (region.sourceText.includes("　")
-                || region.bounds.height > region.bounds.width * 0.8)
-                ? "vertical"
-                : "horizontal";
+              const hasCJKTranslation = /[\\u3000-\\u30ff\\u3400-\\u9fff\\uf900-\\ufaff]/u.test(
+                translatedText
+              );
+              const hasLatinTranslation = /[A-Za-z\\u00c0-\\u024f]/u.test(translatedText);
+              let direction;
+              if (region.style.writingDirection !== "automatic") {
+                direction = region.style.writingDirection;
+              } else if (hasKoreanTranslation) {
+                direction = "horizontal";
+              } else if (hasLatinTranslation && !hasCJKTranslation) {
+                direction = "horizontal";
+              } else if (region.detectedWritingDirection !== "automatic") {
+                direction = region.detectedWritingDirection;
+              } else {
+                // 量不出來時（字太少、擬聲字斜排）才退回長寬比。它描述的是框的形狀
+                // 而不是字的排列，只當最後手段。
+                const hasCJK = /[\\u1100-\\u11ff\\u3000-\\u30ff\\u3130-\\u318f\\u3400-\\u9fff\\uac00-\\ud7af\\uf900-\\ufaff]/u.test(
+                  `${region.sourceText}${region.translatedText}`
+                );
+                direction = hasCJK && (region.sourceText.includes("　")
+                  || region.bounds.height > region.bounds.width * 0.8)
+                  ? "vertical"
+                  : "horizontal";
+              }
+              return hasKoreanTranslation && direction === "vertical"
+                ? "vertical korean-vertical"
+                : direction;
             }
 
             function translationSourceFontSize(region) {

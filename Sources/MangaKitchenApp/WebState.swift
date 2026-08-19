@@ -50,9 +50,10 @@ struct WebPage: Encodable {
             let revision = Self.modificationTimestamp(for: $0) ?? 0
             return "mangakitchen-asset://\(page.id.uuidString.lowercased())/translation-preview?updated=\(revision)"
         }
-        outputPreviewURL = outputURL == nil
-            ? nil
-            : "mangakitchen-asset://\(page.id.uuidString.lowercased())/output"
+        outputPreviewURL = outputURL.map {
+            let revision = Self.modificationTimestamp(for: $0) ?? 0
+            return "mangakitchen-asset://\(page.id.uuidString.lowercased())/output?updated=\(revision)"
+        }
         relativeSourcePath = page.relativeSourcePath
         stringTablePath = page.stringTableURL?.path
         regions = page.regions
@@ -300,7 +301,7 @@ struct WebAppState: Encodable {
         loadedModels = store.loadedModels
         modelLoadingState = store.modelLoadingState
         glossary = store.glossary.entries.map {
-            WebGlossaryEntry(entry: $0, targetLanguageCode: store.options.targetLanguageCode)
+            WebGlossaryEntry(entry: $0, targetLanguageCode: store.options.resolvedTargetLanguageCode)
         }
         batchJobs = store.batchJobs.map { WebBatchJob(job: $0, pages: store.pages) }
         sourceDirectoryPath = store.sourceDirectoryURL?.path

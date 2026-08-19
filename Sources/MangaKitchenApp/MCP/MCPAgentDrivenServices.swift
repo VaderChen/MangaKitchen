@@ -3,7 +3,8 @@ import MangaKitchenCore
 
 // MCP 的翻譯一律由外部 Agent 產生：本檔的替身把管線上「需要內建圖生文模型」的
 // 位置封死，讓這件事是結構上的保證，而不是靠呼叫端每次記得傳對旗標。
-// 區域來源則可切換（見 MCPRegionSource）。
+// 區域預設由 App 內建 Core ML 建立，只有明確切換時才由 Agent 提供粗框
+//（見 MCPRegionSource）。
 //
 // 影像生成（imageToImage）不在此限；背景修補仍可使用已載入的圖生圖模型。
 
@@ -12,10 +13,10 @@ import MangaKitchenCore
 /// **翻譯不在此列**：兩種模式下譯文都固定由 Agent 以 region.update 寫入，
 /// 後端永遠不會呼叫內建圖生文模型翻譯。
 enum MCPRegionSource: String, Codable, Sendable, CaseIterable {
-    /// 區域粗框與原文由 Agent 提供；遮罩仍由後端依粗框與原圖像素產生。
-    case agent
     /// 區域 BBOX 與氣泡形狀由本機 Core ML 定位；原文、翻譯與排版仍由 Agent 提供。
     case local
+    /// 相容後備：區域粗框與原文由 Agent 提供；遮罩仍由後端依粗框與原圖像素產生。
+    case agent
 }
 
 /// 不執行本機語意區域偵測；Agent 模式會走專用遮罩路徑，不呼叫此替身。

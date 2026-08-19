@@ -32,15 +32,15 @@ Project
 1. ComicDirectoryScanner
    └─ 遞迴掃描、自然排序、保留相對路徑
 
-2. MangaBubbleSegmentationCoreMLRuntime + MangaBubbleMaskRegionDetector／外部 MCP Agent + MangaTextMaskRefiner
+2. MangaBubbleSegmentationCoreMLRuntime + MangaBubbleMaskRegionDetector + MangaTextMaskRefiner
    ├─ 內建 Core ML 氣泡分割模型優先以 Apple Neural Engine 產生對話框 BBOX 與形狀，不辨識文字
    ├─ 氣泡 instance mask 裁切 BBOX，保存 `bubbleMaskPolygons` 與供排版使用的 `bubbleLayoutBounds`
    ├─ Otsu／連通元件把搜尋結果縮減成字形級像素遮罩，並將文字 bounds 同步縮到字形外框
-   └─ 像素層膨脹 + add/erase 畫筆 → 二值 `dialogue-mask.png` + CPU／GPU 去字校對預覽 + page.str
+   └─ 像素層膨脹 + add/erase 畫筆 → 二值 `dialogue-mask.png` + CPU／GPU 去字校對預覽 + 專案文字狀態；MCP 直接提供這些區域給 Agent
 
-3. ImageToTextGenerating
+3. ImageToTextGenerating／外部 MCP Agent
    ├─ VLMRegionTranscriptionService 在既有 BBOX 內分類、轉錄並排除擬聲字等非翻譯項目
-   └─ VLMRegionTranslationService 依整頁語境分批翻譯，每批及整頁都必須覆蓋全部 region → page.str
+   └─ GUI 使用 VLMRegionTranslationService；MCP 以單頁工作包一次提供原圖與遮罩 JSON，Agent 一次回傳全部區域 → 專案文字狀態
 
 4. PageBackgroundRestoring + HTMLDialogueTypesetter
    ├─ ImageToImageGenerating（優先）／MetalBubbleCleaner（保底）
@@ -69,12 +69,12 @@ Project
 - `MangaBubbleSegmentationCoreMLRuntime`：內建由 `manga109-segmentation-bubble` 匯出的 Core ML YOLO 分割模型。模型依 image constraint 進行方形 letterbox，優先採用 `cpuAndNeuralEngine`；輸出反算回原圖座標並經 NMS 產生 BBOX，若有 prototype 則同步解出 `bubbleMaskPolygons` 與 `bubbleLayoutBounds`。模型無法載入或推論失敗時，才由 `MangaBubbleCandidateDetector` 的封閉白色連通區演算法後備。
 - `MangaBubbleMaskRegionDetector`：在步驟二將 Core ML BBOX 與氣泡形狀寫入 `DialogueRegion.bounds`、`bubbleBounds`、`bubbleMaskPolygons` 及 `bubbleLayoutBounds`，不載入或呼叫 VLM；`MangaTextMaskRefiner` 隨即依原圖像素將遮罩與文字 bounds 收斂到實際字形。
 - `VLMRegionTranscriptionService`：在步驟三才將既有 BBOX 裁成候選卡片，由 VLM 分類為 `title`、`dialogue`、`caption` 或 `ignore` 並轉錄文字。接受的候選保留原 ID、BBOX、像素遮罩與人工筆劃；擬聲字、頁碼、浮水印、人物與空白區不進入翻譯或最終合成。
-- 外部 MCP Agent：讀取原圖及目前 page resource 後，可用 `page.supplement_regions` 送入文字粗框、來源原文及可選的對話框邊界。所有候選都交由 `MangaTextMaskRefiner` 產生像素遮罩；MCP 不接受 Agent 提交多邊形或筆刷軌跡，因此不會形成兩套遮罩格式或演算法。
+- 外部 MCP Agent：`prepare_agent_task` 一次傳送指定頁原圖與 App 步驟二產生的完整遮罩 JSON；Agent 依既有 `region_id` 抽取原文、翻譯及排版，再由 `submit_agent_result` 一次回寫全部區域並觸發步驟四。Agent 不新增、刪除、合併或重建區域與遮罩。
 - `MangaTextMaskRefiner`：先分析 Core ML BBOX 或 Agent 粗框；若已知 `bubbleMaskPolygons`，會先以氣泡形狀篩選元件。搜尋範圍不會直接成為遮罩，最後以 Otsu 閾值及八鄰域連通元件取得字形像素，並在像素層執行抗鋸齒遲滯與固定像素膨脹，再合併成二值遮罩矩形，避免向量描邊造成灰階毛邊；`bounds` 同步縮到未膨脹的字形外框。暗色背景上的亮字由系統覆蓋檢查回報，必要時由使用者在 App 內以畫筆修正。
 - `VLMRegionTranslationService`：保留整頁影像語境並將已確認來源文字的 region 分批翻譯，讓模型保留人物語氣與上下文，且不再次轉錄來源文字；缺少任一句時整頁不會被標記為翻譯完成。
 - `MetalBubbleCleaner`：執行 Metal compute kernel，作為圖生圖模型不可用時的背景修補。
 - `HTMLDialogueTypesetter`：將步驟三保存的 `translationBounds`、`translationAnchor`、字型、固定／自動字級、粗細及橫排／直排設定交給 WebKit；自動方向優先採用字形排列偵測結果，氣泡排版優先使用完全位於 `bubbleMaskPolygons` 內的 `bubbleLayoutBounds`。使用與 WebUI 相同的 HTML/CSS 與自動縮字演算法渲染背景及文字層，再輸出原圖像素尺寸的 PNG。GUI、批次與 MCP 共用此排版器，不再存在另一套 Core Text 輸出規則。
-- `ComicTranslationPipeline`：只負責階段順序與產物路徑，不知道 UI。步驟二的 `SemanticRegionDetecting` 只需 Core ML BBOX／像素遮罩；GUI 在步驟三才要求已載入圖生文模型，且不回退至系統文字辨識。
+- `ComicTranslationPipeline`：只負責階段順序與產物路徑，不知道 UI。步驟二的 `SemanticRegionDetecting` 只需 Core ML BBOX／像素遮罩；GUI 步驟三可使用內建 VLM，MCP 步驟三則由單頁 Agent 工作包提供，不會呼叫 App 內建圖生文翻譯。
 
 ### MangaKitchenApp
 
@@ -93,7 +93,7 @@ Project
 
 - 使用官方 Swift MCP SDK 與標準 Streamable HTTP transport，監聽 `0.0.0.0`；預設 port 為 `12080`。
 - 每個 HTTP request 都以 TCP socket 的實際來源 IP 檢查 IPv4／IPv6／CIDR 白名單，不採信可偽造的轉送標頭；空白名單拒絕所有連線。
-- Tools 對應多工作區管理、四階段批次命令、外部 Agent 遺漏區域補完與文字／排版編輯，Resources 提供工作區列表、目前工作區、`.str`、原圖、系統遮罩與輸出。
+- Tools 對應多工作區管理與單頁 Agent 工作包；`prepare_agent_task` 提供原圖與遮罩 JSON，`submit_agent_result` 一次回寫全部區域並輸出。Resources 提供工作區列表、目前工作區、頁面、原圖、系統遮罩與輸出供診斷；Agent 不需讀取 sidecar。
 - 不建立第二個 executable；`MangaKitchen` 永遠啟動 GUI，MCP 開關、port 與白名單由全域設定管理，`--mcp=on|off` 與 `--mcp-port` 可覆寫本次啟動。
 - MCP 開啟時建立 macOS menu bar 狀態項目。主視窗關閉後 process 與 MCP 繼續運作，並可從 menu bar 重新開啟視窗或完整結束 App。
 - MCP JSON-RPC 僅存在 `MangaKitchenApp/MCP` adapter 目錄；模型 Runtime 與 Pipeline 不依賴 MCP。

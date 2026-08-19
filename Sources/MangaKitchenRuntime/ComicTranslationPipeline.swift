@@ -229,9 +229,10 @@ public actor ComicTranslationPipeline {
         }) else {
             throw ComicTranslationPipelineError.sourceTextRequired
         }
+        let targetLanguageCode = options.resolvedTargetLanguageCode
         activity(.applyingGlossary)
         let glossaryTerms = glossary.resolvedTerms(
-            for: options.targetLanguageCode,
+            for: targetLanguageCode,
             sourceTexts: recognizedRegions.map(\.sourceText)
         )
         activity(.preparingTextModel)
@@ -239,7 +240,7 @@ public actor ComicTranslationPipeline {
         let translated = try await translator.translate(
             regions: recognizedRegions,
             pageURL: page.sourceURL,
-            targetLanguageCode: options.targetLanguageCode,
+            targetLanguageCode: targetLanguageCode,
             glossaryTerms: glossaryTerms
         ) { value in
             if value > 0 { activity(.translatingRegions) }

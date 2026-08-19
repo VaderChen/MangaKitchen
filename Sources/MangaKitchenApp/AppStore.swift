@@ -636,7 +636,11 @@ final class AppStore: ObservableObject {
     }
 
     @discardableResult
-    func enqueueBatch(operation: BatchOperation, pageIDs: [UUID]) -> UUID? {
+    func enqueueBatch(
+        operation: BatchOperation,
+        pageIDs: [UUID],
+        forceRecalculation: Bool = false
+    ) -> UUID? {
         guard let activeProjectID, let activeProjectName else {
             statusMessage = "請先建立或選取漫畫專案。"
             return nil
@@ -665,6 +669,7 @@ final class AppStore: ObservableObject {
             projectID: activeProjectID,
             projectName: activeProjectName,
             operation: operation,
+            forceRecalculation: forceRecalculation,
             pageIDs: Array(orderedIDs)
         )
         batchJobs.append(job)
@@ -699,7 +704,11 @@ final class AppStore: ObservableObject {
             statusMessage = "只能在原專案內重試失敗頁面。"
             return
         }
-        enqueueBatch(operation: job.operation, pageIDs: job.failures.map(\.pageID))
+        enqueueBatch(
+            operation: job.operation,
+            pageIDs: job.failures.map(\.pageID),
+            forceRecalculation: job.forceRecalculation
+        )
     }
 
     func clearFinishedBatchJobs() {
@@ -740,6 +749,7 @@ final class AppStore: ObservableObject {
                 self.batchJobs[jobIndex].status = .running
                 self.batchJobs[jobIndex].startedAt = Date()
                 let operation = self.batchJobs[jobIndex].operation
+                let forceRecalculation = self.batchJobs[jobIndex].forceRecalculation
                 let pageIDs = self.batchJobs[jobIndex].pageIDs
 
                 for pageID in pageIDs {
@@ -749,7 +759,11 @@ final class AppStore: ObservableObject {
                     self.batchJobs[currentIndex].currentPageID = pageID
                     self.processingActivities[pageID] = .preparingPage
                     do {
-                        try await self.run(operation, pageID: pageID)
+                        try await self.run(
+                            operation,
+                            pageID: pageID,
+                            forceRecalculation: forceRecalculation
+                        )
                         try Task.checkCancellation()
                         guard let resultIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }),
                               self.batchJobs[resultIndex].status == .running else {
@@ -1199,13 +1213,20 @@ final class AppStore: ObservableObject {
 
     // MARK: - 工作流實作
 
-    private func run(_ operation: BatchOperation, pageID: UUID) async throws {
+    private func run(
+        _ operation: BatchOperation,
+        pageID: UUID,
+        forceRecalculation: Bool = false
+    ) async throws {
         try Task.checkCancellation()
         switch operation {
         case .detectMasks:
             try await runDetection(pageID: pageID)
         case .translate:
-            try await runTranslation(pageID: pageID)
+            try await runTranslation(
+                pageID: pageID,
+                forceRecalculation: forceRecalculation
+            )
         case .compose:
             try await runComposition(pageID: pageID)
         case .fullPage:
@@ -1351,7 +1372,10 @@ final class AppStore: ObservableObject {
         schedulePersistence()
     }
 
-    private func runTranslation(pageID: UUID) async throws {
+    private func runTranslation(
+        pageID: UUID,
+        forceRecalculation: Bool = false
+    ) async throws {
         await stopTranslationPreviewRegeneration(pageID: pageID)
         try Task.checkCancellation()
         guard let pipeline,
@@ -1360,7 +1384,7 @@ final class AppStore: ObservableObject {
         }
         guard !page.regions.isEmpty else { throw AppWorkflowError.maskRequired }
         let regions: [DialogueRegion]
-        if hasTranslatedRegions(page) {
+        if !forceRecalculation && hasTranslatedRegions(page) {
             regions = page.regions
         } else {
             guard await models?.isLoaded(.imageToText) == true else {
@@ -1411,9 +1435,6 @@ final class AppStore: ObservableObject {
     }
 
     private func runComposition(pageID: UUID) async throws {
-        guard let pipeline else {
-            throw AppWorkflowError.runtimeUnavailable
-        }
         guard let outputDirectoryURL else {
             throw AppWorkflowError.outputDirectoryRequired
         }
@@ -1445,17 +1466,14 @@ final class AppStore: ObservableObject {
         guard paths.outputURL.standardizedFileURL != page.sourceURL.standardizedFileURL else {
             throw AppWorkflowError.outputWouldOverwriteSource
         }
-        let backgroundURL: URL
-        if let currentBackgroundURL = page.backgroundURL,
-           FileManager.default.fileExists(atPath: currentBackgroundURL.path) {
-            backgroundURL = currentBackgroundURL
-        } else if let maskURL = page.maskURL,
-                  FileManager.default.fileExists(atPath: maskURL.path) {
-            backgroundURL = try await pipeline.renderMaskPreview(
-                page: page,
-                regions: page.regions,
-                maskURL: maskURL
-            )
+        let completedPreviewURL: URL
+        if let translationPreviewURL = page.translationPreviewURL,
+           FileManager.default.fileExists(atPath: translationPreviewURL.path) {
+            completedPreviewURL = translationPreviewURL
+        } else if !page.regions.contains(where: { !$0.translatedText.isEmpty }),
+                  let backgroundURL = page.backgroundURL,
+                  FileManager.default.fileExists(atPath: backgroundURL.path) {
+            completedPreviewURL = backgroundURL
         } else {
             throw AppWorkflowError.translationPreviewRequired
         }
@@ -1463,16 +1481,9 @@ final class AppStore: ObservableObject {
             at: paths.outputURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        if FileManager.default.fileExists(atPath: paths.outputURL.path) {
-            try FileManager.default.removeItem(at: paths.outputURL)
-        }
-        try await pipeline.rerender(
-            backgroundURL: backgroundURL,
-            regions: page.regions,
-            outputURL: paths.outputURL
-        )
+        let previewData = try Data(contentsOf: completedPreviewURL)
+        try previewData.write(to: paths.outputURL, options: .atomic)
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
-        pages[index].backgroundURL = backgroundURL
         pages[index].outputURL = paths.outputURL
         pages[index].stage = .completed
         pages[index].progress = 1
@@ -1762,7 +1773,10 @@ final class AppStore: ObservableObject {
         }
         let fileURL = try stringTableURL(for: pages[index])
         pages[index].stringTableURL = fileURL
-        let table = ComicStringTable(page: pages[index], targetLanguageCode: options.targetLanguageCode)
+        let table = ComicStringTable(
+            page: pages[index],
+            targetLanguageCode: options.resolvedTargetLanguageCode
+        )
         try await stringTables.save(table, to: fileURL)
     }
 
@@ -1791,7 +1805,7 @@ final class AppStore: ObservableObject {
                 } else {
                     table = ComicStringTable(
                         page: page,
-                        targetLanguageCode: options.targetLanguageCode
+                        targetLanguageCode: options.resolvedTargetLanguageCode
                     )
                 }
                 try await stringTables.save(table, to: targetURL)

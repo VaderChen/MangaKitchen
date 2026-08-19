@@ -22,7 +22,7 @@
 - 一個來源目錄對應一個 `projectID`，各自保存來源、輸出、處理設定、頁面與模型目錄。
 - `selectedPageID` 是中央畫布顯示的單一作用中頁面；`selectedPageIDs` 是批次命令集合，兩者不可混為同一狀態。
 - Command 點擊切換個別選取，Shift 點擊加入連續範圍；搜尋或狀態篩選只改變列表顯示，不會隱式刪除既有頁面。
-- `BatchJob` 固定保存建立當下的 `projectID`、`operation` 與 `pageIDs`，執行途中切換專案會被阻止。
+- `BatchJob` 固定保存建立當下的 `projectID`、`operation`、`pageIDs` 與是否強制重算，執行途中切換專案會被阻止。
 - GPU 模型工作使用單一循序佇列；新工作可以排隊，但不會取消正在執行的前一筆工作。
 - App 非正常結束後，原本為 `queued` 或 `running` 的紀錄會復原為 `cancelled`，不會未經確認自動重跑模型。
 
@@ -61,10 +61,10 @@
 - `rawSourceText` 保留 VLM、MCP Agent 或人工最初提供的原文；`sourceText` 是目前供詞表比對與翻譯使用的來源文字。
 - `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；新流程的 `true` 代表來源文字已由 VLM、MCP Agent 或人工確認，不會觸發任何 OCR 校正服務。
 - **GUI 路徑**：步驟二由內建 `MangaBubbleSegmentationCoreMLRuntime` 以 Apple Neural Engine 優先產生對話框 BBOX 與氣泡形狀，再以原圖像素連通元件將 `bounds` 與遮罩收斂到實際字形；此時不載入或呼叫圖生文模型。模型無法載入或推論失敗時，才後備至 `MangaBubbleCandidateDetector` 的封閉白區演算法。步驟三才由 `VLMRegionTranscriptionService` 在既有 BBOX 中分類、轉錄，接著翻譯；未載入圖生文模型時不會回退至系統文字辨識。
-- **MCP 路徑**：遮罩一律由後端依系統 BBOX／氣泡形狀、Agent 粗框與原圖像素產生，不接受 Agent 直接提交 `mask_polygons`；原文、翻譯、字體、排字方向與字級由外部 Agent 透過 `region.update` 提供。`region_source` 只切換區域粗框來源（`agent` 由 Agent 提供／`local` 用本機 Core ML），兩種模式都不呼叫內建 VLM 翻譯。後端共用像素遮罩收斂、背景修補與 HTML 排版。詳見〈MCP 介面〉。
+- **MCP 路徑**：App 先完成區域與像素遮罩，再由 `prepare_agent_task` 將原圖及完整遮罩 JSON 一次交給 Agent；Agent 只依既有 `region_id` 抽取原文、翻譯與決定排版，最後以 `submit_agent_result` 一次回寫並由 App 合成。MCP 不接受 Agent 修改區域或遮罩，也不呼叫內建 VLM 翻譯。詳見〈標準 MCP〉。
 - `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形像素遮罩；抗鋸齒遲滯與固定像素膨脹都在像素層完成，不再對逐條矩形做向量描邊，因此輸出的 `dialogue-mask.png` 維持二值邊界。
 - `maskCoverageRatio` 是系統像素精修保留的前景筆畫比例；`null` 代表尚未執行自動檢查。
-- `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線。若未通過，Agent 應擴大 `bounds`／`bubble_bounds` 後重新執行 `page.detect_masks`，而不是提交遮罩幾何。
+- `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線。若未通過，由使用者回到 App 步驟二調整，不讓 Agent 變更邊界或重建遮罩。
 - `bounds` 是涵蓋完整原文的粗搜尋範圍，不直接作為最終遮罩；`bubbleBounds` 必須涵蓋整個對話框外接範圍，`bubbleMaskPolygons` 則是已知的實際氣泡形狀，像素搜尋、遮罩與裁切都不得越界。
 - `bubbleLayoutBounds` 是完全位於氣泡形狀內的最大軸對齊矩形，只供譯文安全排版；不能用它取代 `bubbleBounds`，否則貼近弧線的原文字形可能無法被遮罩。
 - 自動排版方向優先使用像素字形 BBOX 的實際排列偵測結果；只有字形不足或排列模稜兩可時，才回退既有的自動判定規則。明確指定 `writingDirection` 時仍以使用者設定為準。
@@ -80,7 +80,7 @@
 | 狀態 | 意義 | 可執行的下一步 |
 |---|---|---|
 | `scanned` | 已掃描原圖 | 偵測遮罩 |
-| `maskReady` | VLM／Agent 原文、區域及遮罩已保存 | 人工修遮罩、翻譯 |
+| `maskReady` | App／Agent 區域及像素遮罩已保存，MCP 尚待 Agent 抽取原文與翻譯 | 人工修遮罩、翻譯 |
 | `translationReady` | 譯文及排版設定已保存 | 人工修文、合成 |
 | `completed` | 已輸出合成圖 | 重做任一步驟 |
 | `failed` | 最近命令失敗 | 修正問題後重做該步驟 |
@@ -221,7 +221,7 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `chooseOutputDirectory()` | 選取只存放最終 PNG 的輸出目錄；`.str` 不會隨之移動 |
 | `setPageSelection(pageIDs, activePageID)` | 同時設定批次選取與中央畫布頁面 |
 | `selectAllPages()`／`clearPageSelection()` | 全選或清除批次選取 |
-| `runBatch(operation, pageIDs)` | 將明確的頁面集合加入遮罩、翻譯、合成或完整處理佇列 |
+| `runBatch(operation, pageIDs, forceRecalculation)` | 將明確的頁面集合加入遮罩、翻譯、合成或完整處理佇列；重算翻譯時設為 `true`，會重新呼叫 VLM，不沿用既有原文／譯文 |
 | `detectMasks(scope)` | `selected` 或 `all` 的步驟二 |
 | `translate(scope)` | `selected` 或 `all` 的步驟三 |
 | `compose(scope)` | `selected` 或 `all` 的步驟四；只儲存步驟三已完成的翻譯預覽 |
@@ -267,90 +267,33 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `mangakitchen.workspace.activate` | 切換 `workspace/current` resource；其他工具仍以明確 ID 操作 |
 | `mangakitchen.workspace.rescan` | 重掃來源目錄 |
 | `mangakitchen.workspace.set_output` | 設定輸出目錄 |
-| `mangakitchen.workspace.configure` | 調整目標語言與預設處理設定 |
+| `mangakitchen.workspace.configure` | 調整目標語言與預設處理設定；未指定閱讀順序時預設由右至左 |
 | `mangakitchen.glossary.list` | 讀取指定工作區的完整多語詞表 |
 | `mangakitchen.glossary.upsert` | 新增詞條或以 `entry_id` 更新完整映射 |
 | `mangakitchen.glossary.remove` | 移除指定詞條 |
 | `mangakitchen.model.load` | 載入本機模型 manifest 目錄 |
-| `mangakitchen.workspace.pages` | 取得檔案工作清單與每頁 `next_action`，供 Agent 迴圈處理 |
-| `mangakitchen.page.detect_masks` | 步驟二 |
-| `mangakitchen.page.supplement_regions` | 外部 Agent 批次補入遺漏文字，並由後端精修與重建遮罩 |
-| `mangakitchen.page.translate` | 步驟三 |
-| `mangakitchen.page.compose` | 步驟四 |
-| `mangakitchen.page.run_full` | 一鍵完整頁或批次完整處理 |
-| `mangakitchen.region.create` | 新增區域 |
-| `mangakitchen.region.update` | 修改文字／位置／字型／字級 |
-| `mangakitchen.region.remove` | 移除區域 |
+| `mangakitchen.workspace.pages` | 查詢每頁產物狀態；`nextAction` 只是摘要，不會授權 Agent 自行執行 |
+| `mangakitchen.page.prepare_agent_task` | 主要入口；一次回傳指定頁原圖與步驟二遮罩 JSON |
+| `mangakitchen.page.submit_agent_result` | 一次回寫指定頁全部區域的原文、譯文與排版，再直接執行步驟四 |
 
-四個頁面工具的 `page_ids` 可省略；省略或傳空陣列代表工作區全部頁面。長工序若收到 MCP `_meta.progressToken`，會發送 `notifications/progress`。MCP 的 request cancellation 會傳遞至 Swift Task 與模型 Pipeline。MCP 不提供遮罩幾何或筆刷修改工具；遮罩只能由後端依系統 BBOX、Agent 粗框與原圖像素產生。使用者若要人工修正，請在 App 的遮罩頁面操作畫筆與橡皮擦。
+舊的 `page.detect_masks`、`page.supplement_regions`、`page.translate`、`page.compose`、`page.run_full` 與 `region.*` handler 只保留程式相容性，不再列入 MCP `tools/list`，避免 Agent 自行拆解流程或誤刪、重建區域。
 
-**MCP 的翻譯與排版一律由 Agent 提供。** 後端永遠不會呼叫內建圖生文（imageToText）模型翻譯或替 Agent 決定字型、排字方向與字級；Agent 應以 `region.update` 寫入 `translated_text`、`writing_direction`、`font_name`、`font_size`、`font_weight`、`automatic_font_size` 與 `translation_anchor`。遮罩則固定由後端產生。
+### 單頁工作包契約
 
-**區域來源可切換**，用 `workspace.configure` 的 `region_source` 設定（工作區層級，隨 session 保存）：
+MCP 初始化與工具清單只描述能力，不代表應立即操作資料。除非使用者明確要求，Agent 不得清除、重新掃描、重建、刪除、合併或新增區域。重疊區域可能是合法的氣泡／文字配置，不能作為自動清理依據。
 
-| `region_source` | 區域粗框／候選來源 | 原文、翻譯與排版 | 適用情境 |
-| --- | --- | --- | --- |
-| `agent`（預設） | Agent 提交文字粗框與原文；後端產生像素遮罩 | Agent | Agent 已能判讀文字位置，或沒有本機模型 |
-| `local` | 本機 Core ML 氣泡 BBOX／形狀；後端產生像素遮罩 | Agent | 想使用本機穩定幾何，再由 Agent 提供原文、譯文與排版 |
+標準流程固定為：
 
-`agent` 模式使用 `AgentDrivenRegionDetector` 與 `AgentDrivenTranslator`，不啟動本機區域辨識，但收到 Agent 粗框後仍由 `MangaTextMaskRefiner` 產生遮罩；`local` 模式改用 `MangaBubbleMaskRegionDetector`，translator 仍固定為 `AgentDrivenTranslator`。兩種模式都由 Agent 決定翻譯與排版。
+1. App 已載入步驟一原圖；若步驟二尚未完成，由 `prepare_agent_task` 在 App 內建立。
+2. Agent 呼叫 `page.prepare_agent_task(workspace_id, page_id)`。
+3. Tool result 的 image content 直接包含原圖；structured content 的 `regionData` 內嵌所有區域、BBOX、氣泡形狀、像素遮罩、筆刷與現有排版資料，也同時提供目標語言、閱讀順序與專有名詞。
+4. Agent 只依既有 `region_id` 處理文字：`sourceText` 與 `translatedText` 若已有內容就是待校稿草稿，必須對照原圖確認或修正；空白欄位才重新抽取或翻譯。同時檢查並必要時調整 `translationAnchor`、`translationBounds`、`fontSize`、`automaticFontSize`、`fontWeight` 與 `writingDirection`。
+5. Agent 呼叫 `page.submit_agent_result`，一次送回本頁全部區域。
+6. App 驗證回傳 `region_id` 集合與步驟二完全一致，保留遮罩、更新內部專案資料，再直接執行步驟四合成與輸出。
 
-兩種模式下後端共用像素級遮罩收斂、背景修補與排版。`model.load` 可載入 imageToImage 模型供 `page.compose` 的生成式背景修補使用；MCP 的原文與譯文一律由 Agent 提供，`region_source: local` 也不在 `page.detect_masks` 載入 imageToText 模型。
+`prepare_agent_task` 只在區域或遮罩不存在時自動建立步驟二；已有資料時直接沿用，不會覆蓋使用者修改。若已有抽取文字、翻譯或排版，這些資料會完整包含在 `regionData.entries` 中，交由 Agent 校稿與調整後回傳。所有 Agent 必要資料均包含於單次 tool result，Agent 不得搜尋、讀取或建立 `.str` 檔案，也不需額外讀取 page resource。
 
-⚠️ 切到 `local` 後，`page.detect_masks` 會**重新產生系統區域與遮罩並覆寫**該頁既有區域；Agent 提供的翻譯與排版資料不應在沒有使用者要求時被重做。
-
-標準流程：
-
-`region_source: agent`（預設）：
-
-1. 讀取 `mangakitchen://page/{page_id}` 與 `/source`，由 Agent 辨識文字粗框與原文。
-2. `page.supplement_regions` 批次提交 `bounds`、可選的 `bubble_bounds` 與 `source_text`；後端立即產生像素級遮罩。
-3. 如需重算，呼叫 `page.detect_masks`；此步驟只重建系統遮罩，不接受 `mask_polygons`。
-4. `region.update` 寫入 `translated_text` 與字型、排字方向、字級等排版設定。
-5. `page.compose` 輸出。
-
-`region_source: local`：
-
-1. `page.detect_masks` —— 本機 Core ML 偵測氣泡 BBOX／形狀，並產生像素級遮罩；不載入 imageToText 模型。
-2. 讀取 `mangakitchen://page/{page_id}` 與原圖 resource，由 Agent 取得各區域原文。
-3. `region.update` 寫入 `source_text`、`translated_text` 與字型、排字方向、字級等排版設定。
-4. `page.compose` 輸出。
-
-`page.translate` 在此模式下不可用，呼叫會回傳可操作的錯誤訊息，指引改用 `region.update` 寫入譯文。`page.run_full` 只有在所有區域都已有譯文時才會成功，否則會停在同一個錯誤。
-
-### 整批處理：由 Agent 自行迴圈
-
-全自動與否取決於使用者的指令，後端不會自己啟動批次。使用者要求整批處理時，Agent 以 `mangakitchen.workspace.pages` 取得檔案工作清單，依每頁的 `nextAction` 逐頁執行：
-
-| `nextAction` | 意義 | Agent 該做的事 |
-| --- | --- | --- |
-| `submitRegions` | 這一頁還沒有任何區域 | 讀 `sourceURI` 原圖辨識，`page.supplement_regions` 提交 |
-| `writeSourceText` | 有區域但原文不完整 | `region.update` 寫回 `source_text` |
-| `writeTranslation` | 原文齊全但缺譯文 | `region.update` 寫入 `translated_text` |
-| `compose` | 譯文齊全但尚未輸出 | `page.compose` |
-| `done` | 已輸出 | 略過 |
-
-清單另含 `stage`、`regionCount`、`regionsMissingSourceText`、`regionsMissingTranslation`、`regionsWithIncompleteMask`、`hasMask`、`hasOutput` 與 `errorMessage`（輸出沿用 Codable 的 camelCase；只有工具**輸入**參數是 snake_case，例如 `pending_only`），可據此判斷是否需要回頭補遮罩。輸入參數 `pending_only` 預設 `true`，只回傳還有待辦的頁面；完成一頁後重新取清單即可續跑，因此中斷後可以安全接續。
-
-這份清單**刻意不含 `regions` 內容**：`ComicPage` 內嵌完整 `DialogueRegion`（含數千點的 `maskPolygons`），整個專案列出來會是巨大的 payload。需要單頁細節時再讀 `mangakitchen://page/{page_id}`。同一份資料也以 `mangakitchen://workspace/current/pages` 資源提供（該資源一律回傳全部頁面）。
-
-專案（工作區）層級的列表則用 `mangakitchen.workspace.list` 或 `mangakitchen://workspace/list`。
-
-`page.supplement_regions` 是 Agent 提交區域的主要入口。每筆候選需要涵蓋完整原文的粗 `bounds` 與已確認的 `source_text`，可選 `writing_direction`；`bubble_bounds` 只在文字確實被封閉對話框、旁白框或標題框包住時提供，代表系統遮罩與譯文都不得越界。無框台詞請**省略** `bubble_bounds`，代表沒有硬邊界，系統遮罩改為只依 `maskExpansion` 由文字外擴。`bounds` 要貼著文字本身，因為它同時決定譯文落點與字級推估；候選接受後由 Swift 後端分析原圖像素並產生字形級遮罩。Agent 不提交 `mask_polygons`；若覆蓋率不足，請調整 `bounds`／`bubble_bounds` 後重新執行 `page.detect_masks`。候選若與既有或同批區域重疊超過一半就略過，因此同一請求可以安全重送。接受的區域會保留相容欄位 `ocrTextRefined: true`、合併至頁面並同步 `.str`。
-
-對已存在但來源文字不完整的區域，Agent 使用 `region.update` 寫回已確認的 `source_text`。修改來源文字而未同時提供譯文時，既有譯文會清空，避免沿用失效翻譯。
-
-`region.update` 對「nil 本身就是有效狀態」的欄位採三態語意：**省略＝維持原值，`null`＝清除回預設，帶值＝設定**。適用欄位與清除後的行為：
-
-| 欄位 | 傳 `null` 的意義 |
-| --- | --- |
-| `bubble_bounds` | 這個區域沒有對話框；遮罩與譯文改為只依 `maskExpansion` 由文字外擴，不設硬邊界 |
-| `translation_anchor` | 譯文落點還原成預設（對話框中心／原文位置） |
-| `font_size` | 恢復自動配適字級，等同 `automatic_font_size: true` |
-
-其餘欄位維持「省略＝不變」。遮罩不提供直接幾何更新欄位；修改 `bounds`、`bubble_bounds` 或 `source_text` 後，系統會自動清除舊遮罩並重新精修。
-
-`page.supplement_regions` 的 `regions` 格式如下，座標皆為左上原點的 0...1 正規化值：
+`submit_agent_result.regions` 的格式如下，座標皆為左上原點的 0...1 正規化值：
 
 ```json
 {
@@ -358,16 +301,20 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
   "page_id": "<uuid>",
   "regions": [
     {
-      "bounds": { "x": 0.82, "y": 0.305, "width": 0.06, "height": 0.16 },
+      "region_id": "<existing-region-uuid>",
       "source_text": "欲しいの？",
-      "bubble_bounds": { "x": 0.76, "y": 0.285, "width": 0.17, "height": 0.19 },
+      "translated_text": "你想要嗎？",
+      "translation_anchor": { "x": 0.82, "y": 0.305 },
+      "translation_bounds": { "x": 0.76, "y": 0.285, "width": 0.17, "height": 0.19 },
+      "automatic_font_size": true,
+      "font_weight": "regular",
       "writing_direction": "vertical"
     }
   ]
 }
 ```
 
-`page.translate` 只接受每個區域都有非空 `sourceText` 的資料，不會額外重跑文字辨識或改寫來源文字。`page.compose` 與 `page.run_full` 會檢查遮罩、來源文字、譯文與輸出產物，缺少時才逐級回到必要的前一步；已完成資料不會被重做。
+`regions` 必須完整包含工作包內所有 `region_id`，不可重複、缺少或多出項目。`source_text` 與 `translated_text` 必填；其餘排版欄位可省略以沿用 App 的既有或自動設定。Agent 回傳內容不接受 `bounds`、`bubble_bounds`、`mask_polygons` 或筆刷資料，因此不會改動步驟二。
 
 ### Resources
 
@@ -376,13 +323,12 @@ mangakitchen://workspace/list
 mangakitchen://workspace/current
 mangakitchen://workspace/current/glossary
 mangakitchen://page/{page_id}
-mangakitchen://page/{page_id}/strings
 mangakitchen://page/{page_id}/source
 mangakitchen://page/{page_id}/mask
 mangakitchen://page/{page_id}/output
 ```
 
-JSON 狀態與 `.str` 以 text resource 回傳；原圖、遮罩與輸出圖以 binary resource 回傳。Server 也提供相同 URI 的 resource templates。
+頁面 JSON 狀態以 text resource 回傳；原圖、遮罩與輸出圖以 binary resource 回傳。標準 Agent 流程只使用 `prepare_agent_task` 的內嵌資料，不需要逐一讀取上述 resource。
 
 ### 啟動設定
 

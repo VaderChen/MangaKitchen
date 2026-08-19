@@ -28,7 +28,7 @@ struct MangaKitchenMCPServer {
             name: "mangakitchen",
             version: "0.1.0",
             title: "MangaKitchen 漫畫翻譯",
-            instructions: "先用 mangakitchen.workspace.open 建立目錄專案；可保留多個 workspace_id 並用 workspace.list／activate 切換。遮罩一律由後端依系統 BBOX／氣泡形狀、Agent 粗框與原圖像素產生，Agent 不要提交 mask_polygons。Agent 負責讀取原圖、提供或校正 source_text、翻譯，以及透過 region.update 設定 translation_anchor、writing_direction、font_name、font_size、font_weight 與 automatic_font_size。region_source=agent 時，讀 mangakitchen://page/{page_id}/source 後以 page.supplement_regions 提交 bounds、bubble_bounds 與原文；region_source=local 時，由本機 Core ML 產生 BBOX 與遮罩，Agent 再補原文與譯文。單頁流程：supplement_regions 或 page.detect_masks → region.update 寫入翻譯與排版 → page.compose。使用者要求整批處理時，用 mangakitchen.workspace.pages 取得檔案工作清單，依每頁的 nextAction 逐頁執行，完成一頁後再取一次清單即可續跑；該清單不含 regions 內容，整個專案列出來也很輕量。除非使用者明確要求整批處理，否則不要自行對整個專案迴圈。",
+            instructions: "MangaKitchen 由 App 管理頁面、區域、遮罩與持久化資料。處理指定頁面時只需呼叫 page.prepare_agent_task；若缺少步驟二，App 會先建立區域與像素遮罩，再一次交付內嵌 JSON 與原圖 image content。不要搜尋、讀取或建立 .str 檔案，也不要額外讀取 page resource。Agent 依工作包既有 region_id 完成原文抽取、翻譯與排版後，以 page.submit_agent_result 一次回寫全部區域，App 隨即執行步驟四合成。除非使用者明確要求，請勿清除、刪除、重建、重新掃描、新增、合併或改動區域與遮罩。workspace.pages 只提供狀態摘要，不是要求自動執行的命令清單。",
 
             capabilities: .init(
                 resources: .init(subscribe: false, listChanged: false),
@@ -136,6 +136,40 @@ struct MangaKitchenMCPServer {
                     let model = try await service.loadModel(directoryURL: directory)
                     return try success("模型已載入：\(model.displayName)", model)
 
+                case "mangakitchen.page.prepare_agent_task":
+                    let progress = progressReporter(request: request, server: server)
+                    let payload = try await service.prepareAgentTask(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        progress: progress
+                    )
+                    return try .init(
+                        content: [
+                            .text(
+                                text: try json(payload.bundle),
+                                annotations: nil,
+                                _meta: nil
+                            ),
+                            .image(
+                                data: payload.sourceImageData.base64EncodedString(),
+                                mimeType: payload.sourceImageMIMEType,
+                                annotations: nil,
+                                _meta: nil
+                            )
+                        ],
+                        structuredContent: payload.bundle,
+                        isError: false
+                    )
+
+                case "mangakitchen.page.submit_agent_result":
+                    let result = try await service.submitAgentResult(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        results: try requiredAgentRegionResults(arguments, "regions"),
+                        progress: progressReporter(request: request, server: server)
+                    )
+                    return try success("Agent 結果已一次回寫，步驟四合成完成。", result)
+
                 case "mangakitchen.page.detect_masks":
                     return try await runWorkflow(
                         .detectMasks,
@@ -222,7 +256,7 @@ struct MangaKitchenMCPServer {
                         useAutomaticFontSize: arguments["automatic_font_size"]?.boolValue,
                         writingDirection: try optionalEnum(arguments, "writing_direction", as: WritingDirection.self)
                     )
-                    return try success("對話區域已更新並寫入 .str。", region)
+                    return try success("對話區域已更新；未修改 bounds／bubble_bounds 時會保留既有遮罩。", region)
 
                 case "mangakitchen.region.remove":
                     let page = try await service.removeRegion(
@@ -230,7 +264,7 @@ struct MangaKitchenMCPServer {
                         pageID: requiredUUID(arguments, "page_id"),
                         regionID: requiredUUID(arguments, "region_id")
                     )
-                    return try success("對話區域已移除並更新 .str。", page)
+                    return try success("對話區域已移除並更新專案資料。", page)
 
                 default:
                     return .init(content: [.text(text: "未知工具：\(request.name)", annotations: nil, _meta: nil)], isError: true)
@@ -262,7 +296,7 @@ struct MangaKitchenMCPServer {
                 Resource(
                     name: "目前專案待處理頁面",
                     uri: "mangakitchen://workspace/current/pages",
-                    description: "每頁的進度與 next_action 工作清單；不含 regions 內容，適合 Agent 迴圈取用",
+                    description: "每頁的進度與 next_action 狀態摘要；不含 regions，且不會授權 Agent 自行執行",
                     mimeType: "application/json"
                 ),
                 Resource(
@@ -278,12 +312,6 @@ struct MangaKitchenMCPServer {
                     name: "頁面 \(page.index)：\(page.title)",
                     uri: base,
                     description: "漫畫頁面狀態與所有對話區域",
-                    mimeType: "application/json"
-                ))
-                resources.append(Resource(
-                    name: "\(page.title).str",
-                    uri: base + "/strings",
-                    description: "此頁的文字、位置、字型與遮罩筆劃映射",
                     mimeType: "application/json"
                 ))
                 resources.append(Resource(
@@ -318,12 +346,6 @@ struct MangaKitchenMCPServer {
                     uriTemplate: "mangakitchen://page/{page_id}",
                     name: "MangaKitchen 頁面",
                     description: "依 page_id 讀取頁面及對話區域狀態",
-                    mimeType: "application/json"
-                ),
-                .init(
-                    uriTemplate: "mangakitchen://page/{page_id}/strings",
-                    name: "MangaKitchen .str",
-                    description: "依 page_id 讀取可攜式文字映射",
                     mimeType: "application/json"
                 ),
                 .init(
@@ -365,18 +387,7 @@ struct MangaKitchenMCPServer {
     ) async throws -> CallTool.Result {
         let workspaceID = try requiredUUID(arguments, "workspace_id")
         let pageIDs = try optionalUUIDArray(arguments, "page_ids")
-        let token = request._meta?.progressToken
-        let progress: MCPWorkflowService.Progress = { completed, message in
-            guard let token else { return }
-            Task {
-                try? await server?.notify(ProgressNotification.message(.init(
-                    progressToken: token,
-                    progress: completed,
-                    total: 1,
-                    message: message
-                )))
-            }
-        }
+        let progress = progressReporter(request: request, server: server)
         let result = try await service.run(
             workspaceID: workspaceID,
             step: step,
@@ -559,6 +570,57 @@ struct MangaKitchenMCPServer {
         }
     }
 
+    private static func requiredAgentRegionResults(
+        _ arguments: [String: Value],
+        _ key: String
+    ) throws -> [MCPAgentRegionResult] {
+        guard let values = arguments[key]?.arrayValue, values.count <= 64 else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是 0...64 筆資料的陣列。")
+        }
+        return try values.enumerated().map { offset, item in
+            guard let object = item.objectValue else {
+                throw MCPServiceError.invalidArguments("\(key)[\(offset)] 必須是物件。")
+            }
+            let regionID = try requiredUUID(object, "region_id")
+            let sourceText = try requiredString(object, "source_text")
+            let translatedText = try requiredString(object, "translated_text")
+            let fontSize = number(object["font_size"])
+            if let fontSize, !fontSize.isFinite {
+                throw MCPServiceError.invalidArguments("\(key)[\(offset)].font_size 必須是有限數值。")
+            }
+            return MCPAgentRegionResult(
+                regionID: regionID,
+                sourceText: sourceText,
+                translatedText: translatedText,
+                translationAnchor: try optionalPoint(object, "translation_anchor"),
+                translationBounds: try optionalRect(object, "translation_bounds"),
+                fontName: object["font_name"]?.stringValue,
+                fontSize: fontSize,
+                fontWeight: try optionalEnum(object, "font_weight", as: DialogueFontWeight.self),
+                automaticFontSize: object["automatic_font_size"]?.boolValue,
+                writingDirection: try optionalEnum(object, "writing_direction", as: WritingDirection.self)
+            )
+        }
+    }
+
+    private static func progressReporter(
+        request: CallTool.Parameters,
+        server: Server?
+    ) -> MCPWorkflowService.Progress {
+        let token = request._meta?.progressToken
+        return { completed, message in
+            guard let token else { return }
+            Task {
+                try? await server?.notify(ProgressNotification.message(.init(
+                    progressToken: token,
+                    progress: completed,
+                    total: 1,
+                    message: message
+                )))
+            }
+        }
+    }
+
     private static func requiredEnum<T: RawRepresentable>(
         _ arguments: [String: Value],
         _ key: String,
@@ -643,6 +705,24 @@ struct MangaKitchenMCPServer {
             "required": ["bounds", "source_text"],
             "additionalProperties": false
         ])
+        let agentResult = Value.object([
+            "type": "object",
+            "description": "Agent 對 App 已產生區域的完整文字與排版結果；不可修改區域邊界或遮罩",
+            "properties": .object([
+                "region_id": property("string", "App 回傳的既有區域 UUID"),
+                "source_text": property("string", "該區域的原文；空白分鏡可填 NIL"),
+                "translated_text": property("string", "該區域的翻譯文字"),
+                "translation_anchor": point,
+                "translation_bounds": bounds,
+                "font_name": property("string", "macOS 字型名稱"),
+                "font_size": property("number", "固定字級 4...512；省略代表沿用或自動配適"),
+                "font_weight": enumProperty(["regular", "bold"]),
+                "automatic_font_size": property("boolean", "true 代表使用自動配適字級"),
+                "writing_direction": enumProperty(["automatic", "horizontal", "vertical"])
+            ]),
+            "required": ["region_id", "source_text", "translated_text"],
+            "additionalProperties": false
+        ])
         let translations = Value.object([
             "type": "object",
             "description": "BCP-47 語言代碼到固定譯詞，例如 {\"zh-Hant\":\"王都\",\"en\":\"Royal Capital\"}",
@@ -664,7 +744,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.workspace.open",
                 title: "開啟漫畫工作區",
-                description: "遞迴掃描來源目錄、建立頁面列表，並載入各原圖旁既有的 .str sidecar。",
+                description: "遞迴掃描來源目錄並建立頁面列表；App 會自行載入既有專案資料。",
                 inputSchema: objectSchema([
                     "source_directory": property("string", "來源目錄的絕對路徑"),
                     "output_directory": property("string", "可選的輸出目錄絕對路徑"),
@@ -676,7 +756,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.workspace.pages",
                 title: "列出待處理頁面",
-                description: "取得專案的檔案工作清單，供 Agent 收到使用者指令後自行迴圈處理。回傳每頁的 stage、缺原文／缺譯文／遮罩未通過的區域數，以及 next_action（submitRegions／writeSourceText／writeTranslation／compose／done）與該頁的原圖 URI。刻意不含 regions 內容，因此整個專案列出來也很輕量；需要細節時再讀 mangakitchen://page/{page_id}。",
+                description: "唯讀頁面狀態摘要。next_action 與 nextActionInstruction 只描述缺少的產物，不是要求 Agent 自行迴圈、清理或重做資料；處理頁面請使用 page.prepare_agent_task。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "pending_only": property("boolean", "預設 true，只回傳 next_action 不是 done 的頁面")
@@ -703,7 +783,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.workspace.set_output",
                 title: "設定輸出目錄",
-                description: "設定合成輸出位置並同步每頁 .str；輸出不可位於來源目錄內。",
+                description: "設定最終圖片輸出位置並同步專案狀態；輸出不可位於來源目錄內。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "output_directory": property("string", "輸出目錄的絕對路徑")
@@ -714,7 +794,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.workspace.configure",
                 title: "設定漫畫工作流",
-                description: "調整目標語言、閱讀順序、預設排字方向、字型、遮罩擴張、圖生圖修補與區域來源。",
+                description: "調整目標語言、閱讀順序、預設排字方向、字型、遮罩擴張、圖生圖修補與區域來源。未指定 reading_direction 時預設為 rightToLeft（由右至左）。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "target_language_code": property("string", "BCP-47 目標語言"),
@@ -725,8 +805,8 @@ struct MangaKitchenMCPServer {
                     "use_image_to_image_restoration": property("boolean", "是否優先使用圖生圖修補"),
                     "region_source": .object([
                         "type": "string",
-                        "enum": .array(["agent", "local"]),
-                        "description": "區域候選從哪裡來。agent（預設）＝你用 page.supplement_regions 提交文字粗框與原文，後端依原圖像素產生遮罩；local＝由本機 Core ML 偵測 BBOX 與氣泡形狀，再由你以 region.update 提供原文、譯文與排版。兩種模式的遮罩都由後端產生，翻譯與字型排列／大小都由你提供。切到 local 後 page.detect_masks 會重新產生系統區域與遮罩。"
+                        "enum": .array(["local", "agent"]),
+                        "description": "區域候選從哪裡來。local（預設）＝App 以內建 Manga109 Core ML 偵測氣泡 BBOX／形狀並產生像素遮罩，Agent 再以 region.update 提供原文、譯文與排版；agent＝相容後備，由 Agent 以 page.supplement_regions 提交文字粗框。兩種模式的步驟三都完全由 Agent 負責，App 不執行圖生文翻譯。"
                     ])
                 ], required: ["workspace_id"]),
                 annotations: idempotent,
@@ -740,6 +820,34 @@ struct MangaKitchenMCPServer {
                     "model_directory": property("string", "模型目錄的絕對路徑")
                 ], required: ["model_directory"]),
                 annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.prepare_agent_task",
+                title: "準備單頁 Agent 工作包",
+                description: "唯一頁面處理入口。缺少步驟二時 App 會先建立區域與像素遮罩，再一次回傳內嵌 regionData JSON 與原圖 image content；其中既有 sourceText／translatedText 是需要對照原圖校稿的草稿，既有排版欄位也可由 Agent 修正。Agent 不得搜尋 .str 檔案、讀取額外 page resource、自行偵測或重建區域。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": property("string", "要處理的單頁 UUID")
+                ], required: ["workspace_id", "page_id"]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.submit_agent_result",
+                title: "回寫 Agent 結果並輸出",
+                description: "一次接收本頁全部既有 region_id 的原文、譯文與排版，保留 App 步驟二遮罩、更新專案狀態並直接執行步驟四。陣列必須完整，不可新增、刪除、合併或修改區域與遮罩。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": property("string", "工作包中的單頁 UUID"),
+                    "regions": .object([
+                        "type": "array",
+                        "description": "工作包中全部區域的結果；region_id 必須與工作包完全一致",
+                        "items": agentResult,
+                        "maxItems": 64
+                    ])
+                ], required: ["workspace_id", "page_id", "regions"]),
+                annotations: mutating,
                 outputSchema: genericOutputSchema
             ),
             Tool(
@@ -778,7 +886,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.detect_masks",
                 title: "重建像素遮罩",
-                description: "步驟二，遮罩一律由系統產生。agent（預設）：把目前已提交的文字粗框依原圖像素收斂成遮罩，既有區域不會被覆寫；頁面還沒有區域時輸出空白遮罩，請接著用 page.supplement_regions 提交。local：由本機 Core ML 重新偵測 BBOX／氣泡形狀並產生遮罩；原文、翻譯與字體排列／大小仍由 Agent 以 region.update 提供。",
+                description: "步驟二，預設由 App 以內建 Manga109 Core ML 重新偵測氣泡 BBOX／形狀，再依原圖像素產生文字遮罩。完成後請讀取頁面區域與原圖，由 Agent 在步驟三抽取原文、翻譯並以 region.update 回傳文字及排版。明確使用 region_source=agent 時，此工具只重建已提交粗框的系統遮罩。Agent 不提交 mask_polygons。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent
@@ -786,7 +894,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.page.supplement_regions",
                 title: "由 Agent 補完文字區域",
-                description: "外部 Agent 讀取頁面原圖與目前區域後，批次提交涵蓋完整原文的粗框及原文。bounds 貼著文字給（決定譯文落點與字級），bubble_bounds 只在文字確實被封閉對話框包住時給（決定不可越界的硬邊界）；無框台詞請省略 bubble_bounds。後端依這些範圍與原圖像素產生並驗證遮罩，Agent 不提交 mask_polygons；高度重疊候選會略過，可安全重送。",
+                description: "補充遺漏區域或支援明確設定 region_source=agent 的相容後備。預設流程不要用它取代 page.detect_masks；App 應先用內建 Manga109 Core ML 建立氣泡區域與像素遮罩。需要補充時，Agent 可提交涵蓋完整原文的粗框及原文，後端仍負責產生與驗證遮罩，Agent 不提交 mask_polygons。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": property("string", "頁面 UUID"),
@@ -804,7 +912,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.translate",
                 title: "翻譯對話文字",
-                description: "步驟三在 MCP 為純 Agent 模式下不可用：後端不會呼叫內建圖生文模型翻譯。請改以 region.update 的 translated_text 逐區寫入譯文，再執行 page.compose。",
+                description: "MCP 的步驟三由 Agent 接手，此工具不會呼叫 App 內建圖生文模型。請讀取 App 已偵測的區域與原圖，由 Agent 抽取原文、翻譯並以 region.update 寫回文字及排版，再執行 page.compose。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent
@@ -812,7 +920,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.compose",
                 title: "合成翻譯頁面",
-                description: "步驟四：依目前遮罩修補背景、排版並輸出圖片。",
+                description: "步驟四：只使用目前已完成的步驟二遮罩與 Agent 透過 region.update 回傳的步驟三資料，修補背景、排版並輸出圖片。此工具不會自動重跑 detect_masks 或 translate；缺少資料時請依錯誤提示補前一步。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent
@@ -820,7 +928,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.run_full",
                 title: "一鍵處理完整頁",
-                description: "保留的一鍵功能：依序執行遮罩偵測、翻譯與合成；頁面列表來自步驟一。",
+                description: "相容的一鍵入口；只在步驟二遮罩、原文與譯文都已存在時接續合成，不會自動重跑 detect_masks 或代替 Agent 執行步驟三。缺少資料時請依錯誤提示補正後再執行。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent
@@ -840,13 +948,13 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.region.update",
                 title: "更新對話區域",
-                description: "逐區調整原文、譯文、落點、對話框邊界、字型、字級、字重與排字方向；遮罩由系統依目前範圍重新產生。",
+                description: "逐區寫入 Agent 抽取的原文、譯文、落點、字型、字級、字重與排字方向。只要沒有修改 bounds 或 bubble_bounds，就直接保留步驟二已完成的像素遮罩；只有修改遮罩幾何時才會重建遮罩。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": property("string", "頁面 UUID"),
                     "region_id": property("string", "區域 UUID"),
-                    "source_text": property("string", "來源原文"),
-                    "translated_text": property("string", "翻譯文字"),
+                    "source_text": property("string", "Agent 抽取的來源原文；屬於步驟三文字資料，不會重建既有遮罩"),
+                    "translated_text": property("string", "Agent 產生的翻譯文字；屬於步驟三文字資料，不會重建既有遮罩"),
                     "translation_anchor": point,
                     "bounds": bounds,
                     "bubble_bounds": bubbleBounds,
@@ -871,7 +979,18 @@ struct MangaKitchenMCPServer {
                 annotations: mutating,
                 outputSchema: genericOutputSchema
             ),
-        ]
+        ].filter { tool in
+            ![
+                "mangakitchen.page.detect_masks",
+                "mangakitchen.page.supplement_regions",
+                "mangakitchen.page.translate",
+                "mangakitchen.page.compose",
+                "mangakitchen.page.run_full",
+                "mangakitchen.region.create",
+                "mangakitchen.region.update",
+                "mangakitchen.region.remove"
+            ].contains(tool.name)
+        }
     }
 
     private static func workflowTool(
@@ -914,6 +1033,13 @@ struct MangaKitchenMCPServer {
             "type": "string",
             "enum": .array(values.map(Value.string))
         ])
+    }
+
+    private static func json<T: Encodable>(_ value: T) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return String(decoding: try encoder.encode(value), as: UTF8.self)
     }
 
     private static var genericOutputSchema: Value {

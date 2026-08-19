@@ -13,7 +13,11 @@ private final class MangaKitchenAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        guard let data = UserDefaults.standard.data(forKey: "MangaKitchen.AppPreferences.v1"),
+              let settings = try? JSONDecoder().decode(AppPreferences.self, from: data) else {
+            return true
+        }
+        return !settings.mcpEnabled
     }
 }
 

@@ -26,7 +26,8 @@ export const workflow = Object.freeze({
   chooseOutputDirectory: () => invoke("chooseOutputDirectory"),
   chooseModel: () => invoke("chooseModel"),
 
-  runBatch: (operation, pageIDs) => invoke("runBatch", { operation, pageIDs }),
+  runBatch: (operation, pageIDs, forceRecalculation = false) =>
+    invoke("runBatch", { operation, pageIDs, forceRecalculation }),
   detectMasks: (scope = "selected") =>
     invoke(scope === "all" ? "detectMasksAll" : "detectMasksSelected"),
   translate: (scope = "selected") =>

@@ -57,10 +57,10 @@ MangaKitchen 有兩種操作方式。它們只改變「誰負責推論與編排�
 
 1. **專案與頁面**：選取來源目錄、遞迴掃描圖片，建立可複選與批次處理的頁面列表。
 2. **文字與遮罩**：以內建 Core ML 氣泡分割模型定位對話框 BBOX 與形狀，再依原圖像素精修成字形遮罩；此步驟不呼叫 VLM。MCP Agent 也可直接提供區域與原文，使用者可添加、擦除與修正遮罩。
-3. **翻譯與排版**：先由 VLM 在既有 BBOX 中分類與轉錄原文，再翻譯、排版，並將每個區域的原文、譯文、位置、字型與字級寫入該圖片對應的 `.str`。
+3. **翻譯與排版**：GUI 由 VLM 在既有 BBOX 中分類與轉錄原文；MCP 則由 Agent 依 App 提供的工作包完成原文、翻譯與排版，結果由 App 回寫專案狀態。
 4. **修補與合成**：移除原字、修補背景、排入譯文，輸出到專案指定目錄。
 
-四步驟是可續作的狀態與產物契約，不是每次都要從步驟一重新執行的固定清單。GUI 與 MCP 都應先讀取頁面狀態與 `.str`，再從目前需要的任意步驟開始：已有遮罩可直接翻譯，已有譯文可直接調整排版或合成，只有某個區域需要修改時也只需更新該區域。除非使用者或 Agent 明確要求重做，已完成的區域辨識、遮罩、譯文與人工編修不應被覆蓋。
+四步驟是可續作的狀態與產物契約，不是每次都要從步驟一重新執行的固定清單。GUI 與 MCP 都應先讀取 App 提供的頁面狀態與工作包，再從目前需要的任意步驟開始：已有遮罩可直接翻譯，已有譯文可直接調整排版或合成，只有某個區域需要修改時也只需更新該區域。除非使用者或 Agent 明確要求重做，已完成的區域辨識、遮罩、譯文與人工編修不應被覆蓋。
 
 從任意步驟開始前，必須按頁面檢查實際資料，而不能只相信狀態名稱。若目標步驟缺少前置產物，就逐級回到最近一個需要補做的步驟：
 
@@ -78,21 +78,21 @@ MangaKitchen 有兩種操作方式。它們只改變「誰負責推論與編排�
 - GUI 可分步執行，也可使用「完整處理選取頁／全部頁面」。一鍵功能仍只是依序執行步驟二至四，不會跳過中間資料。
 - 所有結果都回寫專案與 `.str`，可在任何步驟人工修正後重新執行後續階段。
 
-### 用法 B：由 AI Agent 透過 MCP 完成
+### 用法 B：由 AI Agent 透過 MCP 校稿（推薦）
 
-在「設定 → MCP」啟用服務，設定 port 與 IP／CIDR 用戶端白名單，再讓支援 Streamable HTTP 的 AI Agent 連線。Agent 仍必須以 MCP 的 workspace／project 與四階段狀態操作，不能繞過專案資料直接產生不受管理的輸出；但可以依既有產物從任意步驟續作，不必重跑已完成階段。
+> **更推薦的流程：先跑本機流程，再使用 MCP 校稿。** 空白專案也可以直接交給 MCP；但若先由 App 本機批次完成四步驟初稿，Agent 就能直接檢查既有原文、譯文與排版，通常能得到更穩定的結果。MCP 會保留 App 已完成的遮罩與區域，不會重新建立或覆蓋它們。
 
-對全新、尚未處理的專案，不下載本機圖生文模型時，Agent 可依下列方式完成翻譯：
+在「設定 → MCP」啟用服務，設定 port 與 IP／CIDR 用戶端白名單，再讓支援 Streamable HTTP 的 AI Agent 連線。MCP 只提供單頁工作包，不要求 Agent 自行拆解、清除或重建四個步驟。
 
-1. 呼叫 `mangakitchen.workspace.open` 建立工作區並取得 `workspace_id`。
-2. 讀取頁面與原圖 resource，以 `mangakitchen.page.supplement_regions` 批次送入文字粗框與原文；遮罩由後端依原圖像素自動產生。
-3. 如需重算，呼叫 `mangakitchen.page.detect_masks`；Agent 不提供 `mask_polygons`。
-4. 翻譯各區原文，並以 `mangakitchen.region.update` 寫回每區的 `source_text`、譯文、字體、排字方向與字級設定。
-5. 呼叫 `mangakitchen.page.compose` 完成背景修補與輸出。
+1. （推薦）先在 GUI 開啟專案，載入本機模型，使用「完整處理選取頁／全部頁面」批次完成四步驟初稿；也可以略過此步驟，從空白流程開始。
+2. 在「設定 → MCP」啟用服務，讓支援 Streamable HTTP 的 AI Agent 連線。
+3. Agent 呼叫 `mangakitchen.workspace.open` 取得 `workspace_id`，再對指定頁面呼叫 `mangakitchen.page.prepare_agent_task`。若步驟二尚未完成，App 會先建立氣泡區域與像素遮罩，再於同一個 tool result 回傳原圖 image content 及內嵌 `regionData` JSON。
+4. Agent 依工作包逐區處理：既有 `sourceText`／`translatedText` 視為待校稿草稿，對照原圖修正原文與翻譯，並調整 HTML 排版的尺寸、位置、字重與直橫排方向；空白欄位則重新抽取或翻譯。不得新增、刪除、合併或修改區域與遮罩。
+5. Agent 以 `mangakitchen.page.submit_agent_result` 一次回傳全部區域的校稿原文、譯文與排版；App 保留步驟二遮罩、更新內部專案資料，並直接執行步驟四輸出。
 
-若本機也已載入模型，可將 `region_source` 設為 `local`，讓步驟二使用本機 Core ML 氣泡 BBOX／形狀與系統像素遮罩；MCP 的原文、譯文與排版仍由 Agent 以 `region.update` 提供。兩種模式的遮罩都由系統產生，純 Agent 模式採用 `supplement_regions → region.update → compose`。
+`region_source` 與舊的逐區工具僅保留相容性，不是預設 MCP 流程。MCP 步驟三完全由 Agent 接手，App 不會執行內建 VLM 轉錄或翻譯；Agent 不得搜尋、讀取或建立 `.str`，也不需自行讀取多個 page resource 或呼叫 `region.update`。
 
-對既有專案，Agent 應先讀取 workspace、page 與 `.str` resource 判斷目前進度及實際產物，再只呼叫需要的 tool。例如 `maskReady` 且遮罩檔有效時可直接從翻譯或 `region.update` 開始，`translationReady` 且譯文完整時可直接 `compose`，已輸出的頁面也能只修改單一區域後重新合成。若檢查發現資料缺失，Agent 必須依上述規則逐級回溯；純 Agent 模式回溯到步驟三時，由 Agent 補譯並呼叫 `region.update`，不強制改用本機模型。
+對既有專案，Agent 不應自行清除、重新掃描或重跑已完成的步驟；只對使用者指定的頁面建立工作包。`workspace.pages` 只作狀態查詢，不是要求 Agent 自行迴圈執行的命令清單。
 
 MCP 模式同樣支援多工作區、明確的 `workspace_id`、多頁批次、專案專有名詞表、取消與進度通知。AI Agent 是工作流操作者，不是另一套儲存後端。
 

@@ -476,7 +476,7 @@ async function selectOrCalculateWorkflowStep(step, operation, force = false) {
     await runBatch(operation, pageIDs);
     return;
   }
-  await runBatchWithCalculationDialog(operation, pageIDs);
+  await runBatchWithCalculationDialog(operation, pageIDs, force);
 }
 
 function advanceWorkflowStep() {
@@ -489,7 +489,11 @@ function advanceWorkflowStep() {
   return selectOrCalculateWorkflowStep(destination.step, destination.operation);
 }
 
-async function runBatchWithCalculationDialog(operation, pageIDs) {
+async function runBatchWithCalculationDialog(
+  operation,
+  pageIDs,
+  forceRecalculation = false,
+) {
   if (!pageIDs.length) {
     showError(new Error(t("selectAtLeastOnePage")));
     return null;
@@ -502,7 +506,7 @@ async function runBatchWithCalculationDialog(operation, pageIDs) {
     return null;
   }
   openCalculationDialog(operation, pageIDs);
-  const result = await runBatch(operation, pageIDs);
+  const result = await runBatch(operation, pageIDs, forceRecalculation);
   if (!result?.jobID) {
     closeCalculationDialog();
     return null;
@@ -1454,14 +1458,31 @@ function finishCanvasPan(event) {
 }
 
 function resolvedTranslationDirection(region) {
-  if (region.style.writingDirection !== "automatic") return region.style.writingDirection;
-  const bounds = region.bounds;
-  const hasCJK = /[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff]/u.test(
-    `${region.sourceText}${region.translatedText}`
-  );
-  return hasCJK && (region.sourceText.includes("　") || bounds.height > bounds.width * 0.8)
-    ? "vertical"
-    : "horizontal";
+  const translatedText = region.translatedText;
+  const hasKoreanTranslation = /[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/u.test(translatedText);
+  const hasCJKTranslation = /[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff]/u.test(translatedText);
+  const hasLatinTranslation = /[A-Za-z\u00c0-\u024f]/u.test(translatedText);
+  let direction;
+  if (region.style.writingDirection !== "automatic") {
+    direction = region.style.writingDirection;
+  } else if (hasKoreanTranslation) {
+    direction = "horizontal";
+  } else if (hasLatinTranslation && !hasCJKTranslation) {
+    direction = "horizontal";
+  } else if (region.detectedWritingDirection !== "automatic") {
+    direction = region.detectedWritingDirection;
+  } else {
+    const bounds = region.bounds;
+    const hasCJK = /[\u1100-\u11ff\u3000-\u30ff\u3130-\u318f\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]/u.test(
+      `${region.sourceText}${region.translatedText}`
+    );
+    direction = hasCJK && (region.sourceText.includes("　") || bounds.height > bounds.width * 0.8)
+      ? "vertical"
+      : "horizontal";
+  }
+  return hasKoreanTranslation && direction === "vertical"
+    ? "vertical korean-vertical"
+    : direction;
 }
 
 function translationAnchor(region) {
@@ -1471,7 +1492,10 @@ function translationAnchor(region) {
 }
 
 function translationLayoutBounds(region) {
-  return region.translationBounds ?? region.bubbleBounds ?? region.bounds;
+  return region.translationBounds
+    ?? region.bubbleLayoutBounds
+    ?? region.bubbleBounds
+    ?? region.bounds;
 }
 
 function translationSourceFontSize(page, region) {
@@ -1484,14 +1508,6 @@ function translationSourceFontSize(page, region) {
   const minimum = Math.max(4, region.style.minimumFontSize ?? 9);
   const maximum = Math.min(512, Math.max(minimum, region.style.maximumFontSize ?? 40));
   return region.style.fontSize ?? clamp(Math.sqrt(sourceArea / sourceCount) * 1.08, minimum, maximum);
-}
-
-function translationPreviewFontSize(page, region) {
-  const sourceFontSize = translationSourceFontSize(page, region);
-  const displayScale = elements.outputPreview.clientWidth > 0
-    ? elements.outputPreview.clientWidth / Math.max(1, page.pixelWidth)
-    : 1;
-  return Math.max(5, sourceFontSize * displayScale);
 }
 
 function selectedTranslationRegion(page) {
@@ -1579,11 +1595,8 @@ function updateTranslationElementBounds(element, bounds) {
 
 function fitAutomaticTranslationText(element, page, region) {
   if (region.style.fontSize != null || !element.clientWidth || !element.clientHeight) return;
-  const displayScale = elements.outputPreview.clientWidth > 0
-    ? elements.outputPreview.clientWidth / Math.max(1, page.pixelWidth)
-    : 1;
-  let lower = Math.max(3, (region.style.minimumFontSize ?? 4) * displayScale);
-  let upper = Math.max(lower, (region.style.maximumFontSize ?? 40) * displayScale);
+  let lower = Math.max(3, region.style.minimumFontSize ?? 4);
+  let upper = Math.max(lower, region.style.maximumFontSize ?? 40);
   for (let index = 0; index < 10; index += 1) {
     const candidate = (lower + upper) / 2;
     element.style.fontSize = `${candidate}px`;
@@ -1769,6 +1782,15 @@ function renderTranslationLayer(page) {
   elements.translationLayer.hidden = !visible;
   if (!visible) return;
 
+  const displayWidth = elements.outputPreview.clientWidth;
+  const displayHeight = elements.outputPreview.clientHeight;
+  const scaleX = displayWidth > 0 ? displayWidth / Math.max(1, page.pixelWidth) : 1;
+  const scaleY = displayHeight > 0 ? displayHeight / Math.max(1, page.pixelHeight) : scaleX;
+  elements.translationLayer.style.width = `${page.pixelWidth}px`;
+  elements.translationLayer.style.height = `${page.pixelHeight}px`;
+  elements.translationLayer.style.transformOrigin = "top left";
+  elements.translationLayer.style.transform = `scale(${scaleX}, ${scaleY})`;
+
   for (const [index, region] of page.regions.entries()) {
     if (!region.translatedText.trim()) continue;
     const direction = resolvedTranslationDirection(region);
@@ -1780,7 +1802,7 @@ function renderTranslationLayer(page) {
     text.textContent = region.translatedText;
     text.title = t("dragTranslationText", { number: index + 1 });
     text.style.fontFamily = region.style.fontName;
-    text.style.fontSize = `${translationPreviewFontSize(page, region)}px`;
+    text.style.fontSize = `${translationSourceFontSize(page, region)}px`;
     text.style.fontWeight = region.style.fontWeight === "bold" ? "700" : "400";
     text.style.color = region.style.textColorHex;
     updateTranslationElementBounds(text, bounds);
@@ -2122,8 +2144,24 @@ function targetLanguageDisplayName(languageCode) {
   return option?.textContent.trim() || languageCode;
 }
 
+function resolvedTargetLanguageCode(languageCode) {
+  if (languageCode !== "auto") return languageCode;
+  const locale = (navigator.language || "en-US").replace(/_/g, "-");
+  const [language, ...parts] = locale.split("-");
+  const region = parts.find((part) => part.length === 2)?.toUpperCase();
+  const script = parts.find((part) => part.length === 4)?.toLowerCase();
+  if (language === "zh") {
+    return script === "hans" || ["CN", "SG"].includes(region) ? "zh-Hans" : "zh-Hant";
+  }
+  const codes = {
+    ja: "ja-JP", en: "en-US", ko: "ko-KR", fr: "fr-FR", de: "de-DE", es: "es-ES",
+    it: "it-IT", pt: "pt-BR", ru: "ru-RU", th: "th-TH", vi: "vi-VN", id: "id-ID",
+  };
+  return codes[language] ?? "en-US";
+}
+
 function renderGlossary() {
-  const targetLanguageCode = state.options.targetLanguageCode;
+  const targetLanguageCode = resolvedTargetLanguageCode(state.options.targetLanguageCode);
   elements.glossaryCount.textContent = String(state.glossary.length);
   elements.glossaryTargetLabel.textContent = t("glossaryTarget", {
     language: targetLanguageDisplayName(targetLanguageCode),
@@ -2319,7 +2357,7 @@ function updateSettings() {
   }).catch(showError);
 }
 
-async function runBatch(operation, pageIDs) {
+async function runBatch(operation, pageIDs, forceRecalculation = false) {
   if (!pageIDs.length) {
     showError(new Error(t("selectAtLeastOnePage")));
     return null;
@@ -2341,7 +2379,11 @@ async function runBatch(operation, pageIDs) {
   }
   await flushPendingRegionUpdates();
   stopRegionUpdateTimers();
-  const result = await invoke("runBatch", { operation, pageIDs }).catch((error) => {
+  const result = await invoke("runBatch", {
+    operation,
+    pageIDs,
+    forceRecalculation,
+  }).catch((error) => {
     showError(error);
     return null;
   });
@@ -2380,7 +2422,7 @@ function addGlossaryEntry() {
   }
   invoke("upsertGlossaryEntry", {
     sourceTerm,
-    translations: { [state.options.targetLanguageCode]: translatedTerm },
+    translations: { [resolvedTargetLanguageCode(state.options.targetLanguageCode)]: translatedTerm },
   }).then(() => {
     elements.glossarySource.value = "";
     elements.glossaryTargetTerm.value = "";
@@ -2467,7 +2509,10 @@ document.addEventListener("pointerdown", (event) => {
   }
 }, true);
 window.addEventListener("blur", hideRegionContextMenu);
-window.addEventListener("resize", hideRegionContextMenu);
+window.addEventListener("resize", () => {
+  hideRegionContextMenu();
+  renderTranslationLayer(activePage());
+});
 document.querySelector("#select-visible").addEventListener("click", () => {
   const ids = filteredPages().map((page) => page.id);
   setSelection(ids, ids[0] ?? state.selectedPageID);

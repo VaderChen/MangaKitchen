@@ -98,10 +98,10 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
             recognized.rawSourceText = text
             recognized.sourceText = text
             recognized.ocrTextRefined = true
-            recognized.style.writingDirection = item.direction
+            recognized.detectedWritingDirection = item.direction
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
                 .flatMap(WritingDirection.init(rawValue:))
-                ?? recognized.style.writingDirection
+                ?? recognized.detectedWritingDirection
             recognizedByID[recognized.id] = recognized
             progress(Double(offset + 1) / Double(regionCount))
         }

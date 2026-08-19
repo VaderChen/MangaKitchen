@@ -145,6 +145,7 @@ public struct BatchJob: Identifiable, Codable, Hashable, Sendable {
     public var projectID: UUID
     public var projectName: String
     public var operation: BatchOperation
+    public var forceRecalculation: Bool
     public var pageIDs: [UUID]
     public var status: BatchJobStatus
     public var currentPageID: UUID?
@@ -159,6 +160,7 @@ public struct BatchJob: Identifiable, Codable, Hashable, Sendable {
         projectID: UUID,
         projectName: String,
         operation: BatchOperation,
+        forceRecalculation: Bool = false,
         pageIDs: [UUID],
         status: BatchJobStatus = .queued,
         currentPageID: UUID? = nil,
@@ -172,6 +174,7 @@ public struct BatchJob: Identifiable, Codable, Hashable, Sendable {
         self.projectID = projectID
         self.projectName = projectName
         self.operation = operation
+        self.forceRecalculation = forceRecalculation
         self.pageIDs = pageIDs
         self.status = status
         self.currentPageID = currentPageID
@@ -180,6 +183,39 @@ public struct BatchJob: Identifiable, Codable, Hashable, Sendable {
         self.createdAt = createdAt
         self.startedAt = startedAt
         self.finishedAt = finishedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case projectID
+        case projectName
+        case operation
+        case forceRecalculation
+        case pageIDs
+        case status
+        case currentPageID
+        case completedPageIDs
+        case failures
+        case createdAt
+        case startedAt
+        case finishedAt
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        projectID = try values.decode(UUID.self, forKey: .projectID)
+        projectName = try values.decode(String.self, forKey: .projectName)
+        operation = try values.decode(BatchOperation.self, forKey: .operation)
+        forceRecalculation = try values.decodeIfPresent(Bool.self, forKey: .forceRecalculation) ?? false
+        pageIDs = try values.decode([UUID].self, forKey: .pageIDs)
+        status = try values.decode(BatchJobStatus.self, forKey: .status)
+        currentPageID = try values.decodeIfPresent(UUID.self, forKey: .currentPageID)
+        completedPageIDs = try values.decode([UUID].self, forKey: .completedPageIDs)
+        failures = try values.decode([BatchPageFailure].self, forKey: .failures)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        startedAt = try values.decodeIfPresent(Date.self, forKey: .startedAt)
+        finishedAt = try values.decodeIfPresent(Date.self, forKey: .finishedAt)
     }
 
     public var progress: Double {

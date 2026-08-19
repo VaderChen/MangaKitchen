@@ -220,7 +220,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
             }
             let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
             guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
-            let jobID = store.enqueueBatch(operation: operation, pageIDs: pageIDs)
+            let jobID = store.enqueueBatch(
+                operation: operation,
+                pageIDs: pageIDs,
+                forceRecalculation: params["forceRecalculation"] as? Bool ?? false
+            )
             return jobID.map { ["jobID": $0.uuidString] } ?? [:]
         case "cancelProcessing":
             store.cancelProcessing()

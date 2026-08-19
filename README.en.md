@@ -57,10 +57,10 @@ Both modes follow these four steps:
 
 1. **Project and pages**: choose a source directory, scan images recursively, and build a multi-selectable, batch-processable page list.
 2. **Text and masks**: locate dialogue BBOX candidates and bubble shapes with the bundled Core ML segmentation model, then refine the original-image pixels into glyph masks. The local VLM classifies and transcribes candidates in step 3. An MCP Agent may instead provide regions and source text directly before mask editing.
-3. **Translation and typesetting**: write each region's source text, translated text, position, font, and size to the image's `.str` file.
+3. **Translation and typesetting**: the GUI uses its VLM, while MCP gives an Agent an App-generated page bundle for transcription, translation, and typesetting; the App writes the results back to project state.
 4. **Restoration and composition**: remove the original text, restore the background, typeset the translation, and save it to the project's output directory.
 
-The four steps define resumable states, artifacts, and dependencies; they are not a mandatory checklist that restarts at step 1 every time. Both the GUI and MCP should inspect page state and `.str` first, then begin at any step whose prerequisites already exist. Existing masks can go directly to translation, existing translations can go directly to typesetting or composition, and a single region can be edited without reprocessing the page. Completed region detection, masks, translations, and manual edits are not overwritten unless a user or Agent explicitly requests that stage again.
+The four steps define resumable states, artifacts, and dependencies; they are not a mandatory checklist that restarts at step 1 every time. Both the GUI and MCP should inspect the App-provided page state and work package first, then begin at any step whose prerequisites already exist. Existing masks can go directly to translation, existing translations can go directly to typesetting or composition, and a single region can be edited without reprocessing the page. Completed region detection, masks, translations, and manual edits are not overwritten unless a user or Agent explicitly requests that stage again.
 
 Before starting at any stage, each page must be validated against its actual artifacts rather than trusting the state label alone. If the requested stage lacks a prerequisite, walk backward one stage at a time until reaching the nearest work that must be regenerated:
 
@@ -78,21 +78,21 @@ Set an image-to-text model and, optionally, an image-to-image model under Settin
 - The GUI can run each step separately or use “Process Selected/All.” One-click processing still executes steps 2–4 in order and preserves their intermediate data.
 - Every result is written back to the project and `.str`, so users can correct any stage and rerun only the downstream steps.
 
-### Mode B: Let an AI Agent Operate Through MCP
+### Mode B: Proofread Through MCP (Recommended)
 
-Enable MCP under Settings → MCP, configure the port and client IP/CIDR allowlist, then connect an AI Agent that supports Streamable HTTP. The Agent must still operate through MCP workspace/project state and four-stage artifacts rather than producing unmanaged output, but it may resume at any stage and does not need to repeat completed work.
+> **Recommended flow: run locally first, then use MCP for proofreading.** A blank project can still start directly through MCP, but a local four-stage draft gives the Agent existing source text, translations, and typesetting to review, usually producing more stable results. MCP preserves the App-generated regions and masks instead of rebuilding or overwriting them.
 
-For a new, unprocessed project without a local image-to-text model, an Agent can complete translation as follows:
+Enable MCP under Settings → MCP, configure the port and client IP/CIDR allowlist, then connect an AI Agent that supports Streamable HTTP. MCP provides one page work package instead of asking the Agent to decompose, clear, or rebuild the four stages.
 
-1. Call `mangakitchen.workspace.open` and retain the returned `workspace_id`.
-2. Read the page and source-image resources, then batch-submit rough text boxes and source text through `mangakitchen.page.supplement_regions`; the backend generates masks from the original pixels.
-3. Call `mangakitchen.page.detect_masks` when a mask needs to be recomputed; the Agent does not submit `mask_polygons`.
-4. Translate each region and write `source_text`, translated text, font, writing direction, and size settings through `mangakitchen.region.update`.
-5. Call `mangakitchen.page.compose` to restore the background and generate output.
+1. (Recommended) In the GUI, open the project, load the local models, and use “Process Selected/All” to complete a four-stage draft in batch. This step may be skipped when starting from a blank project.
+2. Enable MCP under Settings → MCP and connect an AI Agent that supports Streamable HTTP.
+3. The Agent calls `mangakitchen.workspace.open` to obtain `workspace_id`, then calls `mangakitchen.page.prepare_agent_task` for each requested page. If stage two is missing, the App creates the bubble regions and pixel masks before returning the source image content and embedded `regionData` JSON.
+4. The Agent processes each existing region: treat non-empty `sourceText` and `translatedText` as drafts to proofread against the image, fill or correct empty or inaccurate text, and adjust HTML typesetting bounds, anchor, size, weight, and writing direction. It must not add, remove, merge, or modify regions or masks.
+5. Call `mangakitchen.page.submit_agent_result` once with all proofread text, translations, and typesetting results. The App preserves the stage-two masks, updates its internal project state, and immediately performs stage-four composition and output.
 
-If local model resources are available, set `region_source` to `local` to use local Core ML BBOX/shape detection and system-generated pixel masks in step 2. MCP source text, translations, and typesetting are still always supplied by the Agent through `region.update`. Both modes keep mask generation in the backend; pure Agent mode uses `supplement_regions → region.update → compose`.
+`region_source` and the older per-region tools remain for compatibility and are not the default MCP flow. MCP step three is fully Agent-owned; the App does not run its built-in VLM transcription or translation. The Agent must not search for, read, or create `.str` files, and it does not need to read multiple page resources or call `region.update`.
 
-For an existing project, the Agent should inspect workspace, page, and `.str` resources plus their actual artifacts, then call only the required tools. A `maskReady` page with a valid mask can begin with translation or `region.update`; a `translationReady` page with complete translated text can go directly to `compose`; and a completed page can update one region and recompose without rerunning region or mask detection. If validation finds missing data, the Agent walks backward using the rules above. In pure Agent mode, falling back to step 3 means the Agent supplies translations through `region.update`; it does not force a local model.
+For existing projects, the Agent must not clear, rescan, or rerun completed stages on its own; it prepares a work package only for pages requested by the user. `workspace.pages` is a status query, not an instruction to start an autonomous loop.
 
 MCP mode also supports multiple workspaces, explicit `workspace_id` values, multi-page batches, project glossaries, cancellation, and progress notifications. The AI Agent is a workflow operator, not a separate storage backend.
 

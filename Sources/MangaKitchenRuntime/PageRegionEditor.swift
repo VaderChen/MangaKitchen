@@ -35,6 +35,9 @@ public struct RegionEdit {
     public var fontWeight: DialogueFontWeight?
     public var writingDirection: WritingDirection?
     public var automaticMaskEnabled: Bool?
+    /// MCP 步驟三只補文字時設為 false，保留步驟二已完成的像素遮罩。
+    /// GUI 編輯預設為 true，修改原文時仍可依需要重新精修。
+    public var sourceTextChangesMaskGeometry: Bool = true
 
     public init() {}
 }
@@ -62,7 +65,7 @@ public struct PageRegionEditor: Sendable {
         public var maskURL: URL?
     }
 
-    /// 套用欄位變更。回傳是否動到幾何 —— 動到就代表舊的像素遮罩已經失效。
+    /// 套用欄位變更。回傳是否動到遮罩幾何 —— 動到才代表舊的像素遮罩已經失效。
     ///
     /// 純資料轉換，沒有 I/O，兩邊共用同一份判斷。
     @discardableResult
@@ -108,9 +111,9 @@ public struct PageRegionEditor: Sendable {
             region.automaticMaskEnabled = automaticMaskEnabled
         }
 
-        // 原文影響「每字面積」的合理性判斷，粗框與對話框直接決定搜尋範圍。
-        // 任一改變，既有的像素遮罩就不再代表現況。
-        let geometryChanged = edit.sourceText != nil
+        // 粗框與對話框邊界直接決定搜尋範圍。MCP 步驟三可明確保留既有遮罩，
+        // 因為 Agent 回傳 sourceText／translatedText 只是補上文字資料。
+        let geometryChanged = (edit.sourceText != nil && edit.sourceTextChangesMaskGeometry)
             || edit.bounds != nil
             || edit.bubbleBounds.isChange
         if geometryChanged {
