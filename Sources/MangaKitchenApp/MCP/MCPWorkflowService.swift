@@ -120,6 +120,8 @@ enum MCPResourcePayload: Sendable {
 
 actor MCPWorkflowService {
     typealias Progress = @Sendable (_ completed: Double, _ message: String) -> Void
+    typealias StateChangeHandler = @MainActor @Sendable (MCPWorkspaceState) async -> Void
+    typealias StateProvider = @MainActor @Sendable (URL) async -> WorkspaceSnapshot?
 
     private let models: ModelRuntimeHub
     /// 用來把 Agent 目測的粗框對齊到本機偵測；兩種 region_source 都會用到。
@@ -152,16 +154,22 @@ actor MCPWorkflowService {
     private var glossary = ProjectGlossary()
     private var pages: [ComicPage] = []
     private var workspaces: [UUID: MCPWorkspaceContext] = [:]
+    private let stateChangeHandler: StateChangeHandler?
+    private let stateProvider: StateProvider?
 
     init(
         dataDirectoryPath: String?,
-        imageCompositingBackend: ImageCompositingBackend = .cpu
+        imageCompositingBackend: ImageCompositingBackend = .cpu,
+        stateChangeHandler: StateChangeHandler? = nil,
+        stateProvider: StateProvider? = nil
     ) throws {
         let metal = try MetalContext()
         let models = ModelRuntimeHub(metal: metal)
         let root = try Self.makeWorkspaceRoot(dataDirectoryPath: dataDirectoryPath)
         self.models = models
         self.workspaceRoot = root
+        self.stateChangeHandler = stateChangeHandler
+        self.stateProvider = stateProvider
         let maskGenerator = DialogueMaskGenerator()
         let typesetter = HTMLDialogueTypesetter()
         let backgroundRestorer = try HybridBackgroundRestorer(
@@ -223,7 +231,17 @@ actor MCPWorkflowService {
         if let existing = workspaces.values.first(where: {
             $0.sourceDirectoryURL.standardizedFileURL == sourceDirectoryURL.standardizedFileURL
         }) {
-            try activateWorkspaceContext(existing.id)
+            try await requireWorkspace(existing.id)
+        } else if let snapshot = await stateProvider?(sourceDirectoryURL.standardizedFileURL) {
+            saveActiveWorkspace()
+            workspaceID = snapshot.projectID
+            self.sourceDirectoryURL = sourceDirectoryURL.standardizedFileURL
+            self.outputDirectoryURL = snapshot.outputDirectoryURL?.standardizedFileURL
+            options = snapshot.options
+            options.useImageToImageRestoration = false
+            regionSource = .agent
+            glossary = snapshot.glossary
+            pages = snapshot.pages
         } else {
             saveActiveWorkspace()
             let newWorkspaceID = UUID()
@@ -268,7 +286,7 @@ actor MCPWorkflowService {
             page.pixelHeight = item.pixelHeight
             return page
         }
-        for index in pages.indices {
+        for index in pages.indices where knownPages[pages[index].sourceURL.path] == nil {
             let tableURL = try stringTableURL(for: pages[index])
             if let table = try await stringTables.load(from: tableURL) {
                 pages[index].regions = table.regions
@@ -278,11 +296,14 @@ actor MCPWorkflowService {
                     : .maskReady
             }
         }
-        saveActiveWorkspace()
-        return await state()
+        await publishStateChange()
+        return await currentState()
     }
 
     func listWorkspaces() async -> [MCPWorkspaceState] {
+        if let workspaceID {
+            try? await requireWorkspace(workspaceID)
+        }
         saveActiveWorkspace()
         let loadedModels = await models.loadedModels()
         return workspaces.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -302,13 +323,13 @@ actor MCPWorkflowService {
     }
 
     func activateWorkspace(workspaceID: UUID) async throws -> MCPWorkspaceState {
-        try activateWorkspaceContext(workspaceID)
-        return await state()
+        try await requireWorkspace(workspaceID)
+        await publishStateChange()
+        return await currentState()
     }
 
     func rescanWorkspace(workspaceID: UUID) async throws -> MCPWorkspaceState {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+        try await requireWorkspace(workspaceID)
         guard let sourceDirectoryURL else { throw MCPServiceError.workspaceNotOpen }
         let previousPages = pages
         let oldPages = Dictionary(
@@ -358,17 +379,18 @@ actor MCPWorkflowService {
             rescanned.append(page)
         }
         pages = rescanned
-        return await state()
+        await publishStateChange()
+        return await currentState()
     }
 
     func setOutputDirectory(workspaceID: UUID, directoryURL: URL) async throws -> MCPWorkspaceState {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+        try await requireWorkspace(workspaceID)
         guard let sourceDirectoryURL else { throw MCPServiceError.workspaceNotOpen }
         try validateOutputDirectory(directoryURL, sourceDirectoryURL: sourceDirectoryURL)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         outputDirectoryURL = directoryURL.standardizedFileURL
-        return await state()
+        await publishStateChange()
+        return await currentState()
     }
 
     func configure(
@@ -380,9 +402,8 @@ actor MCPWorkflowService {
         maskExpansion: Double?,
         useImageToImageRestoration: Bool?,
         regionSource: MCPRegionSource?
-    ) throws -> MCPWorkspaceConfiguration {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+    ) async throws -> MCPWorkspaceConfiguration {
+        try await requireWorkspace(workspaceID)
         if let targetLanguageCode {
             let trimmed = targetLanguageCode.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { throw MCPServiceError.invalidArguments("target_language_code 不可為空。") }
@@ -396,6 +417,7 @@ actor MCPWorkflowService {
         }
         options.useImageToImageRestoration = false
         if let regionSource { self.regionSource = regionSource }
+        await publishStateChange()
         return MCPWorkspaceConfiguration(options: options, regionSource: self.regionSource)
     }
 
@@ -403,8 +425,8 @@ actor MCPWorkflowService {
         return try await models.loadModel(at: directoryURL)
     }
 
-    func glossaryEntries(workspaceID: UUID) throws -> [GlossaryEntry] {
-        try requireWorkspace(workspaceID)
+    func glossaryEntries(workspaceID: UUID) async throws -> [GlossaryEntry] {
+        try await requireWorkspace(workspaceID)
         return glossary.entries
     }
 
@@ -414,9 +436,8 @@ actor MCPWorkflowService {
         sourceTerm: String,
         translations: [String: String],
         note: String?
-    ) throws -> GlossaryEntry {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+    ) async throws -> GlossaryEntry {
+        try await requireWorkspace(workspaceID)
         let source = sourceTerm.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !source.isEmpty else {
             throw MCPServiceError.invalidArguments("source_term 不可為空。")
@@ -434,16 +455,17 @@ actor MCPWorkflowService {
         guard let saved = glossary.entries.first(where: { $0.id == savedID }) else {
             throw MCPServiceError.glossaryEntryNotFound
         }
+        await publishStateChange()
         return saved
     }
 
-    func removeGlossaryEntry(workspaceID: UUID, entryID: UUID) throws -> [GlossaryEntry] {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+    func removeGlossaryEntry(workspaceID: UUID, entryID: UUID) async throws -> [GlossaryEntry] {
+        try await requireWorkspace(workspaceID)
         guard glossary.entries.contains(where: { $0.id == entryID }) else {
             throw MCPServiceError.glossaryEntryNotFound
         }
         glossary.remove(entryID: entryID)
+        await publishStateChange()
         return glossary.entries
     }
 
@@ -453,8 +475,7 @@ actor MCPWorkflowService {
         pageIDs requestedPageIDs: [UUID]?,
         progress: @escaping Progress
     ) async throws -> MCPWorkflowResult {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+        try await requireWorkspace(workspaceID)
         let targetIDs = try resolvePageIDs(requestedPageIDs)
         // 純 Agent 模式沒有任何步驟會用到 imageToText，因此不再檢查該模型。
         // 需要譯文的步驟改由 AgentDrivenTranslator 拋出可操作的錯誤說明。
@@ -498,6 +519,7 @@ actor MCPWorkflowService {
                 }
             }
             progress(Double(offset + 1) / Double(targetIDs.count), "完成頁面：\(pageID.uuidString)")
+            await publishStateChange()
         }
         return MCPWorkflowResult(
             workspaceID: workspaceID,
@@ -542,7 +564,7 @@ actor MCPWorkflowService {
         workspaceID: UUID,
         pendingOnly: Bool
     ) async throws -> MCPWorkspacePageList {
-        try requireWorkspace(workspaceID)
+        try await requireWorkspace(workspaceID)
         guard let context = workspaces[workspaceID] else {
             throw MCPServiceError.workspaceNotFound
         }
@@ -616,8 +638,7 @@ actor MCPWorkflowService {
         pageID: UUID,
         proposals: [MCPAgentRegionProposal]
     ) async throws -> MCPAgentSupplementResult {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+        try await requireWorkspace(workspaceID)
         guard !proposals.isEmpty, proposals.count <= 64 else {
             throw MCPServiceError.invalidArguments("regions 每次必須包含 1...64 個候選區域。")
         }
@@ -698,6 +719,7 @@ actor MCPWorkflowService {
         pages[pageIndex].progress = 0.25
         pages[pageIndex].errorMessage = nil
         try await persistStringTable(pageID: pageID)
+        await publishStateChange()
 
         return MCPAgentSupplementResult(
             page: pages[pageIndex],
@@ -722,8 +744,7 @@ actor MCPWorkflowService {
         useAutomaticFontSize: Bool?,
         writingDirection: WritingDirection?
     ) async throws -> DialogueRegion {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+        try await requireWorkspace(workspaceID)
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
               let regionIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
             throw MCPServiceError.regionNotFound
@@ -763,6 +784,7 @@ actor MCPWorkflowService {
                 : .maskReady
             try await persistStringTable(pageID: pageID)
         }
+        await publishStateChange()
         return pages[pageIndex].regions[regionIndex]
     }
 
@@ -771,8 +793,7 @@ actor MCPWorkflowService {
         pageID: UUID,
         bounds: NormalizedRect
     ) async throws -> DialogueRegion {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+        try await requireWorkspace(workspaceID)
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
             throw MCPServiceError.pageNotFound
         }
@@ -790,23 +811,30 @@ actor MCPWorkflowService {
         )
         pages[pageIndex].regions = outcome.regions
         try await refreshEditedPage(pageIndex: pageIndex)
+        await publishStateChange()
         return pages[pageIndex].regions[pages[pageIndex].regions.count - 1]
     }
 
     func removeRegion(workspaceID: UUID, pageID: UUID, regionID: UUID) async throws -> ComicPage {
-        try requireWorkspace(workspaceID)
-        defer { saveActiveWorkspace() }
+        try await requireWorkspace(workspaceID)
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
               let regionIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
             throw MCPServiceError.regionNotFound
         }
         pages[pageIndex].regions.remove(at: regionIndex)
         try await refreshEditedPage(pageIndex: pageIndex)
+        await publishStateChange()
         return pages[pageIndex]
     }
 
     func state() async -> MCPWorkspaceState {
-        saveActiveWorkspace()
+        if let workspaceID {
+            try? await requireWorkspace(workspaceID)
+        }
+        return await currentState()
+    }
+
+    private func currentState() async -> MCPWorkspaceState {
         return MCPWorkspaceState(
             workspaceID: workspaceID,
             name: sourceDirectoryURL?.lastPathComponent,
@@ -820,11 +848,17 @@ actor MCPWorkflowService {
         )
     }
 
-    func resources() -> [ComicPage] {
-        pages
+    func resources() async -> [ComicPage] {
+        if let workspaceID {
+            try? await requireWorkspace(workspaceID)
+        }
+        return pages
     }
 
     func readResource(uri: String) async throws -> MCPResourcePayload {
+        if let workspaceID {
+            try await requireWorkspace(workspaceID)
+        }
         if uri == "mangakitchen://workspace/list" {
             return .text(try Self.json(await listWorkspaces()), mimeType: "application/json")
         }
@@ -1087,8 +1121,29 @@ actor MCPWorkflowService {
         return ids
     }
 
-    private func requireWorkspace(_ id: UUID) throws {
-        try activateWorkspaceContext(id)
+    private func requireWorkspace(_ id: UUID) async throws {
+        let sourceURL: URL
+        if workspaceID == id, let sourceDirectoryURL {
+            sourceURL = sourceDirectoryURL
+        } else if let context = workspaces[id] {
+            sourceURL = context.sourceDirectoryURL
+        } else {
+            throw MCPServiceError.workspaceNotFound
+        }
+        if let snapshot = await stateProvider?(sourceURL.standardizedFileURL) {
+            saveActiveWorkspace()
+            workspaceID = id
+            sourceDirectoryURL = snapshot.sourceDirectoryURL?.standardizedFileURL ?? sourceURL
+            outputDirectoryURL = snapshot.outputDirectoryURL?.standardizedFileURL
+            options = snapshot.options
+            options.useImageToImageRestoration = false
+            regionSource = workspaces[id]?.regionSource ?? regionSource
+            glossary = snapshot.glossary
+            pages = snapshot.pages
+            saveActiveWorkspace()
+        } else {
+            try activateWorkspaceContext(id)
+        }
     }
 
     private func activateWorkspaceContext(_ id: UUID) throws {
@@ -1119,6 +1174,12 @@ actor MCPWorkflowService {
             pages: pages,
             regionSource: regionSource
         )
+    }
+
+    private func publishStateChange() async {
+        saveActiveWorkspace()
+        guard let stateChangeHandler else { return }
+        await stateChangeHandler(await currentState())
     }
 
     private func validateOutputDirectory(_ output: URL, sourceDirectoryURL: URL) throws {

@@ -7,11 +7,15 @@ struct MangaKitchenMCPServer {
         port: Int,
         allowedClients: [String],
         dataDirectoryPath: String?,
-        imageCompositingBackend: ImageCompositingBackend = .cpu
+        imageCompositingBackend: ImageCompositingBackend = .cpu,
+        stateChangeHandler: MCPWorkflowService.StateChangeHandler? = nil,
+        stateProvider: MCPWorkflowService.StateProvider? = nil
     ) throws -> MangaKitchenMCPHTTPHost {
         let service = try MCPWorkflowService(
             dataDirectoryPath: dataDirectoryPath,
-            imageCompositingBackend: imageCompositingBackend
+            imageCompositingBackend: imageCompositingBackend,
+            stateChangeHandler: stateChangeHandler,
+            stateProvider: stateProvider
         )
         return try MangaKitchenMCPHTTPHost(
             configuration: .init(port: port, allowedClients: allowedClients),

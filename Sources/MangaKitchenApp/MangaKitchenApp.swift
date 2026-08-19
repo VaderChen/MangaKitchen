@@ -42,19 +42,28 @@ private struct MangaKitchenApplication: App {
         if let enabled = configuration.mcpEnabled {
             preferences.setMCPEnabled(enabled)
         }
+        let settings = preferences.settings
+        let store = AppStore(
+            dataDirectoryPath: settings.dataDirectoryPath,
+            imageCompositingBackend: settings.resolvedImageCompositingBackend,
+            imageToTextModelPath: settings.imageToTextModelPath,
+            imageToImageModelPath: settings.imageToImageModelPath
+        )
         let mcpController = MCPServiceController(
-            enabled: preferences.settings.mcpEnabled,
-            port: configuration.mcpPort ?? preferences.settings.mcpPort,
+            enabled: settings.mcpEnabled,
+            port: configuration.mcpPort ?? settings.mcpPort,
             portOverride: configuration.mcpPort,
-            allowedClients: preferences.settings.mcpAllowedClients,
-            dataDirectoryPath: preferences.settings.dataDirectoryPath,
-            imageCompositingBackend: preferences.settings.resolvedImageCompositingBackend
+            allowedClients: settings.mcpAllowedClients,
+            dataDirectoryPath: settings.dataDirectoryPath,
+            imageCompositingBackend: settings.resolvedImageCompositingBackend,
+            store: store
         )
         _preferences = StateObject(wrappedValue: preferences)
         _bridge = StateObject(
             wrappedValue: HybridBridgeController(
                 preferences: preferences,
-                mcpController: mcpController
+                mcpController: mcpController,
+                store: store
             )
         )
         _mcpController = StateObject(wrappedValue: mcpController)

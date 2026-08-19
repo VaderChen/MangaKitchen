@@ -5,6 +5,15 @@ import MangaKitchenCore
 /// CPU 合成後端：以每個遮罩連通區外圍最常見的顏色填補文字區域。
 /// 對漫畫對話框通常會選中紙張的底色，避免 GPU 鄰域取樣把線稿拖入框內。
 public actor CPUBubbleCleaner {
+    /// 取樣環與遮罩之間要留的安全距離（像素）。
+    ///
+    /// 緊貼遮罩的那一圈正好是抗鋸齒殘留：門檻切不掉、又比紙白暗。拿它當樣本，
+    /// 每個字會依自己的筆畫量取到不同深淺的底色，填completed之後就浮出一層字形鬼影。
+    /// 往外退幾個像素才取得到乾淨的紙面。
+    private static let sampleInset = 3
+    /// 取樣環的厚度。太薄會在小字周圍取不到足夠樣本。
+    private static let sampleThickness = 3
+
     public init() {}
 
     public func clean(
@@ -25,6 +34,14 @@ public actor CPUBubbleCleaner {
         var source = try rgbaPixels(from: sourceImage)
         let mask = try rgbaPixels(from: maskImage)
         let masked = stride(from: 0, to: mask.count, by: 4).map { mask[$0] > 0 }
+        // 取樣時要避開的範圍：遮罩本身再往外幾像素。緊貼遮罩那一圈是抗鋸齒殘留，
+        // 比紙面暗，取到它就會依每個字的筆畫量得到不同深淺的底色。
+        let excluded = MaskDilation.dilated(
+            masked,
+            width: width,
+            height: height,
+            radius: Self.sampleInset
+        )
         let components = try connectedComponents(masked: masked, width: width, height: height)
         progress(0.2)
 
@@ -32,7 +49,7 @@ public actor CPUBubbleCleaner {
             try Task.checkCancellation()
             let fill = dominantBoundaryColor(
                 for: component,
-                masked: masked,
+                masked: excluded,
                 source: source,
                 width: width,
                 height: height
@@ -132,24 +149,14 @@ public actor CPUBubbleCleaner {
         width: Int,
         height: Int
     ) -> RGBAColor {
-        var boundaryPixels: Set<Int> = []
-        boundaryPixels.reserveCapacity(component.pixels.count)
-        for pixelIndex in component.pixels {
-            let x = pixelIndex % width
-            let y = pixelIndex / width
-            for offsetY in -1...1 {
-                let sampleY = y + offsetY
-                guard sampleY >= 0, sampleY < height else { continue }
-                for offsetX in -1...1 where offsetX != 0 || offsetY != 0 {
-                    let sampleX = x + offsetX
-                    guard sampleX >= 0, sampleX < width else { continue }
-                    let sampleIndex = sampleY * width + sampleX
-                    if !masked[sampleIndex] {
-                        boundaryPixels.insert(sampleIndex)
-                    }
-                }
-            }
-        }
+        // `masked` 傳進來的是「膨脹後的排除範圍」，所以貼著元件往外找即可。
+        let boundaryPixels = ringPixels(
+            around: component,
+            masked: masked,
+            width: width,
+            height: height,
+            inset: Self.sampleInset
+        )
 
         guard !boundaryPixels.isEmpty else {
             return RGBAColor(red: 255, green: 255, blue: 255, alpha: 255)
@@ -183,6 +190,37 @@ public actor CPUBubbleCleaner {
             blue: UInt8(selected.blue / selected.count),
             alpha: UInt8(selected.alpha / selected.count)
         )
+    }
+
+    /// 收集離元件 `inset`...`inset + thickness` 像素、且不在遮罩內的取樣點。
+    private func ringPixels(
+        around component: Component,
+        masked: [Bool],
+        width: Int,
+        height: Int,
+        inset: Int
+    ) -> Set<Int> {
+        let outer = inset + Self.sampleThickness
+        var result: Set<Int> = []
+        result.reserveCapacity(component.pixels.count)
+        for pixelIndex in component.pixels {
+            let x = pixelIndex % width
+            let y = pixelIndex / width
+            for offsetY in -outer...outer {
+                let sampleY = y + offsetY
+                guard sampleY >= 0, sampleY < height else { continue }
+                for offsetX in -outer...outer {
+                    // 用 Chebyshev 距離判斷屬於哪一圈。
+                    let distance = max(abs(offsetX), abs(offsetY))
+                    guard distance >= inset, distance <= outer else { continue }
+                    let sampleX = x + offsetX
+                    guard sampleX >= 0, sampleX < width else { continue }
+                    let sampleIndex = sampleY * width + sampleX
+                    if !masked[sampleIndex] { result.insert(sampleIndex) }
+                }
+            }
+        }
+        return result
     }
 
     private struct ColorAccumulator {

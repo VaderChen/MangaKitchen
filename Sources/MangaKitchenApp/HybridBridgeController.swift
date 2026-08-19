@@ -23,17 +23,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
 
     init(
         preferences: AppPreferencesController,
-        mcpController: MCPServiceController
+        mcpController: MCPServiceController,
+        store: AppStore
     ) {
         self.preferences = preferences
         self.mcpController = mcpController
-        let settings = preferences.settings
-        store = AppStore(
-            dataDirectoryPath: settings.dataDirectoryPath,
-            imageCompositingBackend: settings.resolvedImageCompositingBackend,
-            imageToTextModelPath: settings.imageToTextModelPath,
-            imageToImageModelPath: settings.imageToImageModelPath
-        )
+        self.store = store
         super.init()
         storeCancellable = store.objectWillChange.sink { [weak self] _ in
             Task { @MainActor [weak self] in

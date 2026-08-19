@@ -240,8 +240,11 @@ struct WebGlobalSettings: Encodable {
                 ?? "http://127.0.0.1:\(mcpController.port)/mcp"
             : nil
         mcpAllowedClients = preferences.mcpAllowedClients
-        appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-            ?? "0.1.0"
+        let marketingVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "0.1.0"
+        let buildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        appVersion = buildVersion.map { "\(marketingVersion) build \($0)" } ?? marketingVersion
     }
 }
 

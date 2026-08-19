@@ -39,6 +39,12 @@ public actor MetalBubbleCleaner {
 
         let sourceTexture = try makeReadTexture(from: sourceImage)
         let maskTexture = try makeReadTexture(from: maskImage)
+        // 取樣要避開的範圍：遮罩往外膨脹幾像素，把抗鋸齒殘留整圈排除。
+        // 只用「離目前像素夠遠」不夠 —— 字內部的像素往外取樣照樣會落進殘留圈。
+        let exclusionTexture = try makeExclusionTexture(
+            from: maskImage,
+            radius: Self.sampleInset
+        )
         let outputTexture = try makeTexture(
             width: width,
             height: height,
@@ -58,6 +64,7 @@ public actor MetalBubbleCleaner {
         encoder.setTexture(sourceTexture, index: 0)
         encoder.setTexture(maskTexture, index: 1)
         encoder.setTexture(outputTexture, index: 2)
+        encoder.setTexture(exclusionTexture, index: 3)
         var searchRadius = UInt32(min(192, max(24, min(width, height) / 12)))
         encoder.setBytes(&searchRadius, length: MemoryLayout<UInt32>.size, index: 0)
 
@@ -191,6 +198,60 @@ public actor MetalBubbleCleaner {
         return texture
     }
 
+    /// 取樣時要避開的距離（像素）。
+    private static let sampleInset = 3
+
+    /// 把遮罩膨脹後做成單通道材質，供 shader 判斷哪些像素不能當樣本。
+    private func makeExclusionTexture(from maskImage: CGImage, radius: Int) throws -> any MTLTexture {
+        let width = maskImage.width
+        let height = maskImage.height
+        var gray = [UInt8](repeating: 0, count: width * height)
+        let drawn = gray.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else { return false }
+            context.draw(maskImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { throw ImageProcessingError.cannotCreateBitmap }
+
+        let dilated = MaskDilation.dilated(
+            gray.map { $0 > 127 },
+            width: width,
+            height: height,
+            radius: radius
+        )
+        var bytes = [UInt8](repeating: 0, count: width * height)
+        for index in dilated.indices where dilated[index] { bytes[index] = 255 }
+
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
+        guard let texture = metal.device.makeTexture(descriptor: descriptor) else {
+            throw ImageProcessingError.cannotCreateBitmap
+        }
+        bytes.withUnsafeBytes { buffer in
+            texture.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: buffer.baseAddress!,
+                bytesPerRow: width
+            )
+        }
+        return texture
+    }
+
     private static let kernelSource = """
     #include <metal_stdlib>
     using namespace metal;
@@ -199,6 +260,7 @@ public actor MetalBubbleCleaner {
         texture2d<float, access::read> source [[texture(0)]],
         texture2d<float, access::read> mask [[texture(1)]],
         texture2d<float, access::write> output [[texture(2)]],
+        texture2d<float, access::read> exclusion [[texture(3)]],
         constant uint &searchRadius [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]])
     {
@@ -222,8 +284,7 @@ public actor MetalBubbleCleaner {
                 float angle = 6.28318530718f * float(index) / float(directions);
                 int2 point = int2(round(float2(gid) + float2(cos(angle), sin(angle)) * radius));
                 uint2 coordinate = uint2(clamp(point, int2(0), maximumPoint));
-                float maskValue = mask.read(coordinate).r;
-                if (maskValue <= 0.0f) {
+                if (exclusion.read(coordinate).r <= 0.0f) {
                     float3 color = source.read(coordinate).rgb;
                     float luminance = dot(color, float3(0.299f, 0.587f, 0.114f));
                     uint bin = min(15u, uint(clamp(luminance, 0.0f, 1.0f) * 15.999f));
@@ -258,7 +319,7 @@ public actor MetalBubbleCleaner {
                 float angle = 6.28318530718f * float(index) / float(directions);
                 int2 point = int2(round(float2(gid) + float2(cos(angle), sin(angle)) * radius));
                 uint2 coordinate = uint2(clamp(point, int2(0), maximumPoint));
-                if (mask.read(coordinate).r > 0.0f) continue;
+                if (exclusion.read(coordinate).r > 0.0f) continue;
                 float4 candidate = source.read(coordinate);
                 float luminance = dot(candidate.rgb, float3(0.299f, 0.587f, 0.114f));
                 uint bin = min(15u, uint(clamp(luminance, 0.0f, 1.0f) * 15.999f));

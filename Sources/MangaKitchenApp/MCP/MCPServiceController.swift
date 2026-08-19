@@ -23,6 +23,8 @@ final class MCPServiceController: ObservableObject {
     private var imageCompositingBackend: ImageCompositingBackend
     private let portOverride: Int?
     private let dataDirectoryPath: String?
+    private let stateChangeHandler: MCPWorkflowService.StateChangeHandler
+    private let stateProvider: MCPWorkflowService.StateProvider
 
     init(
         enabled: Bool,
@@ -30,7 +32,8 @@ final class MCPServiceController: ObservableObject {
         portOverride: Int?,
         allowedClients: [String],
         dataDirectoryPath: String?,
-        imageCompositingBackend: ImageCompositingBackend
+        imageCompositingBackend: ImageCompositingBackend,
+        store: AppStore
     ) {
         self.enabled = enabled
         self.port = port
@@ -38,6 +41,12 @@ final class MCPServiceController: ObservableObject {
         self.allowedClients = allowedClients
         self.dataDirectoryPath = dataDirectoryPath
         self.imageCompositingBackend = imageCompositingBackend
+        stateChangeHandler = { @MainActor [weak store] state in
+            await store?.applyMCPState(state)
+        }
+        stateProvider = { @MainActor [weak store] sourceDirectoryURL in
+            await store?.snapshotForMCP(sourceDirectoryURL: sourceDirectoryURL)
+        }
         state = enabled ? .starting : .disabled
     }
 
@@ -97,7 +106,9 @@ final class MCPServiceController: ObservableObject {
                     port: port,
                     allowedClients: allowedClients,
                     dataDirectoryPath: dataDirectoryPath,
-                    imageCompositingBackend: imageCompositingBackend
+                    imageCompositingBackend: imageCompositingBackend,
+                    stateChangeHandler: stateChangeHandler,
+                    stateProvider: stateProvider
                 )
                 self.host = host
                 try await host.run { [weak self] endpointURL in

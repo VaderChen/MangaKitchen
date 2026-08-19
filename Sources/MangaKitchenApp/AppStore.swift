@@ -139,6 +139,92 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func applyMCPState(_ state: MCPWorkspaceState) async {
+        guard let sourceDirectoryURL = state.sourceDirectoryURL?.standardizedFileURL else { return }
+        let isActiveSource = self.sourceDirectoryURL?.standardizedFileURL == sourceDirectoryURL
+        if !isActiveSource {
+            await persistActiveProjectNow()
+        }
+        let existingProject = projects.first {
+            $0.sourceDirectoryURL.standardizedFileURL == sourceDirectoryURL
+        }
+        let projectID = existingProject?.id ?? state.workspaceID ?? UUID()
+        let existingSnapshot: WorkspaceSnapshot?
+        if isActiveSource {
+            existingSnapshot = makeActiveSnapshot()
+        } else if let cached = projectSnapshots[projectID] {
+            existingSnapshot = cached
+        } else {
+            existingSnapshot = try? await projectRepository(for: projectID)?.load()
+        }
+        let selectionPages = existingSnapshot?.pages ?? []
+        let selectedSourcePaths = Set(
+            (existingSnapshot?.selectedPageIDs ?? []).compactMap { pageID in
+                selectionPages.first(where: { $0.id == pageID })?
+                    .sourceURL.standardizedFileURL.path
+            }
+        )
+        let activeSourcePath = existingSnapshot?.selectedPageID.flatMap { pageID in
+            selectionPages.first(where: { $0.id == pageID })?
+                .sourceURL.standardizedFileURL.path
+        }
+        let incomingPages = state.pages
+        let previousPages = Dictionary(
+            uniqueKeysWithValues: selectionPages.map {
+                ($0.sourceURL.standardizedFileURL.path, $0)
+            }
+        )
+        let selectedIncomingPageID = incomingPages.first {
+            $0.sourceURL.standardizedFileURL.path == activeSourcePath
+        }?.id ?? incomingPages.first?.id
+        let selectedIncomingPageIDs = Set(
+            incomingPages.filter {
+                selectedSourcePaths.contains($0.sourceURL.standardizedFileURL.path)
+            }.map(\.id)
+        )
+        let snapshot = WorkspaceSnapshot(
+            projectID: projectID,
+            name: existingProject?.name ?? state.name ?? sourceDirectoryURL.lastPathComponent,
+            createdAt: existingSnapshot?.createdAt ?? Date(),
+            options: state.options,
+            glossary: state.glossary,
+            pages: incomingPages,
+            selectedPageID: selectedIncomingPageID,
+            selectedPageIDs: selectedIncomingPageIDs.isEmpty
+                ? Set(selectedIncomingPageID.map { [$0] } ?? [])
+                : selectedIncomingPageIDs,
+            modelDirectories: existingSnapshot?.modelDirectories ?? [],
+            sourceDirectoryURL: sourceDirectoryURL,
+            outputDirectoryURL: state.outputDirectoryURL?.standardizedFileURL
+        )
+        let restored = validated(snapshot)
+        for page in restored.pages {
+            let path = page.sourceURL.standardizedFileURL.path
+            if previousPages[path] != page {
+                advanceMaskRevision(pageID: page.id)
+            }
+        }
+        projectSnapshots[projectID] = restored
+        cache(restored)
+        apply(restored)
+        schedulePersistence()
+        statusMessage = "MCP 已同步專案資料。"
+    }
+
+    func snapshotForMCP(sourceDirectoryURL: URL) async -> WorkspaceSnapshot? {
+        let sourceURL = sourceDirectoryURL.standardizedFileURL
+        if self.sourceDirectoryURL?.standardizedFileURL == sourceURL {
+            return makeActiveSnapshot()
+        }
+        guard let projectID = projects.first(where: {
+            $0.sourceDirectoryURL.standardizedFileURL == sourceURL
+        })?.id else { return nil }
+        if let cached = projectSnapshots[projectID] {
+            return cached
+        }
+        return try? await projectRepository(for: projectID)?.load()
+    }
+
     // MARK: - 專案管理與步驟一
 
     /// 每個來源目錄對應一個專案；重複選取既有目錄時改為切換並重掃。

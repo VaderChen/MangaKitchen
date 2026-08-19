@@ -8,7 +8,8 @@ readonly PROJECT_ROOT="$SCRIPT_DIRECTORY"
 readonly PRODUCT_NAME="MangaKitchen"
 readonly APP_NAME="${PRODUCT_NAME}.app"
 readonly OUTPUT_DIRECTORY="${OUTPUT_DIRECTORY:-$PROJECT_ROOT/Dist}"
-readonly APP_VERSION="$(date '+1.%y%m.%H%M')"
+readonly APP_VERSION="${APP_VERSION:-$(date '+1.%y.%m%d')}"
+readonly APP_BUILD_VERSION="${APP_BUILD_VERSION:-$(date '+%H%M')}"
 readonly APP_ICON_PATH="$PROJECT_ROOT/Sources/MangaKitchenApp/Resources/AppIcon/MangaKitchen.icns"
 
 configuration="release"
@@ -28,6 +29,8 @@ print_usage() {
 
 環境變數：
   OUTPUT_DIRECTORY  指定 .app 輸出目錄，預設為專案內的 Dist
+  APP_VERSION       App 版本，預設為 1.YY.MMDD
+  APP_BUILD_VERSION Build 編號，預設為 HHmm
 EOF
 }
 
@@ -276,7 +279,7 @@ cat > "$temporary_app/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key>
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>$APP_VERSION</string>
+  <string>$APP_BUILD_VERSION</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.graphics-design</string>
   <key>LSMinimumSystemVersion</key>
@@ -332,7 +335,7 @@ fi
 
 print ""
 print "建置完成：$final_app"
-print "App 版本：$APP_VERSION"
+print "App 版本：$APP_VERSION build $APP_BUILD_VERSION"
 print "可使用以下指令開啟："
 print "open ${(q)final_app}"
 
