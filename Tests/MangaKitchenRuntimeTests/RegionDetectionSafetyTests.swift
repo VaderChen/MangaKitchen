@@ -208,6 +208,35 @@ final class RegionDetectionSafetyTests: XCTestCase {
         XCTAssertFalse(refined[0].automaticMaskEnabled)
     }
 
+    func testFailedPixelRefinementKeepsExistingCoarseMaskEnabled() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MangaKitchen-MaskFallback-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.png")
+        let source = try makeImage(width: 120, height: 120) { context in
+            context.setFillColor(gray: 1, alpha: 1)
+            context.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+        }
+        try CGImageIO.writePNG(source, to: sourceURL)
+        let region = DialogueRegion(
+            bounds: NormalizedRect(x: 0.3, y: 0.3, width: 0.4, height: 0.4),
+            sourceText: "現金な",
+            confidence: 1,
+            automaticMaskEnabled: true
+        )
+
+        let refined = try await MangaTextMaskRefiner().refineMasks(
+            sourceURL: sourceURL,
+            regions: [region]
+        )
+
+        XCTAssertTrue(refined[0].maskPolygons.isEmpty)
+        XCTAssertTrue(refined[0].automaticMaskEnabled, "精修失敗不得停用既有粗遮罩")
+        XCTAssertFalse(refined[0].maskRefinementApplied)
+    }
+
     func testLargeSpokenAttackTextRemainsMaskable() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MangaKitchen-MaskSpokenAttack-\(UUID().uuidString)", isDirectory: true)

@@ -64,8 +64,11 @@ public actor VLMRegionTranslationService: RegionTranslating {
         let promptRegionsJSON = try Self.json(promptRegions)
         let draftEnd = qualityOptions.reviewPassEnabled ? 0.55 : 0.9
 
-        let drafts: [UUID: TranslationItem]
+        var drafts: [UUID: TranslationItem]
         if qualityOptions.usePageContext {
+            // 整頁回覆偶爾只含部分 UUID。大部分結果仍可保留，只針對遺漏區域
+            // 個別補翻；同時為補翻預留一小段單調遞增的進度範圍。
+            let pageDraftEnd = draftEnd * 0.85
             do {
                 drafts = try await generateItems(
                     pageURL: pageURL,
@@ -77,8 +80,27 @@ public actor VLMRegionTranslationService: RegionTranslating {
                         qualityOptions: qualityOptions
                     ),
                     expectedRegions: regions,
-                    progress: { value in progress(value * draftEnd) }
+                    progress: { value in progress(value * pageDraftEnd) }
                 )
+                let missingRegions = regions.filter {
+                    drafts[$0.id]?.resolvedDisplayTranslation == nil
+                }
+                if missingRegions.isEmpty {
+                    progress(draftEnd)
+                } else {
+                    let recovered = try await generateIndividually(
+                        regions: missingRegions,
+                        pageURL: pageURL,
+                        targetLanguageCode: targetLanguageCode,
+                        glossaryJSON: glossaryJSON,
+                        qualityOptions: qualityOptions,
+                        regionProgress: regionProgress,
+                        progress: { value in
+                            progress(pageDraftEnd + value * (draftEnd - pageDraftEnd))
+                        }
+                    )
+                    drafts.merge(recovered) { _, recoveredValue in recoveredValue }
+                }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -89,7 +111,9 @@ public actor VLMRegionTranslationService: RegionTranslating {
                     glossaryJSON: glossaryJSON,
                     qualityOptions: qualityOptions,
                     regionProgress: regionProgress,
-                    progress: { value in progress(value * draftEnd) }
+                    progress: { value in
+                        progress(pageDraftEnd + value * (draftEnd - pageDraftEnd))
+                    }
                 )
             }
         } else {
@@ -154,8 +178,10 @@ public actor VLMRegionTranslationService: RegionTranslating {
                     ))
                 }
                 translated.translationQAFlags = flags.sorted { $0.rawValue < $1.rawValue }
-            } else if qualityOptions.qualityCheckEnabled {
-                translated.translationQAFlags = [.missingTranslation]
+            } else {
+                var flags = Set(translated.translationQAFlags)
+                flags.insert(.missingTranslation)
+                translated.translationQAFlags = flags.sorted { $0.rawValue < $1.rawValue }
             }
             translatedRegions.append(translated)
         }

@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import ImageIO
 import MangaKitchenCore
 import MangaKitchenRuntime
 @preconcurrency import WebKit
@@ -19,6 +20,9 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private var preferencesCancellable: AnyCancellable?
     private var mcpCancellable: AnyCancellable?
     private var pendingPush: Task<Void, Never>?
+    private var updateCheckTask: Task<Void, Never>?
+    private var hasStartedUpdateCheck = false
+    private var availableUpdate: GitHubReleaseUpdate?
     private var pageReady = false
 
     init(
@@ -60,7 +64,8 @@ final class HybridBridgeController: NSObject, ObservableObject {
             let data = try encoder.encode(WebAppState(
                 store: store,
                 preferences: preferences.settings,
-                mcpController: mcpController
+                mcpController: mcpController,
+                availableUpdate: availableUpdate
             ))
             guard let json = String(data: data, encoding: .utf8) else { return }
             webView.evaluateJavaScript("window.MangaKitchenNative?.receiveState(\(json));")
@@ -87,6 +92,10 @@ final class HybridBridgeController: NSObject, ObservableObject {
         switch method {
         case "bootstrap":
             pushState()
+            startUpdateCheckIfNeeded()
+            return nil
+        case "openExternalURL":
+            try openExternalURL(params)
             return nil
         case "updateInterfaceLanguage":
             guard let setting = params["setting"] as? String,
@@ -208,6 +217,8 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "updateSettings":
             try updateSettings(params)
             return nil
+        case "samplePageColor":
+            return try samplePageColor(params)
         case "upsertGlossaryEntry":
             return try upsertGlossaryEntry(params)
         case "removeGlossaryEntry":
@@ -617,6 +628,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
         if let amount = double(params["maskExpansion"]), amount.isFinite {
             value.maskExpansion = min(max(amount, 0), 0.75)
         }
+        if let eraseColorHex = params["eraseColorHex"] as? String {
+            value.eraseColorHex = DialogueStyle.normalizedHexColor(
+                eraseColorHex,
+                fallback: value.eraseColorHex
+            )
+        }
         value.useImageToImageRestoration = false
         if let preserve = params["preserveUntranslatedRegions"] as? Bool {
             value.preserveUntranslatedRegions = preserve
@@ -647,6 +664,50 @@ final class HybridBridgeController: NSObject, ObservableObject {
             value.translationQuality = quality
         }
         store.setOptions(value)
+    }
+
+    private func samplePageColor(_ params: [String: Any]) throws -> [String: String] {
+        guard let pageID = uuid(params["pageID"]),
+              let page = store.pages.first(where: { $0.id == pageID }),
+              let normalizedX = double(params["x"]), normalizedX.isFinite,
+              let normalizedY = double(params["y"]), normalizedY.isFinite,
+              let source = CGImageSourceCreateWithURL(page.sourceURL as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, [
+                kCGImageSourceShouldCacheImmediately: true
+              ] as CFDictionary) else {
+            throw BridgeError.invalidParameters
+        }
+        let pixelX = min(image.width - 1, max(0, Int(normalizedX * Double(image.width))))
+        let pixelY = min(image.height - 1, max(0, Int(normalizedY * Double(image.height))))
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let rendered = pixel.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: 1,
+                height: 1,
+                bitsPerComponent: 8,
+                bytesPerRow: 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)
+                    ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(
+                    rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                ).union(.byteOrder32Big).rawValue
+            ) else { return false }
+            context.setBlendMode(.copy)
+            context.interpolationQuality = .none
+            context.draw(
+                image,
+                in: CGRect(
+                    x: CGFloat(-pixelX),
+                    y: CGFloat(-pixelY),
+                    width: CGFloat(image.width),
+                    height: CGFloat(image.height)
+                )
+            )
+            return true
+        }
+        guard rendered else { throw BridgeError.invalidParameters }
+        return ["hex": String(format: "#%02X%02X%02X", pixel[0], pixel[1], pixel[2])]
     }
 
     private func upsertGlossaryEntry(_ params: [String: Any]) throws -> [String: Any] {
@@ -851,6 +912,33 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return result
     }
 
+    private func startUpdateCheckIfNeeded() {
+        guard !hasStartedUpdateCheck else { return }
+        hasStartedUpdateCheck = true
+        let checker = GitHubReleaseChecker()
+        updateCheckTask = Task { @MainActor [weak self] in
+            let update = try? await checker.availableUpdate()
+            guard !Task.isCancelled, let self else { return }
+            self.updateCheckTask = nil
+            guard let update else { return }
+            self.availableUpdate = update
+            self.scheduleStatePush()
+        }
+    }
+
+    private func openExternalURL(_ params: [String: Any]) throws {
+        guard let value = params["url"] as? String,
+              let url = URL(string: value),
+              url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == "github.com",
+              url.path.lowercased().hasPrefix("/vaderchen/mangakitchen/releases/") else {
+            throw BridgeError.externalURLNotAllowed
+        }
+        guard NSWorkspace.shared.open(url) else {
+            throw BridgeError.cannotOpenExternalURL
+        }
+    }
+
     private func localized(_ key: String) -> String {
         NativeLocalization.text(key, languageCode: interfaceLanguageCode)
     }
@@ -906,6 +994,8 @@ private enum BridgeError: LocalizedError {
     case invalidParameters
     case unknownMethod(String)
     case modelCapabilityMismatch(String)
+    case externalURLNotAllowed
+    case cannotOpenExternalURL
 
     var errorDescription: String? {
         switch self {
@@ -913,6 +1003,10 @@ private enum BridgeError: LocalizedError {
         case let .unknownMethod(method): "未知的 Bridge 方法：\(method)"
         case let .modelCapabilityMismatch(capability):
             "所選模型不符合預期類型：\(capability)。"
+        case .externalURLNotAllowed:
+            "只允許開啟 MangaKitchen 的 GitHub Release 連結。"
+        case .cannotOpenExternalURL:
+            "無法使用預設瀏覽器開啟 GitHub Release。"
         }
     }
 }

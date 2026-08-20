@@ -8,6 +8,8 @@ MangaKitchen is a native macOS workspace for translating comics. Its frontend re
   <img src="AppPic/screen01.jpg" alt="MangaKitchen application window" width="800">
 </p>
 
+[Download the latest notarized DMG](https://github.com/VaderChen/MangaKitchen/releases/latest) · Requires macOS 14 or later
+
 ## Copyright and Lawful Use
 
 All imported comic pages, characters, text, artwork, trademarks, and other content remain the property of their respective authors, publishers, licensed platforms, and other lawful rights holders. Using MangaKitchen does not transfer those rights or grant permission to reproduce, translate, publicly transmit, distribute, or sell a work.
@@ -33,21 +35,24 @@ GPLv3 itself permits commercial use and paid distribution, subject to its source
 - Command/Shift multi-selection, search, status filters, and batch mask detection, translation, and composition.
 - A single sequential batch queue with current-page progress, success/failure counts, cancellation, history cleanup, and failed-page retry; region-by-region translation also reports the current region, total regions, and actual progress.
 - A project-specific multilingual glossary. One source term can map to multiple BCP-47 languages, with automatic selection for the current target language.
-- Four-stage workflow: scan, text/mask, translation/typesetting settings, and background restoration/composition, plus full-page and all-page orchestration.
+- Four-stage workflow with strict artifact ownership: project/pages; dialogue regions, pixel masks, and clean background; transcription, translation, optional SR, and HTML typesetting preview; then final-output save. A later stage never reruns an earlier stage implicitly.
 - One versioned `.str` JSON file per image, storing text, position, font, fixed/automatic size, and mask strokes.
-- Pixel-layer dilation first absorbs anti-aliased edges, then normalized brush strokes add, erase, and undo masks before generating a binary PNG. The pipeline no longer vector-strokes each run rectangle, avoiding gray fringe artifacts. After stage two, a CPU/GPU mask-cleanup preview with the original text removed appears immediately without starting the image-to-image model.
+- Pixel-layer dilation first absorbs anti-aliased edges, then normalized brush strokes add, erase, and undo masks before generating a binary PNG. Failed pixel refinement retains the coarse dialogue mask instead of silently dropping the region. After stage two, a CPU/GPU mask-cleanup preview with the original text removed appears immediately.
+- Project-level erase-paper colors include common white, cool-white, warm-white, ivory, and newsprint presets. A stage-one eyedropper samples the source page, while fixed-color cleanup removes pale JPEG/scanner halos without consuming dark speech-balloon outlines.
 - A bundled manga109 bubble-segmentation Core ML model, preferring Apple Neural Engine execution, produces dialogue BBOX candidates and bubble shapes for black-and-white manga. The shape clips mask search and provides an inscribed layout rectangle for HTML typesetting; the image-to-text model then classifies and transcribes each candidate. System OCR is no longer used for text recognition or positioning. Sound effects, page numbers, footer credits, people, and empty regions are deliberately excluded from the primary workflow.
 - Accepted VLM regions use the dialogue BBOX as their search boundary, then are refined into pixel glyph masks from original-image pixels and shrink to the unexpanded glyph extents. Automatic layout direction prefers the measured glyph arrangement. Each candidate is isolated: if classification, transcription, or translation fails for one region, that region is preserved and the remaining regions continue; only cancellation stops the whole job.
 - Page-context prompts and strict JSON response parsing for image-to-text translation models.
 - Direct loading of local Hugging Face MLX VLM directories through `mlx-swift-lm` on Apple Silicon/Metal.
 - Model-manifest loading for `.mlmodelc`, `.mlmodel`, and `.mlpackage`, with Core ML configured for Metal GPU execution.
 - Dialogue masks use one or more pixel-level shapes to cover the original letters, clip to speech-area boundaries, and accept additive/eraser brush strokes; CPU or Metal GPU repair is available without an image model.
-- HTML/CSS is the single source of truth for translation layout, including horizontal/vertical writing, fixed or automatic font sizing, dragging, and resizing. WebKit renders that same text layer into the final PNG, so step-three layout is not replaced during output.
+- HTML/CSS is the single source of truth for translation layout, including horizontal/vertical writing, fixed or automatic font sizing, per-region bold toggles, dragging, and resizing. WebKit renders the stage-three preview at the real SR pixel size, and stage four saves that exact preview without rebuilding it.
+- Optional 2×/4× super-resolution preserves cleaned mask pixels, rerenders translated text at the resolved dimensions, and invalidates older 1× output so the final PNG and PSD cannot silently fall back to the pre-SR image.
 - Source and output images are exposed to the Web UI through restricted custom URL schemes rather than arbitrary file access.
 - Project indexes and states persist as versioned JSON. The previous version is kept as `.bak` before each write and validated on restore.
 - Optional macOS 26 Swift/MLX Qwen Image Edit worker, using the mask both as model conditioning and as the final composition boundary.
 - Optional standard MCP Streamable HTTP server with four-stage tools, workspace/image resources, cancellation, and progress notifications.
 - When MCP is enabled, the app remains in the macOS menu bar and can reopen the main window after it is closed.
+- Startup model loading is shown in a progress dialog. A separate launch-time check reports newer stable GitHub Releases and opens the official release page only when requested; MangaKitchen never downloads or installs an update automatically.
 
 ## Two Usage Modes, One Project and Four-Step Workflow
 
@@ -56,39 +61,39 @@ MangaKitchen supports two operating modes. They change who performs inference an
 Both modes follow these four steps:
 
 1. **Project and pages**: choose a source directory, scan images recursively, and build a multi-selectable, batch-processable page list.
-2. **Text and masks**: locate dialogue BBOX candidates and bubble shapes with the bundled Core ML segmentation model, then refine the original-image pixels into glyph masks. The local VLM classifies and transcribes candidates in step 3. An MCP Agent may instead provide regions and source text directly before mask editing.
-3. **Translation and typesetting**: the GUI uses its VLM, while MCP gives an Agent an App-generated page bundle for transcription, translation, and typesetting; the App writes the results back to project state.
-4. **Restoration and composition**: remove the original text, restore the background, typeset the translation, and save it to the project's output directory.
+2. **Text, masks, and clean background**: locate dialogue BBOX candidates and bubble shapes with the bundled Core ML segmentation model, refine the original-image pixels into glyph masks, apply manual strokes, and produce the confirmed text-free background.
+3. **Transcription, translation, and typesetting preview**: the GUI uses its VLM, while MCP gives an Agent an App-generated page bundle. The App preserves stage-two artifacts, optionally applies SR, and renders the complete HTML/CSS translation preview.
+4. **Output**: copy the confirmed stage-three preview to the project's output directory. This stage does not rerun detection, masking, cleanup, transcription, translation, SR, or typesetting.
 
 The four steps define resumable states, artifacts, and dependencies; they are not a mandatory checklist that restarts at step 1 every time. Both the GUI and MCP should inspect the App-provided page state and work package first, then begin at any step whose prerequisites already exist. Existing masks can go directly to translation, existing translations can go directly to typesetting or composition, and a single region can be edited without reprocessing the page. Completed region detection, masks, translations, and manual edits are not overwritten unless a user or Agent explicitly requests that stage again.
 
 Before starting at any stage, each page must be validated against its actual artifacts rather than trusting the state label alone. If the requested stage lacks a prerequisite, walk backward one stage at a time until reaching the nearest work that must be regenerated:
 
-- Before step 4, validate the mask and usable `.str` translations/typesetting data. Missing translations fall back to step 3; missing text regions or masks fall back again to step 2.
+- Before step 4, validate that the stage-three translation preview exists and is newer than any prior output. A missing or stale preview falls back to step 3; missing regions, mask, or clean background falls back again to step 2.
 - Before step 3, validate the source page, text regions, source text confirmed by the VLM, Agent, or user, and the mask. Incomplete data falls back to step 2.
 - Before step 2, validate that the source image still exists and the project's page index is valid. Missing data falls back to step 1 and a rescan.
 - Fallback regenerates only missing or invalid artifacts. Valid prerequisites remain untouched, and different pages may resume from different stages.
 
 ### Mode A: Download Models and Work Fully Offline
 
-Set an image-to-text model and, optionally, an image-to-image model under Settings → Models. Region detection, translation, background restoration, and composition run locally on the Mac. Once model files have been downloaded, comic content does not need to be sent to an external AI service.
+Set an image-to-text model under Settings → Models. Region detection, translation, background restoration, and composition run locally on the Mac. Once model files have been downloaded, comic content does not need to be sent to an external AI service.
 
 - The `imageToText` model is required for local GUI step 3. Stage two can complete Core ML BBOX/shape detection and pixel masks without a loaded VLM; the model then classifies and transcribes existing candidates before page-context translation. Without a loaded model, the app does not fall back to system OCR; load a model or let an MCP Agent provide regions and source text. Classification, transcription, and translation run region by region with isolated error handling, so one failed region does not fail the page; sound effects remain outside the current workflow.
-- The `imageToImage` model performs background restoration in step 4 and is optional. Without it, Settings → Advanced selects Metal GPU neighborhood repair or CPU dominant-color speech-area repair; GPU failures automatically fall back to CPU.
+- Background restoration belongs to step 2 and uses the configured Metal GPU neighborhood repair or CPU dominant-color speech-area repair; GPU failures automatically fall back to CPU. Later steps consume this clean background and never regenerate it.
 - The GUI can run each step separately or use “Process Selected/All.” One-click processing still executes steps 2–4 in order and preserves their intermediate data.
 - Every result is written back to the project and `.str`, so users can correct any stage and rerun only the downstream steps.
 
 ### Mode B: Proofread Through MCP (Recommended)
 
-> **Recommended flow: run locally first, then use MCP for proofreading.** A blank project can still start directly through MCP, but a local four-stage draft gives the Agent existing source text, translations, and typesetting to review, usually producing more stable results. MCP preserves the App-generated regions and masks instead of rebuilding or overwriting them.
+> **Recommended flow: finish stage two locally, then use MCP for proofreading.** MCP preserves the App-generated regions, masks, and clean background instead of rebuilding or overwriting them. A later stage never runs an earlier stage implicitly.
 
 Enable MCP under Settings → MCP, configure the port and client IP/CIDR allowlist, then connect an AI Agent that supports Streamable HTTP. MCP provides one page work package instead of asking the Agent to decompose, clear, or rebuild the four stages.
 
-1. (Recommended) In the GUI, open the project, load the local models, and use “Process Selected/All” to complete a four-stage draft in batch. This step may be skipped when starting from a blank project.
+1. In the GUI, open the project and complete stage two (regions, pixel mask, and clean background) for the requested pages.
 2. Enable MCP under Settings → MCP and connect an AI Agent that supports Streamable HTTP.
-3. The Agent calls `mangakitchen.workspace.open` to obtain `workspace_id`, then calls `mangakitchen.page.prepare_agent_task` for each requested page. If stage two is missing, the App creates the bubble regions and pixel masks before returning the source image content and embedded `regionData` JSON.
+3. The Agent calls `mangakitchen.workspace.open` to obtain `workspace_id`, then calls `mangakitchen.page.prepare_agent_task` for each requested page. The tool only packages completed stage-two data; if the mask or clean background is missing, it stops and asks the user to finish stage two in the App.
 4. The Agent processes each existing region: treat non-empty `sourceText` and `translatedText` as drafts to proofread against the image, fill or correct empty or inaccurate text, and adjust HTML typesetting bounds, anchor, size, weight, and writing direction. It must not add, remove, merge, or modify regions or masks.
-5. Call `mangakitchen.page.submit_agent_result` once with all proofread text, translations, and typesetting results. The App preserves the stage-two masks, updates its internal project state, and immediately performs stage-four composition and output.
+5. Call `mangakitchen.page.submit_agent_result` once with all proofread text, translations, and typesetting results. This completes the stage-three translation/typesetting preview without writing final output. Only when the user requests export, call `mangakitchen.page.render`; stage four copies the completed preview to the output directory without rerunning masking, background cleanup, translation, or typesetting.
 
 `region_source` and the older per-region tools remain for compatibility and are not the default MCP flow. MCP step three is fully Agent-owned; the App does not run its built-in VLM transcription or translation. The Agent must not search for, read, or create `.str` files, and it does not need to read multiple page resources or call `region.update`.
 
@@ -111,7 +116,7 @@ swift run MangaKitchen --mcp=on
 
 The GUI always starts. When `--mcp` is omitted, the saved Settings value is used; `--mcp=on|off` overrides it for the current launch. The listener binds to `0.0.0.0`, uses port `12080` by default, and only accepts the actual source IP/CIDR entries in the allowlist. The default allowlist contains only `127.0.0.1`. The local endpoint is `http://127.0.0.1:12080/mcp`; `--mcp-port=<port>` overrides the port for the current launch. Closing the main window does not terminate the app, which can be reopened from the menu bar.
 
-Data-location changes take effect after restart. Image-to-text and image-to-image model changes are applied immediately. Changing the MCP switch, port, or allowlist restarts the listener.
+Data-location changes take effect after restart. Image-to-text and super-resolution model changes are applied immediately. Changing the MCP switch, port, or allowlist restarts the listener.
 
 Project indexes, project states, and intermediate files are stored by default under:
 
@@ -201,12 +206,13 @@ MangaKitchenApp/MCP
 
 See [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md) for architectural decisions and data flow.
 See [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md) for the four-stage Swift/JavaScript/MCP contract.
+See [the build 2347 release notes](Documentation/RELEASE_NOTES_1.26.0820-build-2347.md) for the latest changes and verified download checksum.
 
 ## Known Boundaries
 
-- The bundled `manga109-segmentation-bubble` Core ML model is derived from the Apache-2.0 source model. Image-to-text and image-to-image model weights are not bundled; their size, licensing, and distribution policy remain separate concerns.
+- The bundled `manga109-segmentation-bubble` Core ML model is derived from the Apache-2.0 source model. Image-to-text, super-resolution, and experimental image-edit model weights are not bundled; their size, licensing, and distribution policy remain separate concerns.
 - Dialogue BBOX or Agent boxes are refined with luminance and connected components from original-image pixels; segmentation shapes clip the search area and the mask uses pixel-layer dilation. Dark/color artwork and non-dialogue text still require precise Agent polygons without changing `DialogueRegion` output.
-- Metal neighborhood restoration is a fallback. Complex screen tones or text crossing line art should use an inpainting model.
-- Qwen Image Edit INT4 still needs roughly 25 GB of inference memory and runs a full diffusion pass per page; low-memory Macs should disable image-to-image restoration.
+- Fixed-paper-color and Metal neighborhood cleanup work best in dialogue areas with a stable paper tone. Complex screen tones or text crossing line art may still need mask correction and manual retouching.
+- The optional Qwen Image Edit worker remains experimental, needs roughly 25 GB of inference memory, and is not part of the default four-stage cleanup path.
 - Direct Swift Package execution does not yet include App Sandbox security-scoped bookmarks, signing, notarization, or production `.app` packaging.
 - Moving source or model directories can invalidate restored paths until security-scoped bookmarks are implemented.

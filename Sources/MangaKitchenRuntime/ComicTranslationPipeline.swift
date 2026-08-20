@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import ImageIO
 import MangaKitchenCore
@@ -33,48 +34,6 @@ public actor ComicTranslationPipeline {
         self.typesetter = typesetter
         self.superResolver = superResolver
         self.outputRoot = outputRoot
-    }
-
-    public func process(
-        page: ComicPage,
-        options: ProcessingOptions,
-        glossary: ProjectGlossary = ProjectGlossary(),
-        outputURL: URL? = nil,
-        activity: @escaping PagePipelineActivity = { _ in },
-        progress: @escaping PagePipelineProgress
-    ) async throws -> PageProcessingResult {
-        try Task.checkCancellation()
-        let detection = try await detectMasks(
-            page: page,
-            options: options,
-            activity: activity,
-            progress: progress
-        )
-        let regions = try await translate(
-            page: page,
-            regions: detection.regions,
-            options: options,
-            glossary: glossary,
-            activity: activity,
-            progress: progress
-        )
-        let composition = try await compose(
-            page: page,
-            regions: regions,
-            options: options,
-            outputURL: outputURL,
-            activity: activity,
-            progress: progress
-        )
-        progress(.completed, 1)
-
-        return PageProcessingResult(
-            regions: composition.regions,
-            maskURL: composition.maskURL,
-            backgroundURL: composition.backgroundURL,
-            outputURL: composition.outputURL,
-            warnings: composition.warnings
-        )
     }
 
     /// 步驟二：辨識文字區域並建立可供人工修訂的初始遮罩。
@@ -160,6 +119,7 @@ public actor ComicTranslationPipeline {
         page: ComicPage,
         regions: [DialogueRegion],
         maskURL: URL,
+        fillColorHex: String,
         progress: @escaping InferenceProgress = { _ in }
     ) async throws -> URL {
         try Task.checkCancellation()
@@ -168,6 +128,7 @@ public actor ComicTranslationPipeline {
             sourceURL: page.sourceURL,
             maskURL: maskURL,
             regions: regions,
+            fillColorHex: fillColorHex,
             outputURL: urls.background,
             preferGenerativeModel: false,
             progress: progress
@@ -264,159 +225,6 @@ public actor ComicTranslationPipeline {
         return recognizedRegions.map { translatedByID[$0.id] ?? $0 }
     }
 
-    /// 步驟四：依目前遮罩修補背景、排版並輸出；不重跑辨識或翻譯。
-    public func compose(
-        page: ComicPage,
-        regions: [DialogueRegion],
-        options: ProcessingOptions,
-        outputURL requestedOutputURL: URL? = nil,
-        existingMaskURL: URL? = nil,
-        existingSuperResolvedBackgroundURL: URL? = nil,
-        useSuperResolution: Bool = false,
-        activity: @escaping PagePipelineActivity = { _ in },
-        progress: @escaping PagePipelineProgress,
-        superResolutionProgress: @escaping InferenceProgress = { _ in }
-    ) async throws -> PageCompositionResult {
-        try Task.checkCancellation()
-        let urls = try artifactURLs(for: page)
-        let outputURL = requestedOutputURL ?? urls.output
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        activity(.preparingTranslationPreview)
-        let renderedRegionIDs = Set(regions.filter {
-            !$0.translatedText.isEmpty || !options.preserveUntranslatedRegions
-        }.map(\.id))
-        let reusableMaskURL = existingMaskURL.flatMap { url in
-            FileManager.default.fileExists(atPath: url.path) ? url : nil
-        }
-        let prepared: (regions: [DialogueRegion], warnings: [String])
-        if reusableMaskURL == nil {
-            prepared = try await preparePixelMasksForComposition(
-                page: page,
-                regions: regions,
-                renderedRegionIDs: renderedRegionIDs
-            )
-        } else {
-            prepared = (regions: regions, warnings: [])
-        }
-        let renderedRegions = prepared.regions.filter { renderedRegionIDs.contains($0.id) }
-        activity(.generatingMask)
-        progress(.composing, 0)
-        let maskURL: URL
-        if let reusableMaskURL {
-            maskURL = reusableMaskURL
-        } else {
-            maskURL = urls.mask
-            try await maskGenerator.generateMask(
-                sourceURL: page.sourceURL,
-                regions: renderedRegions,
-                expansion: options.maskExpansion,
-                outputURL: maskURL
-            )
-        }
-        progress(.composing, 0.12)
-
-        activity(.restoringBackground)
-        let restorationWarnings = try await backgroundRestorer.restoreBackground(
-            sourceURL: page.sourceURL,
-            maskURL: maskURL,
-            regions: renderedRegions,
-            outputURL: urls.background,
-            preferGenerativeModel: options.useImageToImageRestoration
-        ) { value in
-            progress(.composing, 0.12 + value * 0.68)
-        }
-
-        var superResolvedBackgroundURL: URL?
-        var typesettingBackgroundURL = urls.background
-        var enhancementWarnings: [String] = []
-        if useSuperResolution, let superResolver {
-            if let cachedURL = existingSuperResolvedBackgroundURL,
-               cachedURL.lastPathComponent == urls.superResolvedBackground.lastPathComponent,
-               FileManager.default.fileExists(atPath: cachedURL.path) {
-                superResolvedBackgroundURL = cachedURL
-                typesettingBackgroundURL = cachedURL
-            } else {
-                activity(.superResolving)
-                do {
-                    try await superResolver.superResolve(
-                        inputURL: urls.background,
-                        outputURL: urls.superResolvedBackground,
-                        progress: superResolutionProgress
-                    )
-                    superResolvedBackgroundURL = urls.superResolvedBackground
-                    typesettingBackgroundURL = urls.superResolvedBackground
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    enhancementWarnings.append(
-                        "超解析失敗，已使用原尺寸背景繼續排版：\(error.localizedDescription)"
-                    )
-                }
-            }
-        }
-
-        activity(.typesettingTranslation)
-        let renderScale = superResolvedBackgroundURL.flatMap {
-            Self.renderScale(page: page, imageURL: $0)
-        } ?? 1
-        try await typesetter.typeset(
-            backgroundURL: typesettingBackgroundURL,
-            regions: renderedRegions,
-            outputURL: outputURL,
-            renderScale: renderScale
-        )
-        progress(.composing, 1)
-
-        return PageCompositionResult(
-            regions: prepared.regions,
-            maskURL: maskURL,
-            backgroundURL: urls.background,
-            superResolvedBackgroundURL: superResolvedBackgroundURL,
-            outputURL: outputURL,
-            warnings: prepared.warnings + restorationWarnings + enhancementWarnings
-        )
-    }
-
-    private func preparePixelMasksForComposition(
-        page: ComicPage,
-        regions: [DialogueRegion],
-        renderedRegionIDs: Set<UUID>
-    ) async throws -> (regions: [DialogueRegion], warnings: [String]) {
-        let pending = regions.filter { region in
-            guard renderedRegionIDs.contains(region.id) else { return false }
-            guard !region.maskStrokes.contains(where: { $0.mode == .add }) else { return false }
-            return region.maskPolygons.isEmpty
-                || (region.maskRefinementApplied && !region.maskCoverageComplete)
-        }
-        var warnings: [String] = []
-        let refined: [DialogueRegion]
-        if pending.isEmpty {
-            refined = regions
-        } else {
-            do {
-                refined = try await refineMasks(page: page, regions: regions)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                refined = regions
-                warnings.append("像素級遮罩精修失敗，已改用目前遮罩繼續合成：\(error.localizedDescription)")
-            }
-        }
-
-        let unverifiedCount = refined.reduce(into: 0) { count, region in
-            guard renderedRegionIDs.contains(region.id) else { return }
-            let hasManualAddition = region.maskStrokes.contains { $0.mode == .add }
-            if !hasManualAddition && !region.maskCoverageComplete { count += 1 }
-        }
-        if unverifiedCount > 0 {
-            warnings.append("有 \(unverifiedCount) 個文字區域未通過像素遮罩覆蓋檢查，已依目前遮罩繼續合成。")
-        }
-        return (refined, warnings)
-    }
-
     public func rerender(
         backgroundURL: URL,
         regions: [DialogueRegion],
@@ -429,6 +237,25 @@ public actor ComicTranslationPipeline {
             outputURL: outputURL,
             renderScale: renderScale
         )
+    }
+
+    /// 以目前背景建立（或補建）這一頁的固定翻譯預覽路徑。SR 可以在舊預覽
+    /// 不存在時呼叫它，避免只有 SR 背景卻沒有可供輸出階段使用的 translated.png。
+    public func renderTranslationPreview(
+        page: ComicPage,
+        backgroundURL: URL,
+        regions: [DialogueRegion]
+    ) async throws -> URL {
+        let urls = try artifactURLs(for: page)
+        let outputURL = urls.output
+        let renderScale = Self.renderScale(page: page, imageURL: backgroundURL) ?? 1
+        try await typesetter.typeset(
+            backgroundURL: backgroundURL,
+            regions: regions,
+            outputURL: outputURL,
+            renderScale: renderScale
+        )
+        return outputURL
     }
 
     public func superResolve(
@@ -445,7 +272,150 @@ public actor ComicTranslationPipeline {
             outputURL: urls.superResolvedBackground,
             progress: progress
         )
+        if let maskURL = page.maskURL,
+           FileManager.default.fileExists(atPath: maskURL.path) {
+            try Self.protectCleanedPixels(
+                cleanBackgroundURL: inputURL,
+                maskURL: maskURL,
+                superResolvedURL: urls.superResolvedBackground
+            )
+        }
         return urls.superResolvedBackground
+    }
+
+    /// 保護已完成去字的遮罩區，避免 SR 把極淡殘影重新銳化成原文。
+    ///
+    /// 遮罩外沿用模型輸出；遮罩內使用去字背景的高品質縮放像素。遮罩再向外
+    /// 擴一個原圖像素，連同 SR 在筆畫邊緣產生的 halo 一起隔離。
+    private static func protectCleanedPixels(
+        cleanBackgroundURL: URL,
+        maskURL: URL,
+        superResolvedURL: URL
+    ) throws {
+        let cleanBackground = try CGImageIO.load(from: cleanBackgroundURL)
+        let mask = try CGImageIO.load(from: maskURL)
+        let superResolved = try CGImageIO.load(from: superResolvedURL)
+        guard cleanBackground.width == mask.width,
+              cleanBackground.height == mask.height,
+              superResolved.width > 0,
+              superResolved.height > 0 else {
+            throw ImageProcessingError.cannotCreateBitmap
+        }
+
+        let width = superResolved.width
+        let height = superResolved.height
+        var protectedPixels = try rgbaPixels(
+            from: superResolved,
+            width: width,
+            height: height,
+            interpolationQuality: .none
+        )
+        let cleanPixels = try rgbaPixels(
+            from: cleanBackground,
+            width: width,
+            height: height,
+            interpolationQuality: .high
+        )
+        let maskPixels = try grayscalePixels(
+            from: mask,
+            width: width,
+            height: height
+        )
+        let scale = min(
+            Double(width) / Double(cleanBackground.width),
+            Double(height) / Double(cleanBackground.height)
+        )
+        let protectedMask = MaskDilation.dilated(
+            maskPixels.map { $0 > 127 },
+            width: width,
+            height: height,
+            radius: max(1, Int(ceil(scale)))
+        )
+        for pixelIndex in protectedMask.indices where protectedMask[pixelIndex] {
+            let byteIndex = pixelIndex * 4
+            protectedPixels[byteIndex] = cleanPixels[byteIndex]
+            protectedPixels[byteIndex + 1] = cleanPixels[byteIndex + 1]
+            protectedPixels[byteIndex + 2] = cleanPixels[byteIndex + 2]
+            protectedPixels[byteIndex + 3] = cleanPixels[byteIndex + 3]
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+        guard let provider = CGDataProvider(data: Data(protectedPixels) as CFData),
+              let output = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(
+                    rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                ).union(.byteOrder32Big),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw ImageProcessingError.cannotCreateBitmap
+        }
+        try CGImageIO.writePNG(output, to: superResolvedURL)
+    }
+
+    private static func rgbaPixels(
+        from image: CGImage,
+        width: Int,
+        height: Int,
+        interpolationQuality: CGInterpolationQuality
+    ) throws -> [UInt8] {
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+        ).union(.byteOrder32Big)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo.rawValue
+            ) else { return false }
+            context.setBlendMode(.copy)
+            context.interpolationQuality = interpolationQuality
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { throw ImageProcessingError.cannotCreateBitmap }
+        return pixels
+    }
+
+    private static func grayscalePixels(
+        from image: CGImage,
+        width: Int,
+        height: Int
+    ) throws -> [UInt8] {
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else { return false }
+            context.setBlendMode(.copy)
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { throw ImageProcessingError.cannotCreateBitmap }
+        return pixels
     }
 
     private func artifactURLs(for page: ComicPage) throws -> (

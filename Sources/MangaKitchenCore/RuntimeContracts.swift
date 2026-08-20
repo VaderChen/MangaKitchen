@@ -103,6 +103,7 @@ public protocol PageBackgroundRestoring: Sendable {
         sourceURL: URL,
         maskURL: URL,
         regions: [DialogueRegion],
+        fillColorHex: String,
         outputURL: URL,
         preferGenerativeModel: Bool,
         progress: @escaping InferenceProgress

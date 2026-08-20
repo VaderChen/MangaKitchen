@@ -316,7 +316,7 @@ struct WebGlobalSettings: Encodable {
 }
 
 struct WebAppState: Encodable {
-    var schemaVersion = 6
+    var schemaVersion = 7
     var globalSettings: WebGlobalSettings
     var projects: [WebProject]
     var activeProjectID: UUID?
@@ -335,12 +335,14 @@ struct WebAppState: Encodable {
     var isProcessing: Bool
     var isSwitchingProject: Bool
     var statusMessage: String?
+    var availableUpdate: GitHubReleaseUpdate?
 
     @MainActor
     init(
         store: AppStore,
         preferences: AppPreferences,
-        mcpController: MCPServiceController
+        mcpController: MCPServiceController,
+        availableUpdate: GitHubReleaseUpdate?
     ) {
         globalSettings = WebGlobalSettings(
             preferences: preferences,
@@ -376,5 +378,6 @@ struct WebAppState: Encodable {
         isProcessing = store.isProcessing
         isSwitchingProject = store.isSwitchingProject
         statusMessage = store.statusMessage
+        self.availableUpdate = availableUpdate
     }
 }

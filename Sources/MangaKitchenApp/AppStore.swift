@@ -1512,6 +1512,7 @@ final class AppStore: ObservableObject {
         supportedValue.useImageToImageRestoration = false
         let previousDefaultFont = options.defaultStyle.fontName
         let nextDefaultFont = supportedValue.defaultStyle.fontName
+        let eraseColorChanged = options.eraseColorHex != supportedValue.eraseColorHex
         var fontUpdatedPageIDs: [UUID] = []
         if previousDefaultFont != nextDefaultFont {
             for pageIndex in pages.indices {
@@ -1529,7 +1530,22 @@ final class AppStore: ObservableObject {
             }
         }
         options = supportedValue
-        for pageID in fontUpdatedPageIDs {
+        var eraseColorUpdatedPageIDs = Set<UUID>()
+        if eraseColorChanged {
+            for pageIndex in pages.indices where pages[pageIndex].backgroundURL != nil {
+                let pageID = pages[pageIndex].id
+                eraseColorUpdatedPageIDs.insert(pageID)
+                // 底色是步驟二設定。只讓舊去字背景失效，不在設定變更時
+                // 暗中執行遮罩／背景步驟；使用者回到步驟二重新計算。
+                pages[pageIndex].backgroundURL = nil
+                pages[pageIndex].superResolvedBackgroundURL = nil
+                pages[pageIndex].translationPreviewURL = nil
+                pages[pageIndex].outputURL = nil
+                pages[pageIndex].stage = .maskReady
+                pages[pageIndex].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
+            }
+        }
+        for pageID in fontUpdatedPageIDs where !eraseColorUpdatedPageIDs.contains(pageID) {
             scheduleTranslationPreviewRegeneration(pageID: pageID)
         }
         schedulePersistence()
@@ -1627,21 +1643,19 @@ final class AppStore: ObservableObject {
     }
 
     private func hasMaskData(pageID: UUID) -> Bool {
-        guard let regions = pages.first(where: { $0.id == pageID })?.regions,
-              !regions.isEmpty else { return false }
-        return regions.allSatisfy(Self.hasUsableMask)
-    }
-
-    private static func hasUsableMask(_ region: DialogueRegion) -> Bool {
-        if region.maskStrokes.contains(where: { $0.mode == .add }) { return true }
-        return region.automaticMaskEnabled
+        guard let page = pages.first(where: { $0.id == pageID }),
+              let maskURL = page.maskURL,
+              let backgroundURL = page.backgroundURL,
+              FileManager.default.fileExists(atPath: maskURL.path),
+              FileManager.default.fileExists(atPath: backgroundURL.path) else { return false }
+        return true
     }
 
     private func hasTranslationData(pageID: UUID) -> Bool {
         guard let page = pages.first(where: { $0.id == pageID }),
-              hasTranslatedRegions(page),
               let previewURL = page.translationPreviewURL else { return false }
-        return FileManager.default.fileExists(atPath: previewURL.path)
+        guard FileManager.default.fileExists(atPath: previewURL.path) else { return false }
+        return page.regions.isEmpty || hasTranslatedRegions(page)
     }
 
     private func hasTranslatedRegions(_ page: ComicPage) -> Bool {
@@ -1659,6 +1673,25 @@ final class AppStore: ObservableObject {
         return FileManager.default.fileExists(atPath: outputURL.path)
     }
 
+    private static func completedArtifactStage(for page: ComicPage) -> PageProcessingStage {
+        let fileManager = FileManager.default
+        if let outputURL = page.outputURL,
+           fileManager.fileExists(atPath: outputURL.path) {
+            return .completed
+        }
+        if let previewURL = page.translationPreviewURL,
+           fileManager.fileExists(atPath: previewURL.path) {
+            return .translationReady
+        }
+        if let maskURL = page.maskURL,
+           let backgroundURL = page.backgroundURL,
+           fileManager.fileExists(atPath: maskURL.path),
+           fileManager.fileExists(atPath: backgroundURL.path) {
+            return .maskReady
+        }
+        return .scanned
+    }
+
     private func runDetection(pageID: UUID) async throws {
         guard let pipeline,
               let page = pages.first(where: { $0.id == pageID }) else {
@@ -1671,21 +1704,13 @@ final class AppStore: ObservableObject {
             progress: progressHandler(pageID: pageID)
         )
         try Task.checkCancellation()
-        let previewURL: URL?
-        var previewWarning: String?
-        do {
-            updateProcessingActivity(pageID: pageID, activity: .renderingMaskPreview)
-            previewURL = try await pipeline.renderMaskPreview(
-                page: page,
-                regions: result.regions,
-                maskURL: result.maskURL
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            previewURL = nil
-            previewWarning = "遮罩已完成，但校對預覽建立失敗：\(error.localizedDescription)"
-        }
+        updateProcessingActivity(pageID: pageID, activity: .renderingMaskPreview)
+        let previewURL = try await pipeline.renderMaskPreview(
+            page: page,
+            regions: result.regions,
+            maskURL: result.maskURL,
+            fillColorHex: options.eraseColorHex
+        )
         try Task.checkCancellation()
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         undoneMaskStrokes[pageID] = nil
@@ -1700,7 +1725,7 @@ final class AppStore: ObservableObject {
         pages[index].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
         pages[index].errorMessage = nil
         try await persistStringTableNow(pageID: pageID)
-        let warnings = result.warnings + [previewWarning].compactMap { $0 }
+        let warnings = result.warnings
         statusMessage = warnings.isEmpty
             ? "第 \(pages[index].index) 頁的文字遮罩與去字校對預覽已就緒。"
             : warnings.joined(separator: "\n")
@@ -1723,21 +1748,13 @@ final class AppStore: ObservableObject {
         )
         try Task.checkCancellation()
 
-        let previewURL: URL?
-        var previewWarning: String?
-        do {
-            updateProcessingActivity(pageID: pageID, activity: .renderingMaskPreview)
-            previewURL = try await pipeline.renderMaskPreview(
-                page: page,
-                regions: [],
-                maskURL: maskURL
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            previewURL = nil
-            previewWarning = "全黑遮罩已完成，但校對預覽建立失敗：\(error.localizedDescription)"
-        }
+        updateProcessingActivity(pageID: pageID, activity: .renderingMaskPreview)
+        let previewURL = try await pipeline.renderMaskPreview(
+            page: page,
+            regions: [],
+            maskURL: maskURL,
+            fillColorHex: options.eraseColorHex
+        )
         try Task.checkCancellation()
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         undoneMaskStrokes[pageID] = nil
@@ -1751,8 +1768,7 @@ final class AppStore: ObservableObject {
         pages[index].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
         pages[index].errorMessage = nil
         try await persistStringTableNow(pageID: pageID)
-        statusMessage = previewWarning
-            ?? "尚未載入圖生文模型；已建立全黑遮罩，可手動編輯。"
+        statusMessage = "尚未載入圖生文模型；已建立全黑遮罩與去字背景，可手動編輯。"
         schedulePersistence()
     }
 
@@ -1766,9 +1782,21 @@ final class AppStore: ObservableObject {
               let page = pages.first(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
         }
-        guard !page.regions.isEmpty else { throw AppWorkflowError.maskRequired }
+        guard let cleanBackgroundURL = page.backgroundURL,
+              FileManager.default.fileExists(atPath: cleanBackgroundURL.path),
+              let maskURL = page.maskURL,
+              FileManager.default.fileExists(atPath: maskURL.path) else {
+            // 步驟三不得在缺少步驟二產物時自行重建遮罩或背景。
+            throw AppWorkflowError.maskRequired
+        }
+        if let index = pages.firstIndex(where: { $0.id == pageID }) {
+            pages[index].translationPreviewURL = nil
+            pages[index].outputURL = nil
+        }
         let regions: [DialogueRegion]
-        if !forceRecalculation && hasTranslatedRegions(page) {
+        if page.regions.isEmpty {
+            regions = []
+        } else if !forceRecalculation && hasTranslatedRegions(page) {
             regions = page.regions
         } else {
             guard await models?.isLoaded(.imageToText) == true else {
@@ -1785,51 +1813,55 @@ final class AppStore: ObservableObject {
             )
         }
         try Task.checkCancellation()
-        guard let translatedIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
         let untranslatedRegionCount = regions.count(where: {
             $0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         })
-        pages[translatedIndex].regions = regions
-        pages[translatedIndex].stage = .translationReady
-        pages[translatedIndex].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
-        pages[translatedIndex].errorMessage = nil
-        try await persistStringTableNow(pageID: pageID)
-        schedulePersistence()
 
-        let composition = try await pipeline.compose(
-            page: page,
-            regions: regions,
-            options: options,
-            existingMaskURL: page.maskURL,
-            existingSuperResolvedBackgroundURL: page.superResolvedBackgroundURL,
-            useSuperResolution: automaticSuperResolutionEnabled
-                && loadedModels.contains(where: { $0.capability == .superResolution }),
-            activity: activityHandler(pageID: pageID),
-            progress: translationLayoutProgressHandler(pageID: pageID),
-            superResolutionProgress: { [weak self] value in
-                Task { @MainActor [weak self] in
-                    self?.updateProgress(
-                        pageID: pageID,
-                        stage: .superResolving,
-                        fraction: value
-                    )
+        var superResolvedBackgroundURL = page.superResolvedBackgroundURL.flatMap { url in
+            FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+        if superResolvedBackgroundURL == nil,
+           automaticSuperResolutionEnabled,
+           loadedModels.contains(where: { $0.capability == .superResolution }) {
+            updateProcessingActivity(pageID: pageID, activity: .superResolving)
+            superResolvedBackgroundURL = try await pipeline.superResolve(
+                page: page,
+                inputURL: cleanBackgroundURL,
+                progress: { [weak self] value in
+                    Task { @MainActor [weak self] in
+                        self?.updateProgress(
+                            pageID: pageID,
+                            stage: .superResolving,
+                            fraction: value
+                        )
+                    }
                 }
-            }
+            )
+        }
+        updateProcessingActivity(pageID: pageID, activity: .typesettingTranslation)
+        guard let typesettingIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[typesettingIndex].regions = regions
+        pages[typesettingIndex].translationPreviewURL = nil
+        pages[typesettingIndex].outputURL = nil
+        pages[typesettingIndex].stage = .typesetting
+        pages[typesettingIndex].errorMessage = nil
+        let previewURL = try await pipeline.renderTranslationPreview(
+            page: page,
+            backgroundURL: superResolvedBackgroundURL ?? cleanBackgroundURL,
+            regions: regions
         )
         try Task.checkCancellation()
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
-        pages[index].regions = composition.regions
-        pages[index].maskURL = composition.maskURL
-        pages[index].backgroundURL = composition.backgroundURL
-        pages[index].superResolvedBackgroundURL = composition.superResolvedBackgroundURL
-        advanceMaskRevision(pageID: pageID)
-        pages[index].translationPreviewURL = composition.outputURL
+        pages[index].regions = regions
+        // maskURL／backgroundURL 是步驟二產物；步驟三只能讀取，絕不覆寫。
+        pages[index].superResolvedBackgroundURL = superResolvedBackgroundURL
+        pages[index].translationPreviewURL = previewURL
         pages[index].outputURL = nil
         pages[index].stage = .translationReady
         pages[index].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
         pages[index].errorMessage = nil
         try await persistStringTableNow(pageID: pageID)
-        var warnings = composition.warnings
+        var warnings: [String] = []
         if untranslatedRegionCount > 0 {
             warnings.append(
                 "有 \(untranslatedRegionCount) 個文字區域翻譯失敗，已保留原有譯文並繼續處理。"
@@ -1883,15 +1915,16 @@ final class AppStore: ObservableObject {
         try Task.checkCancellation()
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         pages[index].superResolvedBackgroundURL = resolvedURL
-        if let translationPreviewURL = pages[index].translationPreviewURL,
-           pages[index].regions.contains(where: { !$0.translatedText.isEmpty }) {
-            try await pipeline.rerender(
-                backgroundURL: resolvedURL,
-                regions: pages[index].regions,
-                outputURL: translationPreviewURL,
-                renderScale: Self.superResolutionRenderScale(for: pages[index])
-            )
-        }
+        // SR 改變了步驟三的背景與排字尺寸，先讓舊預覽與步驟四輸出失效。
+        // 否則步驟三會顯示 2x SR 背景，步驟四卻繼續讀取 SR 前的 1x 檔案。
+        pages[index].translationPreviewURL = nil
+        pages[index].outputURL = nil
+        let previewURL = try await pipeline.renderTranslationPreview(
+            page: pages[index],
+            backgroundURL: resolvedURL,
+            regions: pages[index].regions
+        )
+        pages[index].translationPreviewURL = previewURL
         pages[index].stage = .translationReady
         pages[index].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
         pages[index].errorMessage = nil
@@ -1913,6 +1946,12 @@ final class AppStore: ObservableObject {
         try Task.checkCancellation()
         guard let page = pages.first(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
+        }
+        guard hasMaskData(pageID: pageID) else {
+            throw AppWorkflowError.maskRequired
+        }
+        guard hasTranslationData(pageID: pageID) else {
+            throw AppWorkflowError.translationPreviewRequired
         }
         guard let initialIndex = pages.firstIndex(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
@@ -1936,10 +1975,6 @@ final class AppStore: ObservableObject {
         if let translationPreviewURL = page.translationPreviewURL,
            FileManager.default.fileExists(atPath: translationPreviewURL.path) {
             completedPreviewURL = translationPreviewURL
-        } else if !page.regions.contains(where: { !$0.translatedText.isEmpty }),
-                  let backgroundURL = page.backgroundURL,
-                  FileManager.default.fileExists(atPath: backgroundURL.path) {
-            completedPreviewURL = backgroundURL
         } else {
             throw AppWorkflowError.translationPreviewRequired
         }
@@ -2003,18 +2038,6 @@ final class AppStore: ObservableObject {
         processingActivities[pageID] = activity
     }
 
-    private func translationLayoutProgressHandler(pageID: UUID) -> PagePipelineProgress {
-        { [weak self] _, fraction in
-            Task { @MainActor [weak self] in
-                self?.updateProgress(
-                    pageID: pageID,
-                    stage: .translating,
-                    fraction: 0.85 + min(max(fraction, 0), 1) * 0.15
-                )
-            }
-        }
-    }
-
     private func updateProgress(pageID: UUID, stage: PageProcessingStage, fraction: Double) {
         guard batchJobs.contains(where: {
             $0.status == .running && $0.currentPageID == pageID
@@ -2027,18 +2050,7 @@ final class AppStore: ObservableObject {
 
     private func restoreStablePageStateAfterCancellation(_ pageID: UUID) {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
-        let stage: PageProcessingStage
-        if let outputURL = pages[index].outputURL,
-           FileManager.default.fileExists(atPath: outputURL.path) {
-            stage = .completed
-        } else if pages[index].translationPreviewURL != nil
-                    || pages[index].regions.contains(where: { !$0.translatedText.isEmpty }) {
-            stage = .translationReady
-        } else if pages[index].maskURL != nil || !pages[index].regions.isEmpty {
-            stage = .maskReady
-        } else {
-            stage = .scanned
-        }
+        let stage = Self.completedArtifactStage(for: pages[index])
         pages[index].stage = stage
         pages[index].progress = Self.totalProgress(stage: stage, fraction: 1)
         pages[index].errorMessage = nil
@@ -2049,7 +2061,7 @@ final class AppStore: ObservableObject {
         // 任何遮罩、文字或樣式修改都會讓舊輸出失效；保留檔案供復原，
         // 但不再讓 UI 把舊圖誤當成本次編輯後的結果。
         pages[pageIndex].outputURL = nil
-        pages[pageIndex].stage = hasTranslation ? .translationReady : .maskReady
+        pages[pageIndex].stage = hasTranslation ? .typesetting : .maskReady
         pages[pageIndex].progress = Self.totalProgress(stage: pages[pageIndex].stage, fraction: 1)
         pages[pageIndex].errorMessage = nil
     }
@@ -2065,8 +2077,13 @@ final class AppStore: ObservableObject {
         translationPreviewTasks[pageID]?.cancel()
         translationPreviewTasks[pageID] = nil
         if let index = pages.firstIndex(where: { $0.id == pageID }) {
+            pages[index].maskURL = nil
+            pages[index].backgroundURL = nil
             pages[index].translationPreviewURL = nil
             pages[index].superResolvedBackgroundURL = nil
+            pages[index].outputURL = nil
+            pages[index].stage = .masking
+            pages[index].progress = Self.totalProgress(stage: .masking, fraction: 0)
         }
         maskRegenerationTasks[pageID]?.cancel()
         maskRegenerationTasks[pageID] = Task { @MainActor [weak self] in
@@ -2088,10 +2105,11 @@ final class AppStore: ObservableObject {
                 let regions = outcome.regions
                 guard let maskURL = outcome.maskURL else { return }
                 guard !Task.isCancelled else { return }
-                let previewURL = try? await pipeline.renderMaskPreview(
+                let previewURL = try await pipeline.renderMaskPreview(
                     page: page,
                     regions: regions,
-                    maskURL: maskURL
+                    maskURL: maskURL,
+                    fillColorHex: self.options.eraseColorHex
                 )
                 guard !Task.isCancelled else { return }
                 guard let index = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
@@ -2103,6 +2121,9 @@ final class AppStore: ObservableObject {
                 self.pages[index].maskURL = maskURL
                 self.pages[index].backgroundURL = previewURL
                 self.pages[index].superResolvedBackgroundURL = nil
+                self.pages[index].stage = .maskReady
+                self.pages[index].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
+                self.pages[index].errorMessage = nil
                 self.advanceMaskRevision(pageID: pageID)
                 try await self.persistStringTableNow(pageID: pageID)
                 self.schedulePersistence()
@@ -2156,10 +2177,19 @@ final class AppStore: ObservableObject {
                 guard !Task.isCancelled,
                       let index = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
                 self.pages[index].translationPreviewURL = previewURL
+                self.pages[index].stage = .translationReady
+                self.pages[index].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
+                self.pages[index].errorMessage = nil
                 self.schedulePersistence()
             } catch is CancellationError {
                 return
             } catch {
+                if let index = self.pages.firstIndex(where: { $0.id == pageID }) {
+                    self.pages[index].translationPreviewURL = nil
+                    self.pages[index].outputURL = nil
+                    self.pages[index].stage = .failed
+                    self.pages[index].errorMessage = error.localizedDescription
+                }
                 self.statusMessage = "更新翻譯排版預覽失敗：\(error.localizedDescription)"
             }
         }
@@ -2243,9 +2273,7 @@ final class AppStore: ObservableObject {
                let table = try? await stringTables.load(from: tableURL) {
                 page.regions = table.regions
                 page.stringTableURL = tableURL
-                page.stage = table.entries.contains(where: { !$0.translatedText.isEmpty })
-                    ? .translationReady
-                    : .maskReady
+                page.stage = Self.completedArtifactStage(for: page)
             }
             discoveredOrder[page.id] = offset
             merged.append(page)
@@ -2462,12 +2490,23 @@ final class AppStore: ObservableObject {
     private func validated(_ snapshot: WorkspaceSnapshot) -> WorkspaceSnapshot {
         var value = snapshot
         let fileManager = FileManager.default
+        let modificationDate: (URL) -> Date? = { url in
+            try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        }
         let existingPages: [ComicPage] = value.pages.compactMap { original -> ComicPage? in
             guard fileManager.fileExists(atPath: original.sourceURL.path) else { return nil }
             var page = original
             if let previewURL = page.translationPreviewURL,
                !fileManager.fileExists(atPath: previewURL.path) {
                 page.translationPreviewURL = nil
+            }
+            if let maskURL = page.maskURL,
+               !fileManager.fileExists(atPath: maskURL.path) {
+                page.maskURL = nil
+            }
+            if let backgroundURL = page.backgroundURL,
+               !fileManager.fileExists(atPath: backgroundURL.path) {
+                page.backgroundURL = nil
             }
             if let superResolvedURL = page.superResolvedBackgroundURL,
                !fileManager.fileExists(atPath: superResolvedURL.path) {
@@ -2477,17 +2516,33 @@ final class AppStore: ObservableObject {
                !fileManager.fileExists(atPath: outputURL.path) {
                 page.outputURL = nil
                 if page.stage == .completed {
-                    page.stage = page.regions.contains(where: { !$0.translatedText.isEmpty })
-                        ? .translationReady
-                        : .maskReady
+                    page.stage = Self.completedArtifactStage(for: page)
+                }
+            }
+            if let outputURL = page.outputURL,
+               let previewURL = page.translationPreviewURL,
+               let outputModifiedAt = modificationDate(outputURL),
+               let previewModifiedAt = modificationDate(previewURL),
+               outputModifiedAt < previewModifiedAt {
+                // 步驟四只能儲存步驟三的現行預覽。舊版本在 SR 後沒有清掉
+                // outputURL，導致重啟後仍把較早的 1x 檔案誤當成已完成輸出。
+                page.outputURL = nil
+                if page.stage == .completed {
+                    page.stage = Self.completedArtifactStage(for: page)
                 }
             }
             let stableStages: Set<PageProcessingStage> = [
                 .pending, .scanned, .maskReady, .translationReady, .completed, .failed
             ]
             if !stableStages.contains(page.stage) {
-                page.stage = page.regions.isEmpty ? .scanned : .maskReady
+                page.stage = Self.completedArtifactStage(for: page)
                 page.errorMessage = "上次處理未完成，請重新執行該步驟。"
+            } else if page.stage == .translationReady,
+                      page.translationPreviewURL == nil {
+                page.stage = Self.completedArtifactStage(for: page)
+            } else if page.stage == .maskReady,
+                      (page.maskURL == nil || page.backgroundURL == nil) {
+                page.stage = Self.completedArtifactStage(for: page)
             }
             page.progress = Self.totalProgress(stage: page.stage, fraction: 1)
             return page
@@ -2905,11 +2960,11 @@ private enum AppWorkflowError: LocalizedError {
         switch self {
         case .projectNotFound: "找不到指定的專案資料。"
         case .pageNotFound: "找不到指定的漫畫頁面。"
-        case .maskRequired: "請先執行文字與遮罩偵測，再進行翻譯。"
+        case .maskRequired: "請先完成步驟二的文字區域、遮罩與去字背景，再進行翻譯。"
         case .outputDirectoryRequired: "輸出前請先選取輸出目錄。"
         case .outputInsideSource: "輸出目錄不可等於來源目錄或位於來源目錄內，以免重新掃描到輸出檔。"
         case .outputWouldOverwriteSource: "輸出路徑會覆寫來源圖片，已中止輸出。"
-        case .translationPreviewRequired: "找不到已完成自動排版的翻譯預覽，請重新執行翻譯。"
+        case .translationPreviewRequired: "步驟三的原文、譯文或自動排版預覽尚未完成，請先補齊後再輸出。"
         case .runtimeUnavailable: "漫畫處理 Runtime 尚未就緒。"
         }
     }

@@ -256,7 +256,7 @@ public struct TranslationQualityOptions: Codable, Hashable, Sendable {
 
     public init(
         usePageContext: Bool = true,
-        reviewPassEnabled: Bool = true,
+        reviewPassEnabled: Bool = false,
         qualityCheckEnabled: Bool = true,
         preserveLiteralTranslation: Bool = true,
         lengthMode: TranslationLengthMode = .balanced,
@@ -520,6 +520,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
     public var readingDirection: ReadingDirection
     public var defaultStyle: DialogueStyle
     public var maskExpansion: Double
+    /// 傳統去字修補使用的固定底紙顏色；可由專案設定或滴管更新。
+    public var eraseColorHex: String
     public var useImageToImageRestoration: Bool
     public var preserveUntranslatedRegions: Bool
     /// 精細掃描：封閉區域偵測不到的地方（白底上的開口氣泡、無框台詞），
@@ -533,6 +535,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         readingDirection: ReadingDirection = .rightToLeft,
         defaultStyle: DialogueStyle = DialogueStyle(),
         maskExpansion: Double = 0.035,
+        eraseColorHex: String = "#FFFFFF",
         useImageToImageRestoration: Bool = false,
         preserveUntranslatedRegions: Bool = false,
         fineScanEnabled: Bool = false,
@@ -543,6 +546,10 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.readingDirection = readingDirection
         self.defaultStyle = defaultStyle
         self.maskExpansion = maskExpansion
+        self.eraseColorHex = DialogueStyle.normalizedHexColor(
+            eraseColorHex,
+            fallback: "#FFFFFF"
+        )
         self.useImageToImageRestoration = useImageToImageRestoration
         self.preserveUntranslatedRegions = preserveUntranslatedRegions
         self.fineScanEnabled = fineScanEnabled
@@ -560,6 +567,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         case readingDirection
         case defaultStyle
         case maskExpansion
+        case eraseColorHex
         case useImageToImageRestoration
         case preserveUntranslatedRegions
         case fineScanEnabled
@@ -584,6 +592,11 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         maskExpansion = try values.decodeIfPresent(
             Double.self, forKey: .maskExpansion
         ) ?? defaults.maskExpansion
+        eraseColorHex = DialogueStyle.normalizedHexColor(
+            try values.decodeIfPresent(String.self, forKey: .eraseColorHex)
+                ?? defaults.eraseColorHex,
+            fallback: defaults.eraseColorHex
+        )
         useImageToImageRestoration = try values.decodeIfPresent(
             Bool.self, forKey: .useImageToImageRestoration
         ) ?? defaults.useImageToImageRestoration
@@ -601,28 +614,6 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
     }
 }
 
-public struct PageProcessingResult: Codable, Hashable, Sendable {
-    public var regions: [DialogueRegion]
-    public var maskURL: URL
-    public var backgroundURL: URL
-    public var outputURL: URL
-    public var warnings: [String]
-
-    public init(
-        regions: [DialogueRegion],
-        maskURL: URL,
-        backgroundURL: URL,
-        outputURL: URL,
-        warnings: [String] = []
-    ) {
-        self.regions = regions
-        self.maskURL = maskURL
-        self.backgroundURL = backgroundURL
-        self.outputURL = outputURL
-        self.warnings = warnings
-    }
-}
-
 public struct PageDetectionResult: Codable, Hashable, Sendable {
     public var regions: [DialogueRegion]
     public var maskURL: URL
@@ -632,31 +623,6 @@ public struct PageDetectionResult: Codable, Hashable, Sendable {
     public init(regions: [DialogueRegion], maskURL: URL, warnings: [String] = []) {
         self.regions = regions
         self.maskURL = maskURL
-        self.warnings = warnings
-    }
-}
-
-public struct PageCompositionResult: Codable, Hashable, Sendable {
-    public var regions: [DialogueRegion]
-    public var maskURL: URL
-    public var backgroundURL: URL
-    public var superResolvedBackgroundURL: URL?
-    public var outputURL: URL
-    public var warnings: [String]
-
-    public init(
-        regions: [DialogueRegion],
-        maskURL: URL,
-        backgroundURL: URL,
-        superResolvedBackgroundURL: URL? = nil,
-        outputURL: URL,
-        warnings: [String] = []
-    ) {
-        self.regions = regions
-        self.maskURL = maskURL
-        self.backgroundURL = backgroundURL
-        self.superResolvedBackgroundURL = superResolvedBackgroundURL
-        self.outputURL = outputURL
         self.warnings = warnings
     }
 }

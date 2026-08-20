@@ -2,23 +2,31 @@ import CoreGraphics
 import Foundation
 import MangaKitchenCore
 
-/// CPU 合成後端：以每個遮罩連通區外圍最常見的顏色填補文字區域。
+/// CPU 合成後端：以每個文字區域外圍最常見的顏色填補遮罩像素。
 /// 對漫畫對話框通常會選中紙張的底色，避免 GPU 鄰域取樣把線稿拖入框內。
 public actor CPUBubbleCleaner {
     /// 取樣環與遮罩之間要留的安全距離（像素）。
     ///
     /// 緊貼遮罩的那一圈正好是抗鋸齒殘留：門檻切不掉、又比紙白暗。拿它當樣本，
-    /// 每個字會依自己的筆畫量取到不同深淺的底色，填completed之後就浮出一層字形鬼影。
+    /// 每個字會依自己的筆畫量取到不同深淺的底色，填完之後就浮出一層字形鬼影。
     /// 往外退幾個像素才取得到乾淨的紙面。
     private static let sampleInset = 3
     /// 取樣環的厚度。太薄會在小字周圍取不到足夠樣本。
     private static let sampleThickness = 3
+    /// 指定固定底色時，額外清掉遮罩外圍的掃描／JPEG 淡色 halo。
+    /// 只接受與底色相近的像素，因此不會把黑色泡泡框線或線稿一起吃掉。
+    private static let fixedFillHaloRadius = 2
+    // JPEG 與掃描抗鋸齒會把黑字邊緣混到約 160/255；白底差值 95
+    // 仍屬於要清掉的字形 halo。門檻 96 能包住這層，但不會接近黑色框線。
+    private static let fixedFillMaximumChannelDistance = 96
 
     public init() {}
 
     public func clean(
         sourceURL: URL,
         maskURL: URL,
+        regions: [DialogueRegion] = [],
+        fillColorHex: String? = nil,
         outputURL: URL,
         progress: @escaping InferenceProgress
     ) async throws {
@@ -33,7 +41,17 @@ public actor CPUBubbleCleaner {
 
         var source = try rgbaPixels(from: sourceImage)
         let mask = try rgbaPixels(from: maskImage)
-        let masked = stride(from: 0, to: mask.count, by: 4).map { mask[$0] > 0 }
+        let originalMask = stride(from: 0, to: mask.count, by: 4).map { mask[$0] > 0 }
+        let configuredFill = fillColorHex.flatMap(Self.color(from:))
+        let masked = configuredFill.map {
+            fixedFillMask(
+                originalMask,
+                source: source,
+                fill: $0,
+                width: width,
+                height: height
+            )
+        } ?? originalMask
         // 取樣時要避開的範圍：遮罩本身再往外幾像素。緊貼遮罩那一圈是抗鋸齒殘留，
         // 比紙面暗，取到它就會依每個字的筆畫量得到不同深淺的底色。
         let excluded = MaskDilation.dilated(
@@ -42,18 +60,23 @@ public actor CPUBubbleCleaner {
             height: height,
             radius: Self.sampleInset
         )
-        let components = try connectedComponents(masked: masked, width: width, height: height)
+        let components = groupedComponents(
+            try connectedComponents(masked: masked, width: width, height: height),
+            regions: regions,
+            width: width,
+            height: height
+        )
         progress(0.2)
 
         for (offset, component) in components.enumerated() {
             try Task.checkCancellation()
-            let fill = dominantBoundaryColor(
-                for: component,
-                masked: excluded,
-                source: source,
-                width: width,
-                height: height
-            )
+            let fill = configuredFill ?? dominantBoundaryColor(
+                    for: component,
+                    masked: excluded,
+                    source: source,
+                    width: width,
+                    height: height
+                )
             for pixelIndex in component.pixels {
                 let byteIndex = pixelIndex * 4
                 source[byteIndex] = fill.red
@@ -83,6 +106,46 @@ public actor CPUBubbleCleaner {
         var green: UInt8
         var blue: UInt8
         var alpha: UInt8
+    }
+
+    private func fixedFillMask(
+        _ mask: [Bool],
+        source: [UInt8],
+        fill: RGBAColor,
+        width: Int,
+        height: Int
+    ) -> [Bool] {
+        let expanded = MaskDilation.dilated(
+            mask,
+            width: width,
+            height: height,
+            radius: Self.fixedFillHaloRadius
+        )
+        var result = mask
+        for pixelIndex in result.indices where !result[pixelIndex] && expanded[pixelIndex] {
+            let byteIndex = pixelIndex * 4
+            let channelDistance = max(
+                abs(Int(source[byteIndex]) - Int(fill.red)),
+                abs(Int(source[byteIndex + 1]) - Int(fill.green)),
+                abs(Int(source[byteIndex + 2]) - Int(fill.blue))
+            )
+            if channelDistance <= Self.fixedFillMaximumChannelDistance {
+                result[pixelIndex] = true
+            }
+        }
+        return result
+    }
+
+    private static func color(from hex: String) -> RGBAColor? {
+        let normalized = DialogueStyle.normalizedHexColor(hex, fallback: "")
+        guard normalized.count == 7 else { return nil }
+        let digits = normalized.dropFirst()
+        guard let red = UInt8(digits.prefix(2), radix: 16),
+              let green = UInt8(digits.dropFirst(2).prefix(2), radix: 16),
+              let blue = UInt8(digits.dropFirst(4).prefix(2), radix: 16) else {
+            return nil
+        }
+        return RGBAColor(red: red, green: green, blue: blue, alpha: 255)
     }
 
     private func connectedComponents(
@@ -142,6 +205,74 @@ public actor CPUBubbleCleaner {
         queue.append(index)
     }
 
+    /// 同一區域的字通常會被二值遮罩拆成許多互不相連的筆畫。若逐筆畫取色，
+    /// 掃描紙紋的些微亮度差就會被填成文字形狀的斑點；先依 region.bounds 合併，
+    /// 整段文字只會使用一個穩定底色。無法歸屬區域的人工遮罩仍逐元件處理。
+    private func groupedComponents(
+        _ components: [Component],
+        regions: [DialogueRegion],
+        width: Int,
+        height: Int
+    ) -> [Component] {
+        guard !components.isEmpty, !regions.isEmpty else { return components }
+        let margin = max(0.005, 4 / Double(max(1, min(width, height))))
+        let regionBounds = regions.map { region in
+            (region.id, pixelBounds(
+                for: region.bounds.expanded(by: margin),
+                width: width,
+                height: height
+            ))
+        }
+        var grouped: [UUID: [Component]] = [:]
+        var unassigned: [Component] = []
+        for component in components {
+            let match = regionBounds.compactMap { id, bounds -> (UUID, Int)? in
+                let overlapWidth = max(
+                    0,
+                    min(component.maxX, bounds.maxX) - max(component.minX, bounds.minX) + 1
+                )
+                let overlapHeight = max(
+                    0,
+                    min(component.maxY, bounds.maxY) - max(component.minY, bounds.minY) + 1
+                )
+                let overlap = overlapWidth * overlapHeight
+                return overlap > 0 ? (id, overlap) : nil
+            }.max { $0.1 < $1.1 }
+            if let match {
+                grouped[match.0, default: []].append(component)
+            } else {
+                unassigned.append(component)
+            }
+        }
+        let merged = regions.compactMap { region -> Component? in
+            guard let values = grouped[region.id], let first = values.first else { return nil }
+            return values.dropFirst().reduce(first) { partial, component in
+                Component(
+                    pixels: partial.pixels + component.pixels,
+                    minX: min(partial.minX, component.minX),
+                    minY: min(partial.minY, component.minY),
+                    maxX: max(partial.maxX, component.maxX),
+                    maxY: max(partial.maxY, component.maxY)
+                )
+            }
+        }
+        return merged + unassigned
+    }
+
+    private func pixelBounds(
+        for bounds: NormalizedRect,
+        width: Int,
+        height: Int
+    ) -> (minX: Int, minY: Int, maxX: Int, maxY: Int) {
+        let clamped = bounds.clamped()
+        return (
+            minX: max(0, min(width - 1, Int(floor(clamped.x * Double(width))))),
+            minY: max(0, min(height - 1, Int(floor(clamped.y * Double(height))))),
+            maxX: max(0, min(width - 1, Int(ceil(clamped.maxX * Double(width))) - 1)),
+            maxY: max(0, min(height - 1, Int(ceil(clamped.maxY * Double(height))) - 1))
+        )
+    }
+
     private func dominantBoundaryColor(
         for component: Component,
         masked: [Bool],
@@ -176,18 +307,29 @@ public actor CPUBubbleCleaner {
             let binIndex = min(15, luminance * 16 / 256)
             bins[binIndex].append(red: red, green: green, blue: blue, alpha: alpha)
         }
-        guard let selected = bins.enumerated().max(by: { lhs, rhs in
+        guard let selectedEntry = bins.enumerated().max(by: { lhs, rhs in
             if lhs.element.count != rhs.element.count {
                 return lhs.element.count < rhs.element.count
             }
             return lhs.offset < rhs.offset
-        })?.element, selected.count > 0 else {
+        }), selectedEntry.element.count > 0 else {
+            return RGBAColor(red: 255, green: 255, blue: 255, alpha: 255)
+        }
+        let selected = selectedEntry.element
+        let red = selected.red / selected.count
+        let green = selected.green / selected.count
+        let blue = selected.blue / selected.count
+        let averageLuminance = (299 * red + 587 * green + 114 * blue) / 1_000
+        let channelSpread = max(red, green, blue) - min(red, green, blue)
+        // 黑白漫畫的紙面若已落在最高亮度色階，繼續取平均會把少量掃描灰塵
+        // 混成淡灰底塊。只有近白且低色偏時才正規化為純白；灰底與彩色底保留。
+        if selectedEntry.offset == 15, averageLuminance >= 244, channelSpread <= 12 {
             return RGBAColor(red: 255, green: 255, blue: 255, alpha: 255)
         }
         return RGBAColor(
-            red: UInt8(selected.red / selected.count),
-            green: UInt8(selected.green / selected.count),
-            blue: UInt8(selected.blue / selected.count),
+            red: UInt8(red),
+            green: UInt8(green),
+            blue: UInt8(blue),
             alpha: UInt8(selected.alpha / selected.count)
         )
     }

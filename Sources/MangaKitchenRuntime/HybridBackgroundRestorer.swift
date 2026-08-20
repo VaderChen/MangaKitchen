@@ -25,6 +25,7 @@ public actor HybridBackgroundRestorer: PageBackgroundRestoring {
         sourceURL: URL,
         maskURL: URL,
         regions: [DialogueRegion],
+        fillColorHex: String,
         outputURL: URL,
         preferGenerativeModel: Bool,
         progress: @escaping InferenceProgress
@@ -49,11 +50,27 @@ public actor HybridBackgroundRestorer: PageBackgroundRestoring {
             warnings.append("未載入圖生圖模型。")
         }
 
+        let fixedFillColor = DialogueStyle.normalizedHexColor(fillColorHex, fallback: "")
+        if !fixedFillColor.isEmpty {
+            // 專案已指定底紙顏色時直接精確填色，不再讓 CPU／Metal 猜測紙面亮度。
+            try await cpuFallback.clean(
+                sourceURL: sourceURL,
+                maskURL: maskURL,
+                regions: regions,
+                fillColorHex: fixedFillColor,
+                outputURL: outputURL,
+                progress: progress
+            )
+            warnings.append("本頁已使用專案抹除底色修補。")
+            return warnings
+        }
+
         switch compositingBackend {
         case .cpu:
             try await cpuFallback.clean(
                 sourceURL: sourceURL,
                 maskURL: maskURL,
+                regions: regions,
                 outputURL: outputURL,
                 progress: progress
             )
@@ -65,7 +82,16 @@ public actor HybridBackgroundRestorer: PageBackgroundRestoring {
                     sourceURL: sourceURL,
                     maskURL: maskURL,
                     outputURL: outputURL,
-                    progress: progress
+                    progress: { progress($0 * 0.75) }
+                )
+                // Metal 完成大量像素修補後，再依文字區域統一底色；避免每個
+                // 像素的局部取樣差異在大片白底上形成顆粒。
+                try await cpuFallback.clean(
+                    sourceURL: outputURL,
+                    maskURL: maskURL,
+                    regions: regions,
+                    outputURL: outputURL,
+                    progress: { progress(0.75 + $0 * 0.25) }
                 )
                 warnings.append("本頁已使用 GPU／Metal 鄰域修補。")
             } catch is CancellationError {
@@ -74,6 +100,7 @@ public actor HybridBackgroundRestorer: PageBackgroundRestoring {
                 try await cpuFallback.clean(
                     sourceURL: sourceURL,
                     maskURL: maskURL,
+                    regions: regions,
                     outputURL: outputURL,
                     progress: progress
                 )

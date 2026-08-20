@@ -27,7 +27,7 @@ struct MCPContractDescription: Codable, Sendable {
     var invariants: [String]
 
     static let current = MCPContractDescription(
-        contractVersion: "1.1.0",
+        contractVersion: "1.2.0",
         protocolVersion: "2025-11-25",
         revisionFormat: "opaque page content token；呼叫端只能原樣回傳，不可解析或自行遞增",
         coordinateSystem: MCPContractCoordinateSystem(
@@ -106,6 +106,7 @@ struct MCPContractDescription: Codable, Sendable {
             "region.batch_update 先驗證完整批次，再一次提交；任一 patch 無效時不得部分套用。",
             "partial patch 省略欄位代表沿用；null 只允許清除 nullablePatchFields 列出的欄位。",
             "遮罩 geometry 與文字 presentation 分離；純文字或樣式修改不得重建像素遮罩。",
+            "步驟二只建立區域、遮罩與去字背景；步驟三只翻譯並產生排字預覽；步驟四只把既有預覽儲存到輸出位置。",
             "Agent 不直接讀寫 .str；App 負責 sidecar、工作區狀態及產物持久化。",
             "HTML/CSS 是畫布、PNG 與 PSD 的唯一文字排版標準。",
             "translationQuality 啟用整頁語境、二次校稿與 QA 時，Agent 應保存直譯稿、顯示譯文、角色語氣、信心與 QA flags。",
@@ -131,6 +132,7 @@ struct MCPPageArtifacts: Codable, Sendable {
     var hasMask: Bool
     var hasBackground: Bool
     var hasSuperResolvedBackground: Bool
+    var hasTranslationPreview: Bool
     var hasOutput: Bool
     var sourceURI: String
     var maskURI: String?

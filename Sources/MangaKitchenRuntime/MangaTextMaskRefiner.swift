@@ -24,7 +24,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         searchPaddingPixels: Int = 2,
         componentPaddingPixels: Int = 0,
         maximumComponentsPerRegion: Int = 256,
-        maskDilationPixels: Int = 1
+        maskDilationPixels: Int = 2
     ) {
         self.searchPaddingPixels = max(0, searchPaddingPixels)
         self.componentPaddingPixels = max(0, componentPaddingPixels)
@@ -45,7 +45,9 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             guard let result = refinement(for: region, raster: raster),
                   !result.polygons.isEmpty else {
                 refined.maskPolygons = []
-                refined.automaticMaskEnabled = false
+                // 像素精修失敗只代表無法縮到筆畫級，不代表 VLM／封閉框粗遮罩
+                // 無效。保留原本 automaticMaskEnabled，讓生成器回退到 region.bounds；
+                // 舊邏輯直接設 false，翻譯重建遮罩時會整區漏掉。
                 refined.maskRefinementApplied = false
                 refined.maskCoverageRatio = nil
                 refined.maskCoverageComplete = false
@@ -56,7 +58,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             guard let pixelBounds = result.glyphBounds,
                   Self.isPlausibleMaskBounds(pixelBounds, for: region.sourceText) else {
                 refined.maskPolygons = []
-                refined.automaticMaskEnabled = false
+                // 不採用不合理的精修結果，但仍保留原始粗遮罩作安全回退。
                 refined.maskRefinementApplied = false
                 refined.maskCoverageRatio = nil
                 refined.maskCoverageComplete = false

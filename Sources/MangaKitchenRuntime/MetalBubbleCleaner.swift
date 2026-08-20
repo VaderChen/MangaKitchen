@@ -302,14 +302,15 @@ public actor MetalBubbleCleaner {
             return;
         }
 
-        uint targetRank = max(1u, (sampleCount * 9u + 9u) / 10u);
-        uint cumulativeCount = 0;
-        uint dominantBin = 15;
+        // 百分位數只看亮度排序；少量掃描亮點就可能把每個像素推到不同色階，
+        // 大面積填補後會形成雜紋。改取出現次數最多的色階，與 CPU 路徑一致；
+        // 票數相同時保留較亮者，避免線稿色階勝出。
+        uint dominantBin = 0;
+        uint dominantCount = 0;
         for (uint bin = 0; bin < 16; ++bin) {
-            cumulativeCount += luminanceHistogram[bin];
-            if (cumulativeCount >= targetRank) {
+            if (luminanceHistogram[bin] >= dominantCount) {
                 dominantBin = bin;
-                break;
+                dominantCount = luminanceHistogram[bin];
             }
         }
 

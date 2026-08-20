@@ -106,11 +106,16 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
             }
         let payloadData = try JSONEncoder().encode(payload)
         let normalizedScale = renderScale.isFinite ? max(1, renderScale) : 1
+        // SR 背景仍以原始頁面的邏輯尺寸進行 HTML 排版，再由 WebKit snapshot
+        // 直接輸出目標像素。若把 viewport 本身也放大到 2×／4×，長頁面很容易
+        // 讓 WebKit 在建立黑白底截圖時耗盡可用 bitmap 資源。
+        let viewportWidth = Double(width.intValue) / normalizedScale
+        let viewportHeight = Double(height.intValue) / normalizedScale
         let html = Self.document(
             regionsBase64: payloadData.base64EncodedString(),
-            width: width.intValue,
-            height: height.intValue,
-            renderScale: normalizedScale
+            width: viewportWidth,
+            height: viewportHeight,
+            renderScale: 1
         )
         let temporaryURL = backgroundURL.deletingLastPathComponent()
             .appendingPathComponent(".mangakitchen-typesetting-\(UUID().uuidString)")
@@ -132,8 +137,10 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
             htmlURL: temporaryURL,
             readAccessURL: backgroundURL.deletingLastPathComponent(),
             outputURL: renderedLayerURL,
-            width: width.intValue,
-            height: height.intValue
+            outputWidth: width.intValue,
+            outputHeight: height.intValue,
+            viewportWidth: viewportWidth,
+            viewportHeight: viewportHeight
         )
         try Task.checkCancellation()
         try Self.composite(
@@ -172,8 +179,8 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
 
     private static func document(
         regionsBase64: String,
-        width: Int,
-        height: Int,
+        width: Double,
+        height: Double,
         renderScale: Double
     ) -> String {
         return """
@@ -503,10 +510,17 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
         htmlURL: URL,
         readAccessURL: URL,
         outputURL: URL,
-        width: Int,
-        height: Int
+        outputWidth: Int,
+        outputHeight: Int,
+        viewportWidth: Double,
+        viewportHeight: Double
     ) async throws {
-        let frame = CGRect(x: 0, y: 0, width: width, height: height)
+        let frame = CGRect(
+            x: 0,
+            y: 0,
+            width: viewportWidth,
+            height: viewportHeight
+        )
         webView.frame = frame
         window.setContentSize(frame.size)
 
@@ -515,7 +529,7 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
 
         let snapshotConfiguration = WKSnapshotConfiguration()
         snapshotConfiguration.rect = frame
-        snapshotConfiguration.snapshotWidth = NSNumber(value: width)
+        snapshotConfiguration.snapshotWidth = NSNumber(value: outputWidth)
         try await setSnapshotBackground("#000000", webView: webView)
         let blackBackgroundPNG = try await snapshot(
             webView,
@@ -531,8 +545,8 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
         let pngData = try Self.transparentLayerPNG(
             blackBackgroundPNG: blackBackgroundPNG,
             whiteBackgroundPNG: whiteBackgroundPNG,
-            width: width,
-            height: height
+            width: outputWidth,
+            height: outputHeight
         )
         try pngData.write(to: outputURL, options: .atomic)
     }
@@ -732,11 +746,7 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
         guard let blackSource = CGImageSourceCreateWithData(blackBackgroundPNG as CFData, nil),
               let blackImage = CGImageSourceCreateImageAtIndex(blackSource, 0, nil),
               let whiteSource = CGImageSourceCreateWithData(whiteBackgroundPNG as CFData, nil),
-              let whiteImage = CGImageSourceCreateImageAtIndex(whiteSource, 0, nil),
-              blackImage.width == width,
-              blackImage.height == height,
-              whiteImage.width == width,
-              whiteImage.height == height else {
+              let whiteImage = CGImageSourceCreateImageAtIndex(whiteSource, 0, nil) else {
             throw HTMLDialogueTypesetterError.snapshotFailed
         }
         var pixels = try rgbaBytes(from: blackImage, width: width, height: height)

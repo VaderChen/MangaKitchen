@@ -28,7 +28,7 @@ struct MangaKitchenMCPServer {
             name: "mangakitchen",
             version: "0.1.0",
             title: "MangaKitchen 漫畫翻譯",
-            instructions: "MangaKitchen 由 App 管理頁面、區域、遮罩與持久化資料。處理指定頁面時只需呼叫 page.prepare_agent_task；若缺少步驟二，App 會先建立區域與像素遮罩，再一次交付內嵌 JSON 與原圖 image content。不要搜尋、讀取或建立 .str 檔案，也不要額外讀取 page resource。Agent 依工作包既有 region_id 完成原文抽取、翻譯與排版後，以 page.submit_agent_result 一次回寫全部區域，App 隨即執行步驟四合成。除非使用者明確要求，請勿清除、刪除、重建、重新掃描、新增、合併或改動區域與遮罩。workspace.pages 只提供狀態摘要，不是要求自動執行的命令清單。",
+            instructions: "MangaKitchen 由 App 管理頁面、區域、遮罩與持久化資料。四個步驟必須分開：步驟二由 App 完成區域、像素遮罩與去字背景；只有這些產物齊全時，page.prepare_agent_task 才會交付內嵌 JSON 與原圖 image content。Agent 依既有 region_id 完成原文抽取、翻譯與排版後，以 page.submit_agent_result 一次回寫並建立步驟三預覽；只有使用者要求輸出時才呼叫 page.render 執行步驟四儲存。後一步不得代跑或重做前一步。不要搜尋、讀取或建立 .str 檔案，也不要額外讀取 page resource。除非使用者明確要求，請勿清除、刪除、重建、重新掃描、新增、合併或改動區域與遮罩。workspace.pages 只提供狀態摘要，不是要求自動執行的命令清單。",
 
             capabilities: .init(
                 resources: .init(subscribe: false, listChanged: false),
@@ -189,7 +189,7 @@ struct MangaKitchenMCPServer {
                         results: try requiredAgentRegionResults(arguments, "regions"),
                         progress: progressReporter(request: request, server: server)
                     )
-                    return try success("Agent 結果已一次回寫，步驟四合成完成。", result)
+                    return try success("Agent 結果已一次回寫，步驟三翻譯排字預覽完成。", result)
 
                 case "mangakitchen.page.render":
                     let result = try await service.renderPage(
@@ -198,7 +198,7 @@ struct MangaKitchenMCPServer {
                         expectedRevision: try requiredRevision(arguments),
                         progress: progressReporter(request: request, server: server)
                     )
-                    return try success("頁面已依目前 HTML 排版合成。", result)
+                    return try success("步驟三預覽已儲存到輸出位置。", result)
 
                 case "mangakitchen.region.batch_update":
                     let result = try await service.batchUpdateRegions(
@@ -1035,7 +1035,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.workspace.pages",
                 title: "列出待處理頁面",
-                description: "唯讀頁面狀態摘要。next_action 與 nextActionInstruction 只描述缺少的產物，不是要求 Agent 自行迴圈、清理或重做資料；處理頁面請使用 page.prepare_agent_task。",
+                description: "唯讀頁面狀態摘要。next_action 與 nextActionInstruction 只描述缺少的產物，不是要求 Agent 自行迴圈、清理或重做資料；必須依步驟順序補齊產物。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "pending_only": property("boolean", "預設 true，只回傳 next_action 不是 done 的頁面")
@@ -1094,7 +1094,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.model.load",
                 title: "載入本機模型",
-                description: "從含 mangakitchen-model.json 的本機目錄載入模型。MCP 的翻譯與排版由 Agent 提供；imageToImage 模型可供 page.compose 的生成式背景修補使用。",
+                description: "從含 mangakitchen-model.json 的本機目錄載入模型。MCP 的翻譯與排版由 Agent 提供；模型載入不會自動執行任何工作流步驟。",
                 inputSchema: objectSchema([
                     "model_directory": property("string", "模型目錄的絕對路徑")
                 ], required: ["model_directory"]),
@@ -1129,7 +1129,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.page.prepare_agent_task",
                 title: "準備單頁 Agent 工作包",
-                description: "唯一頁面處理入口。缺少步驟二時 App 會先建立區域與像素遮罩，再一次回傳內嵌 regionData JSON 與原圖 image content；其中既有 sourceText／translatedText 是需要對照原圖校稿的草稿，既有排版欄位也可由 Agent 修正。Agent 不得搜尋 .str 檔案、讀取額外 page resource、自行偵測或重建區域。",
+                description: "步驟三入口。只封裝 App 已完成的步驟二區域、像素遮罩與去字背景，再一次回傳內嵌 regionData JSON 與原圖 image content；缺少任一前置產物時會停止並要求先回 App 完成步驟二。其中既有 sourceText／translatedText 是需要對照原圖校稿的草稿，既有排版欄位也可由 Agent 修正。Agent 不得搜尋 .str 檔案、讀取額外 page resource、自行偵測或重建區域。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": property("string", "要處理的單頁 UUID")
@@ -1139,8 +1139,8 @@ struct MangaKitchenMCPServer {
             ),
             Tool(
                 name: "mangakitchen.page.submit_agent_result",
-                title: "回寫 Agent 結果並輸出",
-                description: "一次接收本頁全部既有 region_id 的原文、譯文與排版，保留 App 步驟二遮罩、更新專案狀態並直接執行步驟四。陣列必須完整，不可新增、刪除、合併或修改區域與遮罩。",
+                title: "完成翻譯與排字預覽",
+                description: "步驟三：一次接收本頁全部既有 region_id 的原文、譯文與排版，保留 App 步驟二產物並建立翻譯排字預覽；不會儲存最終輸出。陣列必須完整，不可新增、刪除、合併或修改區域與遮罩。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": property("string", "工作包中的單頁 UUID"),
@@ -1157,8 +1157,8 @@ struct MangaKitchenMCPServer {
             ),
             Tool(
                 name: "mangakitchen.page.render",
-                title: "渲染頁面",
-                description: "依目前區域的 HTML/CSS 排版重新產生畫布輸出；不重新翻譯或重建區域。",
+                title: "儲存頁面輸出",
+                description: "步驟四：只把步驟三已完成的翻譯排字預覽儲存到輸出目錄；不重新排字、翻譯、修補背景或重建遮罩。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": pageID,
@@ -1266,7 +1266,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.translate",
                 title: "翻譯對話文字",
-                description: "MCP 的步驟三由 Agent 接手，此工具不會呼叫 App 內建圖生文模型。請讀取 App 已偵測的區域與原圖，由 Agent 抽取原文、翻譯並以 region.update 寫回文字及排版，再執行 page.compose。",
+                description: "MCP 的步驟三由 Agent 接手，此相容工具不會呼叫 App 內建圖生文模型。請改用 page.prepare_agent_task 與 page.submit_agent_result 完成翻譯排字預覽。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent
@@ -1274,7 +1274,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.compose",
                 title: "合成翻譯頁面",
-                description: "步驟四：只使用目前已完成的步驟二遮罩與 Agent 透過 region.update 回傳的步驟三資料，修補背景、排版並輸出圖片。此工具不會自動重跑 detect_masks 或 translate；缺少資料時請依錯誤提示補前一步。",
+                description: "步驟四相容入口：只把既有步驟三翻譯排字預覽儲存成輸出圖片，不會修補背景、重新排字、重跑 detect_masks 或 translate。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent
@@ -1282,7 +1282,7 @@ struct MangaKitchenMCPServer {
             workflowTool(
                 name: "mangakitchen.page.run_full",
                 title: "一鍵處理完整頁",
-                description: "相容的一鍵入口；只在步驟二遮罩、原文與譯文都已存在時接續合成，不會自動重跑 detect_masks 或代替 Agent 執行步驟三。缺少資料時請依錯誤提示補正後再執行。",
+                description: "相容的一鍵入口；只在步驟二與步驟三預覽都已完成時儲存輸出，不會自動重跑 detect_masks、翻譯或排字。缺少資料時請依錯誤提示補正後再執行。",
                 workspaceID: workspaceID,
                 pageIDs: pageIDs,
                 annotations: idempotent

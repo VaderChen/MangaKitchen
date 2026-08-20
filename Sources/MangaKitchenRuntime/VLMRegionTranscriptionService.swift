@@ -81,29 +81,37 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
                         from: response
                     )
                     for returnedItems in decodedItems {
-                        if let matchedItem = returnedItems.first(where: { $0.index == 1 }) {
-                            item = matchedItem
-                            break
+                        guard let matchedItem = returnedItems.first(where: { $0.index == 1 }) else {
+                            continue
                         }
+                        let kind = matchedItem.kind
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .lowercased()
+                        let text = matchedItem.text
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        // 有 index 但沒有可用原文仍是不完整回覆，必須繼續重試。
+                        // 舊邏輯會把空字串或誤判 ignore 當成功，之後整顆泡泡便漏翻。
+                        guard Self.isAcceptedKind(kind),
+                              !text.isEmpty,
+                              !Self.isSoundEffectTranscript(text) else { continue }
+                        item = matchedItem
+                        break
                     }
                     if item != nil { break }
                 }
                 guard let item else {
                     throw VLMRegionTranscriptionError.invalidModelResponse
                 }
-                let kind = item.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if Self.isAcceptedKind(kind), !text.isEmpty, !Self.isSoundEffectTranscript(text) {
-                    var recognized = region
-                    recognized.rawSourceText = text
-                    recognized.sourceText = text
-                    recognized.ocrTextRefined = true
-                    recognized.detectedWritingDirection = item.direction
-                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-                        .flatMap(WritingDirection.init(rawValue:))
-                        ?? recognized.detectedWritingDirection
-                    recognizedByID[recognized.id] = recognized
-                }
+                var recognized = region
+                recognized.rawSourceText = text
+                recognized.sourceText = text
+                recognized.ocrTextRefined = true
+                recognized.detectedWritingDirection = item.direction
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                    .flatMap(WritingDirection.init(rawValue:))
+                    ?? recognized.detectedWritingDirection
+                recognizedByID[recognized.id] = recognized
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

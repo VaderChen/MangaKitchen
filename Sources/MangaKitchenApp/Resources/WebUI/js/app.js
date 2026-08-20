@@ -21,6 +21,8 @@ let pageContextTarget = null;
 let calculationDialogState = null;
 let calculationElapsedTimer = null;
 let dismissedModelLoadingFailureID = null;
+const presentedUpdateTags = new Set();
+let updateDialogRetryTimer = null;
 let maskTool = "add";
 let activeMaskStroke = null;
 // 譯文編輯的防抖更新在筆劃期間不能送出：它一送出，後端推回的狀態會蓋掉
@@ -33,6 +35,7 @@ const regionUpdateTimers = new Map();
 let regionUpdatesSuspended = false;
 let translationDrag = null;
 let translationResize = null;
+let eraseColorPicking = false;
 const canvasViewport = { pageID: null, scale: 1, x: 0, y: 0, drag: null };
 const canvasBaseSizes = new WeakMap();
 const colorSchemeStorageKey = "mangakitchen.color-scheme";
@@ -68,8 +71,6 @@ const elements = {
   translationRedo: document.querySelector("#translation-redo"),
   translationFontDecrease: document.querySelector("#translation-font-decrease"),
   translationFontIncrease: document.querySelector("#translation-font-increase"),
-  translationFontRegular: document.querySelector("#translation-font-regular"),
-  translationFontBold: document.querySelector("#translation-font-bold"),
   translationFontSizeValue: document.querySelector("#translation-font-size-value"),
   outputImageStage: document.querySelector("#output-image-stage"),
   outputPreviewStack: document.querySelector("#output-preview-stack"),
@@ -108,6 +109,10 @@ const elements = {
   noticeTitle: document.querySelector("#notice-title"),
   noticeMessage: document.querySelector("#notice-message"),
   noticeDismiss: document.querySelector("#notice-dismiss"),
+  updateDialog: document.querySelector("#update-dialog"),
+  updateMessage: document.querySelector("#update-message"),
+  updateReleaseName: document.querySelector("#update-release-name"),
+  updateOpenRelease: document.querySelector("#update-open-release"),
   calculationDialog: document.querySelector("#calculation-dialog"),
   calculationTitle: document.querySelector("#calculation-title"),
   calculationMessage: document.querySelector("#calculation-message"),
@@ -156,6 +161,12 @@ const elements = {
   targetLanguage: document.querySelector("#target-language"),
   readingDirection: document.querySelector("#reading-direction"),
   writingDirection: document.querySelector("#writing-direction"),
+  eraseColor: document.querySelector("#erase-color"),
+  eraseColorTrigger: document.querySelector("#erase-color-trigger"),
+  eraseColorSwatch: document.querySelector("#erase-color-swatch"),
+  eraseColorValue: document.querySelector("#erase-color-value"),
+  eraseColorPresets: document.querySelector("#erase-color-presets"),
+  eraseColorEyedropper: document.querySelector("#erase-color-eyedropper"),
   fontName: document.querySelector("#font-name"),
   fontNameTrigger: document.querySelector("#font-name-trigger"),
   fontNameValue: document.querySelector("#font-name-value"),
@@ -274,9 +285,9 @@ function activePage() {
 
 function workflowStepForPage(page) {
   if (!page) return "pages";
-  if (["detectingText", "recognizing", "masking", "maskReady"].includes(page.stage)) return "mask";
-  if (["translating", "translationReady", "superResolving"].includes(page.stage)) return "translate";
-  if (["composing", "restoringBackground", "typesetting", "completed"].includes(page.stage)) return "compose";
+  if (["detectingText", "recognizing", "masking", "restoringBackground", "maskReady"].includes(page.stage)) return "mask";
+  if (["translating", "typesetting", "translationReady", "superResolving"].includes(page.stage)) return "translate";
+  if (["composing", "completed"].includes(page.stage)) return "compose";
   return "pages";
 }
 
@@ -302,6 +313,7 @@ function selectWorkflowStep(step) {
   workflowStepPinned = true;
   syncWorkflowStep(activePage());
   renderPage();
+  renderSettings();
 }
 
 function selectedWorkflowPages() {
@@ -313,10 +325,13 @@ function selectedWorkflowPages() {
 
 function hasWorkflowStepData(page, step) {
   if (step === "mask") {
-    return Boolean(page.maskPreviewURL);
+    return Boolean(page.maskPreviewURL && page.maskAppliedPreviewURL);
   }
   if (step === "translate") {
-    return Boolean(page.translationPreviewURL || page.outputPreviewURL);
+    const regionsComplete = (page.regions ?? []).every((region) => (
+      Boolean(region.sourceText?.trim()) && Boolean(region.translatedText?.trim())
+    ));
+    return regionsComplete && Boolean(page.translationPreviewURL || page.outputPreviewURL);
   }
   if (step === "compose") return Boolean(page.outputPreviewURL);
   return true;
@@ -518,12 +533,21 @@ function calculationPageFraction(operation, page) {
 
 async function selectOrCalculateWorkflowStep(step, operation, force = false) {
   await flushPendingRegionUpdates();
-  selectWorkflowStep(step);
   const pages = selectedWorkflowPages();
   if (!pages.length) {
     showError(new Error(t("selectAtLeastOnePage")));
     return;
   }
+  const prerequisiteStep = {
+    translate: "mask",
+    compose: "translate",
+  }[step];
+  if (prerequisiteStep
+      && pages.some((page) => !hasWorkflowStepData(page, prerequisiteStep))) {
+    showError(new Error(t("completeCurrentStepFirst")));
+    return;
+  }
+  selectWorkflowStep(step);
   const pendingPages = force ? pages : pages.filter((page) => !hasWorkflowStepData(page, step));
   if (!pendingPages.length) return;
   const pageIDs = pendingPages.map((page) => page.id);
@@ -545,6 +569,16 @@ async function selectOrCalculateWorkflowStep(step, operation, force = false) {
 }
 
 function advanceWorkflowStep() {
+  const pages = selectedWorkflowPages();
+  if (!pages.length) {
+    showError(new Error(t("selectAtLeastOnePage")));
+    return Promise.resolve();
+  }
+  if (activeWorkflowStep !== "pages"
+      && pages.some((page) => !hasWorkflowStepData(page, activeWorkflowStep))) {
+    showError(new Error(t("completeCurrentStepFirst")));
+    return Promise.resolve();
+  }
   const destination = {
     pages: { step: "mask", operation: "detectMasks" },
     mask: { step: "translate", operation: "translate" },
@@ -639,6 +673,41 @@ function showNotice(title, message, dismissLabel) {
     elements.noticeDialog.addEventListener("close", resolve, { once: true });
     elements.noticeDialog.showModal();
   });
+}
+
+function updateDisplayVersion(update) {
+  return Number.isInteger(update?.build)
+    ? `${update.version} build ${update.build}`
+    : update?.version ?? "";
+}
+
+function renderAvailableUpdateDialog() {
+  const update = state?.availableUpdate;
+  if (!update || presentedUpdateTags.has(update.tag) || elements.updateDialog.open) {
+    if (updateDialogRetryTimer !== null) clearTimeout(updateDialogRetryTimer);
+    updateDialogRetryTimer = null;
+    return;
+  }
+  const anotherDialogIsOpen = [...document.querySelectorAll("dialog[open]")]
+    .some((dialog) => dialog !== elements.updateDialog);
+  if (anotherDialogIsOpen) {
+    if (updateDialogRetryTimer === null) {
+      updateDialogRetryTimer = setTimeout(() => {
+        updateDialogRetryTimer = null;
+        renderAvailableUpdateDialog();
+      }, 500);
+    }
+    return;
+  }
+
+  presentedUpdateTags.add(update.tag);
+  elements.updateMessage.textContent = t("updateAvailableMessage", {
+    current: state.globalSettings.appVersion,
+    latest: updateDisplayVersion(update),
+  });
+  elements.updateReleaseName.textContent = update.name || update.tag;
+  elements.updateOpenRelease.dataset.url = update.releaseURL;
+  elements.updateDialog.showModal();
 }
 
 function requestPageName(page) {
@@ -1215,6 +1284,39 @@ function renderRegions(page) {
       direction.append(option);
     }
 
+    const boldToggle = document.createElement("button");
+    boldToggle.type = "button";
+    boldToggle.className = "region-bold-toggle";
+    boldToggle.textContent = "B";
+    boldToggle.title = t("boldTranslationFont");
+    boldToggle.setAttribute("aria-label", t("boldTranslationFont"));
+    boldToggle.disabled = state.isProcessing || regionUpdatesSuspended;
+    const renderBoldToggle = () => {
+      const isBold = region.style.fontWeight === "bold";
+      boldToggle.classList.toggle("active", isBold);
+      boldToggle.setAttribute("aria-pressed", String(isBold));
+    };
+    renderBoldToggle();
+    boldToggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (state.isProcessing || regionUpdatesSuspended) return;
+      const previous = region.style.fontWeight ?? "regular";
+      const next = previous === "bold" ? "regular" : "bold";
+      region.style.fontWeight = next;
+      renderBoldToggle();
+      renderTranslationLayer(page);
+      invoke("updateRegion", {
+        pageID: page.id,
+        regionID: region.id,
+        fontWeight: next,
+      }).catch((error) => {
+        region.style.fontWeight = previous;
+        renderBoldToggle();
+        renderTranslationLayer(activePage());
+        showError(error);
+      });
+    });
+
     const alignment = document.createElement("select");
     for (const [value, labelKey] of [["start", "alignStart"], ["center", "alignCenter"], ["end", "alignEnd"]]) {
       const option = document.createElement("option");
@@ -1324,7 +1426,7 @@ function renderRegions(page) {
     rotation.addEventListener("input", scheduleUpdate);
     const controls = document.createElement("div");
     controls.className = "region-controls";
-    controls.append(direction);
+    controls.append(direction, boldToggle);
     row.append(heading, source, editor, translationMetadata, controls, styleControls);
     elements.regionList.append(row);
   }
@@ -1938,10 +2040,6 @@ function renderTranslationFontTools(page) {
   const disabled = !translationMode || !region || !region.translatedText.trim() || state.isProcessing;
   elements.translationFontDecrease.disabled = disabled;
   elements.translationFontIncrease.disabled = disabled;
-  elements.translationFontRegular.disabled = disabled;
-  elements.translationFontBold.disabled = disabled;
-  elements.translationFontRegular.classList.toggle("active", Boolean(region) && region.style.fontWeight !== "bold");
-  elements.translationFontBold.classList.toggle("active", region?.style.fontWeight === "bold");
   elements.translationFontSizeValue.textContent = region
     ? `${Math.round(translationSourceFontSize(page, region))} pt`
     : "—";
@@ -1976,25 +2074,6 @@ function adjustSelectedTranslationFontSize(delta) {
     useAutomaticFontSize: false,
   }).catch((error) => {
     region.style.fontSize = previous;
-    renderTranslationLayer(activePage());
-    showError(error);
-  });
-}
-
-function setSelectedTranslationFontWeight(fontWeight) {
-  const page = activePage();
-  const region = selectedTranslationRegion(page);
-  if (!page || !region || activeWorkflowStep !== "translate" || state.isProcessing) return;
-  const previous = region.style.fontWeight ?? "regular";
-  if (previous === fontWeight) return;
-  region.style.fontWeight = fontWeight;
-  renderTranslationLayer(page);
-  invoke("updateRegion", {
-    pageID: page.id,
-    regionID: region.id,
-    fontWeight,
-  }).catch((error) => {
-    region.style.fontWeight = previous;
     renderTranslationLayer(activePage());
     showError(error);
   });
@@ -2297,7 +2376,13 @@ function renderPage() {
       || page?.translationPreviewURL
       || page?.outputPreviewURL
   );
-  elements.reveal.textContent = t(outputStepActive ? "revealOutput" : "recalculate");
+  elements.reveal.textContent = t(
+    outputStepActive
+      ? "revealOutput"
+      : activeWorkflowStep === "pages"
+        ? "clearAndRestart"
+        : "recalculate"
+  );
   elements.reveal.hidden = !page
     || (activeWorkflowStep === "pages" && !hasCalculatedOutput);
   elements.reveal.disabled = outputStepActive
@@ -2402,6 +2487,7 @@ function renderSettings() {
   if (document.activeElement !== elements.targetLanguage) elements.targetLanguage.value = options.targetLanguageCode;
   elements.readingDirection.value = options.readingDirection;
   elements.writingDirection.value = options.defaultStyle.writingDirection;
+  renderEraseColor(options.eraseColorHex ?? "#FFFFFF");
   const selectedFont = options.defaultStyle.fontName;
   const availableFonts = [...new Set([
     selectedFont,
@@ -2449,7 +2535,7 @@ function renderSettings() {
   }
   const quality = options.translationQuality ?? {};
   elements.translationPageContext.checked = quality.usePageContext ?? true;
-  elements.translationReviewPass.checked = quality.reviewPassEnabled ?? true;
+  elements.translationReviewPass.checked = quality.reviewPassEnabled ?? false;
   elements.translationQualityCheck.checked = quality.qualityCheckEnabled ?? true;
   elements.translationPreserveLiteral.checked = quality.preserveLiteralTranslation ?? true;
   elements.translationLengthMode.value = quality.lengthMode ?? "balanced";
@@ -2472,6 +2558,70 @@ function renderSettings() {
   ]) {
     control.disabled = !state.activeProjectID;
   }
+  elements.eraseColorTrigger.disabled = !state.activeProjectID;
+  elements.eraseColorEyedropper.disabled = activeWorkflowStep !== "pages"
+    || !activePage()
+    || state.isProcessing;
+  if (elements.eraseColorEyedropper.disabled && eraseColorPicking) {
+    setEraseColorPicking(false);
+  }
+}
+
+function normalizedEraseColor(value) {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return /^#[0-9A-F]{6}$/.test(normalized) ? normalized : "#FFFFFF";
+}
+
+function renderEraseColor(value) {
+  const color = normalizedEraseColor(value);
+  elements.eraseColor.value = color;
+  elements.eraseColorSwatch.style.setProperty("--paper-color", color);
+  elements.eraseColorValue.value = color;
+  for (const option of elements.eraseColorPresets.querySelectorAll("[data-erase-color]")) {
+    option.setAttribute("aria-selected", String(option.dataset.eraseColor === color));
+  }
+}
+
+function closeEraseColorPresets() {
+  elements.eraseColorPresets.hidden = true;
+  elements.eraseColorTrigger.setAttribute("aria-expanded", "false");
+}
+
+function openEraseColorPresets() {
+  closeFontPreviewList();
+  setEraseColorPicking(false);
+  elements.eraseColorPresets.hidden = false;
+  elements.eraseColorTrigger.setAttribute("aria-expanded", "true");
+}
+
+function setEraseColorPicking(active) {
+  eraseColorPicking = Boolean(active && activePage() && !state?.isProcessing);
+  elements.eraseColorEyedropper.classList.toggle("active", eraseColorPicking);
+  elements.eraseColorEyedropper.setAttribute("aria-pressed", String(eraseColorPicking));
+  elements.workspace.classList.toggle("erase-color-picking", eraseColorPicking);
+}
+
+async function pickEraseColorFromSource(event) {
+  if (!eraseColorPicking) return;
+  const page = activePage();
+  const bounds = elements.sourcePreview.getBoundingClientRect();
+  if (!page || bounds.width <= 0 || bounds.height <= 0
+      || event.clientX < bounds.left || event.clientX > bounds.right
+      || event.clientY < bounds.top || event.clientY > bounds.bottom) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  const result = await invoke("samplePageColor", {
+    pageID: page.id,
+    x: clamp((event.clientX - bounds.left) / bounds.width, 0, 1),
+    y: clamp((event.clientY - bounds.top) / bounds.height, 0, 1),
+  }).catch((error) => {
+    showError(error);
+    return null;
+  });
+  setEraseColorPicking(false);
+  if (!result?.hex) return;
+  renderEraseColor(result.hex);
+  await updateSettings();
 }
 
 function globalSettingsPayload(overrides = {}) {
@@ -2886,6 +3036,7 @@ function render(nextState) {
   renderBatchJobs();
   renderModelLoadingDialog();
   renderCalculationDialog();
+  renderAvailableUpdateDialog();
   renderSelectionSummary();
   elements.cancel.disabled = !state.isProcessing;
   elements.status.textContent = state.statusMessage || t("ready");
@@ -2937,11 +3088,12 @@ function updateSettings() {
     }
     renderTranslationLayer(activePage());
   }
-  invoke("updateSettings", {
+  return invoke("updateSettings", {
     targetLanguageCode: elements.targetLanguage.value,
     readingDirection: elements.readingDirection.value,
     writingDirection: elements.writingDirection.value,
     fontName: elements.fontName.value,
+    eraseColorHex: elements.eraseColor.value,
     translationQuality: {
       usePageContext: elements.translationPageContext.checked,
       reviewPassEnabled: elements.translationReviewPass.checked,
@@ -3058,6 +3210,7 @@ for (const stage of [elements.sourceImageStage, elements.outputImageStage]) {
   stage.addEventListener("pointerup", finishCanvasPan);
   stage.addEventListener("pointercancel", finishCanvasPan);
 }
+elements.sourceImageStage.addEventListener("pointerdown", pickEraseColorFromSource, true);
 
 function addGlossaryEntry() {
   const sourceTerm = elements.glossarySource.value.trim();
@@ -3096,6 +3249,16 @@ elements.modelLoadingClose.addEventListener("click", () => {
   const loading = state?.modelLoadingState;
   dismissedModelLoadingFailureID = loading?.id?.toLowerCase() ?? "unknown";
   closeModelLoadingDialog();
+});
+elements.updateOpenRelease.addEventListener("click", async () => {
+  const url = elements.updateOpenRelease.dataset.url;
+  if (!url) return;
+  try {
+    await invoke("openExternalURL", { url });
+    elements.updateDialog.close("open");
+  } catch (error) {
+    showError(error);
+  }
 });
 elements.calculationCancel.addEventListener("click", () => {
   elements.calculationCancel.disabled = true;
@@ -3242,8 +3405,6 @@ elements.translationRedo.addEventListener("click", () => {
   if (page) invoke("redoRegionEdit", { pageID: page.id }).catch(showError);
 });
 elements.translationFontIncrease.addEventListener("click", () => adjustSelectedTranslationFontSize(1));
-elements.translationFontRegular.addEventListener("click", () => setSelectedTranslationFontWeight("regular"));
-elements.translationFontBold.addEventListener("click", () => setSelectedTranslationFontWeight("bold"));
 elements.maskUndo.addEventListener("click", () => {
   const page = activePage();
   const region = selectedMaskRegion(page);
@@ -3490,6 +3651,21 @@ elements.fontNameTrigger.addEventListener("click", () => {
   if (elements.fontNameList.hidden) openFontPreviewList();
   else closeFontPreviewList();
 });
+elements.eraseColorTrigger.addEventListener("click", () => {
+  if (elements.eraseColorPresets.hidden) openEraseColorPresets();
+  else closeEraseColorPresets();
+});
+elements.eraseColorPresets.addEventListener("click", (event) => {
+  const option = event.target.closest("[data-erase-color]");
+  if (!option) return;
+  renderEraseColor(option.dataset.eraseColor);
+  closeEraseColorPresets();
+  updateSettings();
+});
+elements.eraseColorEyedropper.addEventListener("click", () => {
+  closeEraseColorPresets();
+  setEraseColorPicking(!eraseColorPicking);
+});
 elements.fontNameTrigger.addEventListener("keydown", (event) => {
   if (["ArrowDown", "Enter", " "].includes(event.key)) {
     event.preventDefault();
@@ -3521,6 +3697,17 @@ document.addEventListener("pointerdown", (event) => {
   if (elements.fontNameList.hidden) return;
   if (elements.fontNameList.contains(event.target) || elements.fontNameTrigger.contains(event.target)) return;
   closeFontPreviewList();
+});
+document.addEventListener("pointerdown", (event) => {
+  if (elements.eraseColorPresets.hidden) return;
+  if (elements.eraseColorPresets.contains(event.target)
+      || elements.eraseColorTrigger.contains(event.target)) return;
+  closeEraseColorPresets();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!elements.eraseColorPresets.hidden) closeEraseColorPresets();
+  if (eraseColorPicking) setEraseColorPicking(false);
 });
 
 for (const control of [

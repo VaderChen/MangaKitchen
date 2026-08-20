@@ -109,14 +109,12 @@
               <button id="translation-font-decrease" type="button" class="icon-button" data-i18n-title="decreaseTranslationFontSize" data-i18n-aria-label="decreaseTranslationFontSize" title="縮小翻譯文字（-）" aria-label="縮小翻譯文字（-）"><i class="fa-solid fa-minus" aria-hidden="true"></i></button>
               <output id="translation-font-size-value">—</output>
               <button id="translation-font-increase" type="button" class="icon-button" data-i18n-title="increaseTranslationFontSize" data-i18n-aria-label="increaseTranslationFontSize" title="放大翻譯文字（+）" aria-label="放大翻譯文字（+）"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
-              <button id="translation-font-regular" type="button" class="icon-button translation-weight" data-i18n-title="regularTranslationFont" data-i18n-aria-label="regularTranslationFont" title="正常字重" aria-label="正常字重"><i class="fa-solid fa-font" aria-hidden="true"></i></button>
-              <button id="translation-font-bold" type="button" class="icon-button translation-weight" data-i18n-title="boldTranslationFont" data-i18n-aria-label="boldTranslationFont" title="粗體" aria-label="粗體"><i class="fa-solid fa-bold" aria-hidden="true"></i></button>
             </div>
             <div class="canvas-toolbar-spacer"></div>
             <button id="canvas-pixel-preview" type="button" class="secondary" data-i18n-title="pixelPreview" data-i18n-aria-label="pixelPreview" title="以輸出原生像素檢視" aria-label="以輸出原生像素檢視" disabled>1:1</button>
             <button id="super-resolution" type="button" class="secondary" data-i18n="superResolutionShort" data-i18n-title="superResolution" data-i18n-aria-label="superResolution" title="超高解析度" aria-label="超高解析度" hidden disabled><i class="fa-solid fa-expand" aria-hidden="true"></i> <span>超高解析度</span></button>
             <button id="export-psd" class="secondary" data-i18n="exportPSD" disabled>輸出 PSD</button>
-            <button id="reveal-output" class="secondary" disabled>重新計算</button>
+            <button id="reveal-output" class="secondary" disabled>清除重來</button>
             <button id="workflow-next" type="button" class="primary icon-button" data-i18n-title="nextWorkflowStep" data-i18n-aria-label="nextWorkflowStep" title="下一步" aria-label="下一步" disabled><i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
           </header>
 
@@ -190,6 +188,28 @@
               <option value="vertical" data-i18n="vertical">直排</option>
             </select>
           </label>
+          <div class="erase-color-field">
+            <span data-i18n="eraseBackgroundColor">抹除底色</span>
+            <div class="erase-color-controls">
+              <div class="erase-color-picker">
+                <input id="erase-color" type="hidden" value="#FFFFFF">
+                <button id="erase-color-trigger" type="button" class="erase-color-trigger" aria-haspopup="listbox" aria-expanded="false">
+                  <span id="erase-color-swatch" class="erase-color-swatch" aria-hidden="true"></span>
+                  <output id="erase-color-value">#FFFFFF</output>
+                  <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+                </button>
+                <div id="erase-color-presets" class="erase-color-presets" role="listbox" hidden>
+                  <button type="button" data-erase-color="#FFFFFF" role="option"><span style="--paper-color:#FFFFFF"></span><span data-i18n="paperPureWhite">純白</span></button>
+                  <button type="button" data-erase-color="#F8F8F6" role="option"><span style="--paper-color:#F8F8F6"></span><span data-i18n="paperCoolWhite">冷白</span></button>
+                  <button type="button" data-erase-color="#FAF5E8" role="option"><span style="--paper-color:#FAF5E8"></span><span data-i18n="paperWarmWhite">暖白</span></button>
+                  <button type="button" data-erase-color="#F4EBD7" role="option"><span style="--paper-color:#F4EBD7"></span><span data-i18n="paperIvory">象牙白</span></button>
+                  <button type="button" data-erase-color="#E8DFC8" role="option"><span style="--paper-color:#E8DFC8"></span><span data-i18n="paperNewsprint">新聞紙色</span></button>
+                </div>
+              </div>
+              <button id="erase-color-eyedropper" type="button" class="icon-button erase-color-eyedropper" data-i18n-title="pickEraseBackgroundColor" data-i18n-aria-label="pickEraseBackgroundColor" title="從左側原圖吸取抹除底色" aria-label="從左側原圖吸取抹除底色"><i class="fa-solid fa-eye-dropper" aria-hidden="true"></i></button>
+            </div>
+            <small data-i18n="eraseBackgroundColorHelp">預設使用白色；啟用滴管後點選左側原圖取色。</small>
+          </div>
           <div class="font-picker-field">
             <span data-i18n="defaultFont">預設字型</span>
             <div class="font-picker">
@@ -534,6 +554,18 @@
         <p id="notice-message"></p>
         <div class="confirmation-dialog-actions">
           <button id="notice-dismiss" type="submit" value="acknowledge" class="primary"></button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="update-dialog" aria-labelledby="update-title" aria-describedby="update-message">
+      <form method="dialog" class="confirmation-dialog-shell">
+        <h2 id="update-title" data-i18n="updateAvailableTitle">發現新版本</h2>
+        <p id="update-message"></p>
+        <p id="update-release-name" class="update-release-name"></p>
+        <div class="confirmation-dialog-actions">
+          <button type="submit" value="later" class="secondary" data-i18n="remindMeLater">稍後</button>
+          <button id="update-open-release" type="button" class="primary" data-i18n="viewGitHubRelease">查看 GitHub Release</button>
         </div>
       </form>
     </dialog>

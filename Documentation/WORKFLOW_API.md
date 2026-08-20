@@ -63,7 +63,7 @@
 
 `DialogueStyle` 除字型、字級、字重與書寫方向外，也保存 `textAlignment`、`textColorHex`、`strokeColorHex`、`strokeWidth`、`opacity`、`rotationDegrees` 與 `isVisible`。WebUI、HTML PNG 排版與 HTML 分層 PSD 必須消費同一份樣式，不得各自建立不同預設。
 
-`TranslationQualityOptions` 預設啟用整頁語境、二次校稿、翻譯 QA 與直譯稿保存，長度策略為 `balanced`。本機 VLM 第一階段一次讀取整頁有序區域，產生直譯稿、顯示譯文、角色、語氣與信心；第二階段再以相同整頁資料統一稱謂、詞表、數字、否定、語氣與長度。QA 會檢查缺譯、詞表、數字、長度及低信心，結果保存於 `.str`，不只存在記憶體。
+`TranslationQualityOptions` 預設啟用整頁語境、翻譯 QA 與直譯稿保存，二次校稿預設關閉，長度策略為 `balanced`。本機 VLM 第一階段一次讀取整頁有序區域，產生直譯稿、顯示譯文、角色、語氣與信心；若整頁回覆遺漏區域，只對缺少的 UUID 逐區補翻。啟用二次校稿時才以相同整頁資料統一稱謂、詞表、數字、否定、語氣與長度。QA 會檢查缺譯、詞表、數字、長度及低信心，結果保存於 `.str`，不只存在記憶體。
 
 - `NormalizedPoint` 與 `NormalizedRect` 都以原圖左上角為原點，範圍為 `0...1`。
 - 遮罩畫筆的 `diameter` 是相對於原圖短邊的比例，範圍為 `0.001...1`。
@@ -71,7 +71,7 @@
 - `rawSourceText` 保留 VLM、MCP Agent 或人工最初提供的原文；`sourceText` 是目前供詞表比對與翻譯使用的來源文字。
 - `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；新流程的 `true` 代表來源文字已由 VLM、MCP Agent 或人工確認，不會觸發任何 OCR 校正服務。
 - **GUI 路徑**：步驟二由內建 `MangaBubbleSegmentationCoreMLRuntime` 以 Apple Neural Engine 優先產生對話框 BBOX 與氣泡形狀，再以原圖像素連通元件將 `bounds` 與遮罩收斂到實際字形；此時不載入或呼叫圖生文模型。模型無法載入或推論失敗時，才後備至 `MangaBubbleCandidateDetector` 的封閉白區演算法。步驟三才由 `VLMRegionTranscriptionService` 在既有 BBOX 中分類、轉錄，接著翻譯；未載入圖生文模型時不會回退至系統文字辨識。
-- **MCP 路徑**：App 先完成區域與像素遮罩，再由 `prepare_agent_task` 將原圖及完整遮罩 JSON 一次交給 Agent；Agent 只依既有 `region_id` 抽取原文、翻譯與決定排版，最後以 `submit_agent_result` 一次回寫並由 App 合成。MCP 不接受 Agent 修改區域或遮罩，也不呼叫內建 VLM 翻譯。詳見〈標準 MCP〉。
+- **MCP 路徑**：App 先完成區域、像素遮罩與去字背景，再由 `prepare_agent_task` 將原圖及完整遮罩 JSON 一次交給 Agent；Agent 只依既有 `region_id` 抽取原文、翻譯與決定排版，最後以 `submit_agent_result` 一次回寫並建立步驟三預覽。只有使用者要求輸出時才以 `page.render` 儲存步驟四結果。MCP 不接受 Agent 修改區域或遮罩，也不呼叫內建 VLM 翻譯。詳見〈標準 MCP〉。
 - `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形像素遮罩；抗鋸齒遲滯與固定像素膨脹都在像素層完成，不再對逐條矩形做向量描邊，因此輸出的 `dialogue-mask.png` 維持二值邊界。
 - `maskCoverageRatio` 是系統像素精修保留的前景筆畫比例；`null` 代表尚未執行自動檢查。
 - `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線。若未通過，由使用者回到 App 步驟二調整，不讓 Agent 變更邊界或重建遮罩。
@@ -90,8 +90,8 @@
 | 狀態 | 意義 | 可執行的下一步 |
 |---|---|---|
 | `scanned` | 已掃描原圖 | 偵測遮罩 |
-| `maskReady` | App／Agent 區域及像素遮罩已保存，MCP 尚待 Agent 抽取原文與翻譯 | 人工修遮罩、翻譯 |
-| `translationReady` | 譯文及排版設定已保存 | 人工修文、合成 |
+| `maskReady` | 步驟二區域、像素遮罩及去字背景已保存 | 人工修遮罩、翻譯 |
+| `translationReady` | 步驟三原文、譯文、排版與完整預覽已保存 | 人工修文、儲存輸出 |
 | `completed` | 已輸出合成圖 | 重做任一步驟 |
 | `failed` | 最近命令失敗 | 修正問題後重做該步驟 |
 
@@ -256,7 +256,7 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `removeRegion(pageID, regionID)` | 移除區域 |
 | `moveRegion(pageID, regionID, offset)` | 調整閱讀順序及 PSD 文字圖層順序 |
 | `updateRegion(pageID, regionID, changes)` | 更新文字、`translationAnchor` 譯文中心點、字型、字級及排字設定 |
-| `updateSettings(changes)` | 更新專案處理設定；`translationQuality` 可控制整頁語境、校稿、QA、直譯稿、長度策略與風格指南 |
+| `updateSettings(changes)` | 更新專案處理設定；`eraseColorHex` 指定步驟二去字底紙色，`translationQuality` 可控制整頁語境、校稿、QA、直譯稿、長度策略與風格指南 |
 
 命令 Promise 代表 Native 已接受命令。長工序的實際狀態、進度及結果由 `window.MangaKitchenNative.receiveState` 持續推送。
 
@@ -270,7 +270,7 @@ PSD 匯出以目前頁面順序產生 `序號_頁名.psd`。合併預覽、每�
 
 ## 標準 MCP
 
-`MangaKitchen` 使用官方 Swift MCP SDK `0.12.1`，提供 MCP `2025-11-25` 的標準 Streamable HTTP transport、tools、resources、resource templates、取消與 progress notification。MCP adapter 在 GUI process 內運作，但 JSON-RPC 或 transport 型別不會進入漫畫核心。
+`MangaKitchen` 使用官方 Swift MCP SDK `0.12.1`，提供 MCP `2025-11-25` 的標準 Streamable HTTP transport、tools、resources、resource templates、取消與 progress notification；目前工作流契約版本為 `1.2.0`。MCP adapter 在 GUI process 內運作，但 JSON-RPC 或 transport 型別不會進入漫畫核心。
 
 啟動參數：
 
@@ -303,8 +303,8 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `mangakitchen.page.inspect` | 讀取完整頁面、產物、可用操作與 opaque `revision` |
 | `mangakitchen.page.update` | 帶入 `expected_revision` 更新頁名或頁序 |
 | `mangakitchen.page.prepare_agent_task` | 主要入口；一次回傳指定頁原圖與步驟二遮罩 JSON |
-| `mangakitchen.page.submit_agent_result` | 帶入工作包 revision，一次回寫全部區域並執行步驟四 |
-| `mangakitchen.page.render` | 依目前 HTML/CSS 區域資料重新合成頁面 |
+| `mangakitchen.page.submit_agent_result` | 帶入工作包 revision，一次回寫全部區域並建立步驟三排字預覽 |
+| `mangakitchen.page.render` | 步驟四只將既有步驟三預覽儲存到輸出目錄 |
 | `mangakitchen.region.batch_update` | 原子套用 1...64 個區域 partial patch |
 | `mangakitchen.region.reorder` | 以完整 ID 陣列更新閱讀與 PSD 圖層順序 |
 
@@ -316,14 +316,14 @@ MCP 初始化與工具清單只描述能力，不代表應立即操作資料。�
 
 標準流程固定為：
 
-1. App 已載入步驟一原圖；若步驟二尚未完成，由 `prepare_agent_task` 在 App 內建立。
+1. App 已載入步驟一原圖，並由使用者在 App 完成步驟二區域、像素遮罩與去字背景。
 2. Agent 呼叫 `page.prepare_agent_task(workspace_id, page_id)`。
 3. Tool result 的 image content 直接包含原圖；structured content 的 `regionData` 內嵌所有區域、BBOX、氣泡形狀、像素遮罩、筆刷與現有排版資料，也同時提供目標語言、閱讀順序與專有名詞。
 4. Agent 只依既有 `region_id` 處理文字：`sourceText` 與 `translatedText` 若已有內容就是待校稿草稿，必須對照原圖確認或修正；空白欄位才重新抽取或翻譯。同時檢查並必要時調整 `translationAnchor`、`translationBounds`、`fontSize`、`automaticFontSize`、`fontWeight` 與 `writingDirection`。
 5. Agent 呼叫 `page.submit_agent_result`，一次送回本頁全部區域。
-6. App 驗證回傳 `region_id` 集合與步驟二完全一致，保留遮罩、更新內部專案資料，再直接執行步驟四合成與輸出。
+6. App 驗證回傳 `region_id` 集合與步驟二完全一致，保留遮罩與去字背景、更新內部專案資料，並建立步驟三排字預覽；只有使用者要求輸出時才另呼叫 `page.render`。
 
-`prepare_agent_task` 只在區域或遮罩不存在時自動建立步驟二；已有資料時直接沿用，不會覆蓋使用者修改。若已有抽取文字、翻譯或排版，這些資料會完整包含在 `regionData.entries` 中，交由 Agent 校稿與調整後回傳。所有 Agent 必要資料均包含於單次 tool result，Agent 不得搜尋、讀取或建立 `.str` 檔案，也不需額外讀取 page resource。
+`prepare_agent_task` 不會自動建立、修復或重跑步驟二；任一區域、遮罩或去字背景缺少時都停止並要求回 App 完成。若已有抽取文字、翻譯或排版，這些資料會完整包含在 `regionData.entries` 中，交由 Agent 校稿與調整後回傳。所有 Agent 必要資料均包含於單次 tool result，Agent 不得搜尋、讀取或建立 `.str` 檔案，也不需額外讀取 page resource。
 
 `prepare_agent_task` 與 `page.inspect` 都會回傳 opaque `revision`。所有寫入工具必須原樣放入 `expected_revision`；如果 GUI 或另一個 Agent 已修改頁面，server 會整筆拒絕並回傳目前 revision，呼叫端必須重新 inspect，不能自行遞增或猜測 revision。
 

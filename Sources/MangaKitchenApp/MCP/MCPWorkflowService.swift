@@ -47,6 +47,8 @@ struct MCPPageTask: Codable, Sendable {
     /// 像素遮罩覆蓋檢查未通過的區域數。
     var regionsWithIncompleteMask: Int
     var hasMask: Bool
+    var hasBackground: Bool
+    var hasTranslationPreview: Bool
     var hasOutput: Bool
     /// 目前缺少的產物類型，並非強制執行命令。
     var nextAction: MCPPageNextAction
@@ -68,7 +70,7 @@ enum MCPPageNextAction: String, Codable, Sendable {
     case writeSourceText
     /// 原文齊全但缺譯文：用 region.update 寫入 translated_text。
     case writeTranslation
-    /// 譯文齊全但尚未輸出：執行 page.compose。
+    /// 步驟三預覽齊全但尚未輸出：執行 page.render。
     case compose
     /// 已輸出，無待辦。
     case done
@@ -346,9 +348,7 @@ actor MCPWorkflowService {
             if let table = try await stringTables.load(from: tableURL) {
                 pages[index].regions = table.regions
                 pages[index].stringTableURL = tableURL
-                pages[index].stage = table.entries.contains(where: { !$0.translatedText.isEmpty })
-                    ? .translationReady
-                    : .maskReady
+                pages[index].stage = Self.completedArtifactStage(for: pages[index])
             }
         }
         await publishStateChange()
@@ -427,9 +427,7 @@ actor MCPWorkflowService {
             if let table = try await stringTables.load(from: tableURL) {
                 page.regions = table.regions
                 page.stringTableURL = tableURL
-                page.stage = table.entries.contains(where: { !$0.translatedText.isEmpty })
-                    ? .translationReady
-                    : .maskReady
+                page.stage = Self.completedArtifactStage(for: page)
             }
             rescanned.append(page)
         }
@@ -560,7 +558,7 @@ actor MCPWorkflowService {
                     throw MCPServiceError.maskDataRequired
                 }
                 guard hasTranslationData(pageID: pageID) else {
-                    throw MCPServiceError.agentTranslationRequired
+                    throw MCPServiceError.translationPreviewRequired
                 }
                 try await compose(pageID: pageID, progress: pageProgress)
             case .fullPage:
@@ -568,7 +566,7 @@ actor MCPWorkflowService {
                     throw MCPServiceError.maskDataRequired
                 }
                 guard hasTranslationData(pageID: pageID) else {
-                    throw MCPServiceError.agentTranslationRequired
+                    throw MCPServiceError.translationPreviewRequired
                 }
                 if !hasCompletedOutput(pageID: pageID) {
                     try await compose(pageID: pageID, progress: pageProgress)
@@ -589,34 +587,26 @@ actor MCPWorkflowService {
         guard let page = pages.first(where: { $0.id == pageID }),
               let maskURL = page.maskURL,
               FileManager.default.fileExists(atPath: maskURL.path),
-              !page.regions.isEmpty else { return false }
-        return page.regions.allSatisfy(Self.hasUsableMask)
-    }
-
-    private func hasMaskArtifact(pageID: UUID) -> Bool {
-        guard let page = pages.first(where: { $0.id == pageID }),
-              let maskURL = page.maskURL else { return false }
-        return FileManager.default.fileExists(atPath: maskURL.path)
+              let backgroundURL = page.backgroundURL,
+              FileManager.default.fileExists(atPath: backgroundURL.path) else { return false }
+        return true
     }
 
     private func hasAgentTaskData(pageID: UUID) -> Bool {
         guard let page = pages.first(where: { $0.id == pageID }),
               !page.regions.isEmpty else { return false }
-        return hasMaskArtifact(pageID: pageID)
-    }
-
-    private static func hasUsableMask(_ region: DialogueRegion) -> Bool {
-        if region.maskStrokes.contains(where: { $0.mode == .add }) { return true }
-        return region.automaticMaskEnabled
+        return hasMaskData(pageID: pageID)
     }
 
     private func hasTranslationData(pageID: UUID) -> Bool {
         guard let page = pages.first(where: { $0.id == pageID }),
-              !page.regions.isEmpty else { return false }
-        return page.regions.allSatisfy {
+              !page.regions.isEmpty,
+              page.regions.allSatisfy({
             !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && !$0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
+              }),
+              let previewURL = page.translationPreviewURL else { return false }
+        return FileManager.default.fileExists(atPath: previewURL.path)
     }
 
     private func hasCompletedOutput(pageID: UUID) -> Bool {
@@ -624,6 +614,25 @@ actor MCPWorkflowService {
               page.stage == .completed,
               let outputURL = page.outputURL else { return false }
         return FileManager.default.fileExists(atPath: outputURL.path)
+    }
+
+    private static func completedArtifactStage(for page: ComicPage) -> PageProcessingStage {
+        let fileManager = FileManager.default
+        if let outputURL = page.outputURL,
+           fileManager.fileExists(atPath: outputURL.path) {
+            return .completed
+        }
+        if let previewURL = page.translationPreviewURL,
+           fileManager.fileExists(atPath: previewURL.path) {
+            return .translationReady
+        }
+        if let maskURL = page.maskURL,
+           let backgroundURL = page.backgroundURL,
+           fileManager.fileExists(atPath: maskURL.path),
+           fileManager.fileExists(atPath: backgroundURL.path) {
+            return .maskReady
+        }
+        return .scanned
     }
 
     /// 專案的頁面狀態摘要，不會觸發或授權 Agent 自行處理。
@@ -720,8 +729,7 @@ actor MCPWorkflowService {
         return try Self.makeMutationResult(workspaceID: workspaceID, page: page)
     }
 
-    /// 建立單頁 Agent 工作包。缺少步驟二時由 App 先建立，再一次提供原圖與
-    /// 內嵌的區域／遮罩資料；Agent 不需要尋找 sidecar 或讀取其他 resource。
+    /// 步驟三入口：只封裝已完成的步驟二資料，不代跑區域偵測、遮罩或去字背景。
     func prepareAgentTask(
         workspaceID: UUID,
         pageID: UUID,
@@ -731,22 +739,10 @@ actor MCPWorkflowService {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else {
             throw MCPServiceError.pageNotFound
         }
-        if !hasAgentTaskData(pageID: pageID) {
-            let pageTitle = pages[index].title
-            progress(0.05, "App 正在建立步驟二區域與像素遮罩：\(pageTitle)")
-            try await detect(pageID: pageID) { stage, fraction in
-                let normalized = min(max(fraction, 0), 1)
-                progress(
-                    0.05 + normalized * 0.65,
-                    "App 正在建立步驟二：\(stage.rawValue)"
-                )
-            }
-            await publishStateChange()
-        }
         guard hasAgentTaskData(pageID: pageID) else {
             throw MCPServiceError.maskDataRequired
         }
-        progress(0.75, "封裝 App 已完成的步驟二資料：\(pages[index].title)")
+        progress(0.1, "封裝 App 已完成的步驟二資料：\(pages[index].title)")
         let page = pages[index]
         let targetLanguageCode = options.resolvedTargetLanguageCode
         let bundle = MCPAgentPageBundle(
@@ -762,7 +758,7 @@ actor MCPWorkflowService {
             defaultWritingDirection: options.defaultStyle.writingDirection,
             translationQuality: options.translationQuality,
             glossary: glossary,
-            instruction: "原圖已附在本次 tool result 的 image content，全部區域與遮罩資料已內嵌於 regionData.entries。請依 readingDirection 以整頁語境處理，先建立忠實直譯稿，再依 translationQuality 的長度策略與 styleGuide 完成自然譯文；reviewPassEnabled 時需執行整頁二次校稿，qualityCheckEnabled 時回傳信心與 QA flags。entries 中既有的 sourceText 與 translatedText 都是待校稿草稿，正確時保留，不正確或空白時修正。請同時檢查排版欄位，必要時調整以符合氣泡內的 HTML 排版。不要搜尋、讀取或建立 .str 檔案，也不要額外讀取 page resource。請依既有 region id 逐區處理，不要刪除、合併或重建區域與遮罩。完成全部區域後，以 submit_agent_result 一次回寫全部結果並合成輸出。"
+            instruction: "原圖已附在本次 tool result 的 image content，全部區域與遮罩資料已內嵌於 regionData.entries。請依 readingDirection 以整頁語境處理，先建立忠實直譯稿，再依 translationQuality 的長度策略與 styleGuide 完成自然譯文；reviewPassEnabled 時需執行整頁二次校稿，qualityCheckEnabled 時回傳信心與 QA flags。entries 中既有的 sourceText 與 translatedText 都是待校稿草稿，正確時保留，不正確或空白時修正。請同時檢查排版欄位，必要時調整以符合氣泡內的 HTML 排版。不要搜尋、讀取或建立 .str 檔案，也不要額外讀取 page resource。請依既有 region id 逐區處理，不要刪除、合併或重建區域與遮罩。完成全部區域後，以 submit_agent_result 一次回寫並完成步驟三翻譯排字預覽；只有使用者要求輸出時才另外呼叫 page.render 執行步驟四。"
         )
         progress(1, "單頁 Agent 工作包已準備完成：\(page.title)")
         return MCPAgentTaskPayload(
@@ -772,7 +768,7 @@ actor MCPWorkflowService {
         )
     }
 
-    /// 一次套用 Agent 對本頁所有區域的文字與排版，並直接執行步驟四。
+    /// 步驟三：一次套用 Agent 對本頁所有區域的文字與排版，並建立翻譯預覽。
     /// 區域 ID 集合必須完全相同，避免 Agent 意外刪除或新增 App 產生的區域。
     func submitAgentResult(
         workspaceID: UUID,
@@ -782,11 +778,13 @@ actor MCPWorkflowService {
         progress: @escaping Progress
     ) async throws -> MCPWorkflowResult {
         try await requireWorkspace(workspaceID)
-        guard outputDirectoryURL != nil else { throw MCPServiceError.outputDirectoryRequired }
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
             throw MCPServiceError.pageNotFound
         }
         try Self.requireRevision(expectedRevision, for: pages[pageIndex])
+        guard hasAgentTaskData(pageID: pageID) else {
+            throw MCPServiceError.maskDataRequired
+        }
         let expectedIDs = Set(pages[pageIndex].regions.map(\.id))
         let receivedIDs = results.map(\.regionID)
         guard Set(receivedIDs).count == receivedIDs.count,
@@ -795,10 +793,10 @@ actor MCPWorkflowService {
                 "submit_agent_result 必須一次包含本頁全部 region_id，且不可新增、刪除或重複區域。"
             )
         }
-
+        var updatedRegions = pages[pageIndex].regions
         let resultByID = Dictionary(uniqueKeysWithValues: results.map { ($0.regionID, $0) })
-        for regionIndex in pages[pageIndex].regions.indices {
-            let regionID = pages[pageIndex].regions[regionIndex].id
+        for regionIndex in updatedRegions.indices {
+            let regionID = updatedRegions[regionIndex].id
             guard let result = resultByID[regionID] else { continue }
             var edit = RegionEdit()
             edit.sourceText = result.sourceText
@@ -824,32 +822,43 @@ actor MCPWorkflowService {
             edit.rotationDegrees = result.rotationDegrees
             edit.isVisible = result.isVisible
             edit.sourceTextChangesMaskGeometry = false
-            _ = PageRegionEditor.apply(edit, to: &pages[pageIndex].regions[regionIndex])
-            pages[pageIndex].regions[regionIndex].literalTranslatedText = result.literalTranslatedText
-            pages[pageIndex].regions[regionIndex].speakerID = result.speakerID
-            pages[pageIndex].regions[regionIndex].tone = result.tone
-            pages[pageIndex].regions[regionIndex].translationConfidence = result.translationConfidence.map {
+            _ = PageRegionEditor.apply(edit, to: &updatedRegions[regionIndex])
+            updatedRegions[regionIndex].literalTranslatedText = result.literalTranslatedText
+            updatedRegions[regionIndex].speakerID = result.speakerID
+            updatedRegions[regionIndex].tone = result.tone
+            updatedRegions[regionIndex].translationConfidence = result.translationConfidence.map {
                 min(max($0, 0), 1)
             }
-            pages[pageIndex].regions[regionIndex].translationQAFlags = result.translationQAFlags ?? []
+            updatedRegions[regionIndex].translationQAFlags = result.translationQAFlags ?? []
         }
+        guard updatedRegions.allSatisfy({
+            !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && !$0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            throw MCPServiceError.agentTranslationRequired
+        }
+        guard let cleanBackgroundURL = pages[pageIndex].backgroundURL,
+              FileManager.default.fileExists(atPath: cleanBackgroundURL.path) else {
+            throw MCPServiceError.maskDataRequired
+        }
+        progress(0.65, "已驗證全部區域文字與排版：\(pages[pageIndex].title)")
+        let previewURL = try await pipeline.renderTranslationPreview(
+            page: pages[pageIndex],
+            backgroundURL: pages[pageIndex].superResolvedBackgroundURL ?? cleanBackgroundURL,
+            regions: updatedRegions
+        )
+        pages[pageIndex].regions = updatedRegions
+        pages[pageIndex].translationPreviewURL = previewURL
         pages[pageIndex].outputURL = nil
-        pages[pageIndex].backgroundURL = nil
         pages[pageIndex].stage = .translationReady
         pages[pageIndex].progress = 0.65
         pages[pageIndex].errorMessage = nil
         try await persistStringTable(pageID: pageID)
         await publishStateChange()
-        progress(0.65, "已回寫全部區域文字與排版：\(pages[pageIndex].title)")
-
-        let pageProgress: PagePipelineProgress = { stage, fraction in
-            progress(0.65 + fraction * 0.35, "\(stage.rawValue)：\(pageID.uuidString)")
-        }
-        try await compose(pageID: pageID, progress: pageProgress)
-        await publishStateChange()
+        progress(1, "步驟三翻譯與排字預覽已完成：\(pages[pageIndex].title)")
         return MCPWorkflowResult(
             workspaceID: workspaceID,
-            operation: "agent_submit_and_compose",
+            operation: "agent_submit",
             processedPageIDs: [pageID],
             pages: [pages[pageIndex]],
             revisions: [pageID: try Self.revision(for: pages[pageIndex])]
@@ -875,19 +884,26 @@ actor MCPWorkflowService {
         let hasMask = page.maskURL.map {
             FileManager.default.fileExists(atPath: $0.path)
         } ?? false
+        let hasBackground = page.backgroundURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
+        let hasTranslationPreview = page.translationPreviewURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
         let hasOutput = page.outputURL.map {
             FileManager.default.fileExists(atPath: $0.path)
         } ?? false
         let identifier = page.id.uuidString.lowercased()
+        let hasCompleteMaskData = hasMask && hasBackground
 
         let nextAction: MCPPageNextAction
         if page.regions.isEmpty {
             nextAction = regionSource == .local ? .detectMasks : .submitRegions
-        } else if !hasMask {
+        } else if !hasCompleteMaskData {
             nextAction = .detectMasks
         } else if missingSourceText > 0 {
             nextAction = .writeSourceText
-        } else if missingTranslation > 0 {
+        } else if missingTranslation > 0 || !hasTranslationPreview {
             nextAction = .writeTranslation
         } else if !hasOutput {
             nextAction = .compose
@@ -908,6 +924,8 @@ actor MCPWorkflowService {
             regionsMissingTranslation: missingTranslation,
             regionsWithIncompleteMask: incompleteMask,
             hasMask: hasMask,
+            hasBackground: hasBackground,
+            hasTranslationPreview: hasTranslationPreview,
             hasOutput: hasOutput,
             nextAction: nextAction,
             nextActionInstruction: Self.nextActionInstruction(for: nextAction),
@@ -921,15 +939,15 @@ actor MCPWorkflowService {
     private static func nextActionInstruction(for action: MCPPageNextAction) -> String {
         switch action {
         case .detectMasks:
-            "狀態提示：步驟二產物不存在；若使用者要求處理本頁，可建立單頁 Agent 工作包。"
+            "狀態提示：步驟二的區域、遮罩或去字背景尚未完成；請先在 App 完成步驟二。"
         case .submitRegions:
             "狀態提示：目前沒有 App 區域；只有使用者要求補區域時才提交。"
         case .writeSourceText:
             "狀態提示：部分區域缺少原文；優先使用單頁 Agent 工作包一次處理。"
         case .writeTranslation:
-            "狀態提示：部分區域缺少譯文；優先使用單頁 Agent 工作包一次處理。"
+            "狀態提示：步驟三的原文、譯文或排字預覽尚未完成；請使用單頁 Agent 工作包一次處理。"
         case .compose:
-            "狀態提示：已有遮罩與文字資料；只有使用者要求輸出時才合成。"
+            "狀態提示：步驟三預覽已完成；只有使用者要求輸出時才呼叫 page.render 儲存。"
         case .done:
             "狀態提示：本頁已有完整產物，除非使用者明確要求修改，否則不需操作。"
         }
@@ -1016,7 +1034,17 @@ actor MCPWorkflowService {
             regions: pages[pageIndex].regions,
             options: options
         )
+        let backgroundURL = try await pipeline.renderMaskPreview(
+            page: pages[pageIndex],
+            regions: pages[pageIndex].regions,
+            maskURL: maskURL,
+            fillColorHex: options.eraseColorHex
+        )
         pages[pageIndex].maskURL = maskURL
+        pages[pageIndex].backgroundURL = backgroundURL
+        pages[pageIndex].superResolvedBackgroundURL = nil
+        pages[pageIndex].translationPreviewURL = nil
+        pages[pageIndex].outputURL = nil
         pages[pageIndex].stage = .maskReady
         pages[pageIndex].progress = 0.25
         pages[pageIndex].errorMessage = nil
@@ -1093,12 +1121,15 @@ actor MCPWorkflowService {
             pages[pageIndex].regions = outcome.regions
         }
         pages[pageIndex].outputURL = nil
+        pages[pageIndex].translationPreviewURL = nil
         if shouldRegenerateMask {
             try await refreshEditedPage(pageIndex: pageIndex)
         } else {
             pages[pageIndex].stage = pages[pageIndex].regions.contains(where: { !$0.translatedText.isEmpty })
-                ? .translationReady
+                ? .translating
                 : .maskReady
+            pages[pageIndex].progress = 0.25
+            pages[pageIndex].errorMessage = nil
             try await persistStringTable(pageID: pageID)
         }
         await publishStateChange()
@@ -1145,6 +1176,7 @@ actor MCPWorkflowService {
         }
 
         var regeneratedMaskURL: URL?
+        var regeneratedBackgroundURL: URL?
         if !geometryChangedIDs.isEmpty {
             let outcome = try await regionEditor.materialize(
                 regions: updatedRegions,
@@ -1159,6 +1191,14 @@ actor MCPWorkflowService {
                 regions: updatedRegions,
                 options: options
             )
+            if let regeneratedMaskURL {
+                regeneratedBackgroundURL = try await pipeline.renderMaskPreview(
+                    page: pages[pageIndex],
+                    regions: updatedRegions,
+                    maskURL: regeneratedMaskURL,
+                    fillColorHex: options.eraseColorHex
+                )
+            }
         }
 
         pages[pageIndex].regions = updatedRegions
@@ -1166,15 +1206,14 @@ actor MCPWorkflowService {
         pages[pageIndex].translationPreviewURL = nil
         if let regeneratedMaskURL {
             pages[pageIndex].maskURL = regeneratedMaskURL
-            pages[pageIndex].backgroundURL = nil
+            pages[pageIndex].backgroundURL = regeneratedBackgroundURL
             pages[pageIndex].superResolvedBackgroundURL = nil
         }
-        pages[pageIndex].stage = updatedRegions.contains(where: { !$0.translatedText.isEmpty })
-            ? .translationReady
+        let hasTranslatedText = updatedRegions.contains(where: { !$0.translatedText.isEmpty })
+        pages[pageIndex].stage = geometryChangedIDs.isEmpty && hasTranslatedText
+            ? .translating
             : .maskReady
-        pages[pageIndex].progress = updatedRegions.contains(where: { !$0.translatedText.isEmpty })
-            ? 0.65
-            : 0.25
+        pages[pageIndex].progress = 0.25
         pages[pageIndex].errorMessage = nil
         try await persistStringTable(pageID: pageID)
         await publishStateChange()
@@ -1212,6 +1251,11 @@ actor MCPWorkflowService {
         pages[pageIndex].regions = orderedRegionIDs.compactMap { regionsByID[$0] }
         pages[pageIndex].outputURL = nil
         pages[pageIndex].translationPreviewURL = nil
+        pages[pageIndex].stage = pages[pageIndex].regions.contains(where: { !$0.translatedText.isEmpty })
+            ? .translating
+            : .maskReady
+        pages[pageIndex].progress = 0.25
+        pages[pageIndex].errorMessage = nil
         try await persistStringTable(pageID: pageID)
         await publishStateChange()
 
@@ -1236,7 +1280,9 @@ actor MCPWorkflowService {
         }
         try Self.requireRevision(expectedRevision, for: pages[pageIndex])
         guard hasMaskData(pageID: pageID) else { throw MCPServiceError.maskRequired }
-        guard hasTranslationData(pageID: pageID) else { throw MCPServiceError.agentTranslationRequired }
+        guard hasTranslationData(pageID: pageID) else {
+            throw MCPServiceError.translationPreviewRequired
+        }
 
         let pageProgress: PagePipelineProgress = { stage, fraction in
             progress(fraction, "\(stage.rawValue)：\(pageID.uuidString)")
@@ -1438,9 +1484,17 @@ actor MCPWorkflowService {
         )
         progress(.detectingText, 0.6)
         guard let maskURL = outcome.maskURL else { return }
+        let backgroundURL = try await pipeline.renderMaskPreview(
+            page: pages[pageIndex],
+            regions: outcome.regions,
+            maskURL: maskURL,
+            fillColorHex: options.eraseColorHex
+        )
         pages[pageIndex].regions = outcome.regions
         pages[pageIndex].maskURL = maskURL
-        pages[pageIndex].backgroundURL = nil
+        pages[pageIndex].backgroundURL = backgroundURL
+        pages[pageIndex].superResolvedBackgroundURL = nil
+        pages[pageIndex].translationPreviewURL = nil
         pages[pageIndex].outputURL = nil
         pages[pageIndex].stage = .maskReady
         pages[pageIndex].progress = 0.25
@@ -1468,34 +1522,24 @@ actor MCPWorkflowService {
             regions: regions,
             options: options
         )
+        let backgroundURL = try await pipeline.renderMaskPreview(
+            page: pages[pageIndex],
+            regions: regions,
+            maskURL: maskURL,
+            fillColorHex: options.eraseColorHex
+        )
         pages[pageIndex].regions = regions
         pages[pageIndex].maskURL = maskURL
-        pages[pageIndex].backgroundURL = nil
+        pages[pageIndex].backgroundURL = backgroundURL
+        pages[pageIndex].superResolvedBackgroundURL = nil
+        pages[pageIndex].translationPreviewURL = nil
         pages[pageIndex].outputURL = nil
         pages[pageIndex].stage = .maskReady
         pages[pageIndex].progress = 0.25
         pages[pageIndex].errorMessage = nil
     }
 
-    private func translate(pageID: UUID, progress: @escaping PagePipelineProgress) async throws {
-        guard let index = pages.firstIndex(where: { $0.id == pageID }) else {
-            throw MCPServiceError.pageNotFound
-        }
-        guard !pages[index].regions.isEmpty else { throw MCPServiceError.maskRequired }
-        let translated = try await pipeline.translate(
-            page: pages[index],
-            regions: pages[index].regions,
-            options: options,
-            glossary: glossary,
-            progress: progress
-        )
-        pages[index].regions = translated
-        pages[index].stage = .translationReady
-        pages[index].progress = 0.65
-        pages[index].errorMessage = nil
-        try await persistStringTable(pageID: pageID)
-    }
-
+    /// 步驟四：只把步驟三已完成的翻譯排字預覽存到輸出位置。
     private func compose(pageID: UUID, progress: @escaping PagePipelineProgress) async throws {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else {
             throw MCPServiceError.pageNotFound
@@ -1509,19 +1553,20 @@ actor MCPWorkflowService {
         guard paths.outputURL.standardizedFileURL != pages[index].sourceURL.standardizedFileURL else {
             throw MCPServiceError.outputWouldOverwriteSource
         }
-        let result = try await pipeline.compose(
-            page: pages[index],
-            regions: pages[index].regions,
-            options: options,
-            outputURL: paths.outputURL,
-            existingMaskURL: pages[index].maskURL,
-            progress: progress
+        guard let previewURL = pages[index].translationPreviewURL,
+              FileManager.default.fileExists(atPath: previewURL.path) else {
+            throw MCPServiceError.translationPreviewRequired
+        }
+        try Task.checkCancellation()
+        progress(.composing, 0)
+        try FileManager.default.createDirectory(
+            at: paths.outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
         )
-        pages[index].regions = result.regions
-        pages[index].maskURL = result.maskURL
-        pages[index].backgroundURL = result.backgroundURL
-        pages[index].superResolvedBackgroundURL = result.superResolvedBackgroundURL
-        pages[index].outputURL = result.outputURL
+        let previewData = try Data(contentsOf: previewURL)
+        try previewData.write(to: paths.outputURL, options: .atomic)
+        progress(.completed, 1)
+        pages[index].outputURL = paths.outputURL
         pages[index].stage = .completed
         pages[index].progress = 1
         pages[index].errorMessage = nil
@@ -1535,14 +1580,19 @@ actor MCPWorkflowService {
             regions: pages[pageIndex].regions,
             options: options
         )
+        let backgroundURL = try await pipeline.renderMaskPreview(
+            page: pages[pageIndex],
+            regions: pages[pageIndex].regions,
+            maskURL: maskURL,
+            fillColorHex: options.eraseColorHex
+        )
         pages[pageIndex].maskURL = maskURL
-        pages[pageIndex].backgroundURL = nil
+        pages[pageIndex].backgroundURL = backgroundURL
         pages[pageIndex].superResolvedBackgroundURL = nil
         pages[pageIndex].translationPreviewURL = nil
         pages[pageIndex].outputURL = nil
-        pages[pageIndex].stage = pages[pageIndex].regions.contains(where: { !$0.translatedText.isEmpty })
-            ? .translationReady
-            : .maskReady
+        pages[pageIndex].stage = .maskReady
+        pages[pageIndex].progress = 0.25
         try await persistStringTable(pageID: pageID)
     }
 
@@ -1736,19 +1786,27 @@ actor MCPWorkflowService {
         let superResolvedExists = page.superResolvedBackgroundURL.map {
             FileManager.default.fileExists(atPath: $0.path)
         } ?? false
+        let translationPreviewExists = page.translationPreviewURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
         let outputExists = page.outputURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
         var operations = [
             "mangakitchen.page.inspect",
-            "mangakitchen.page.update",
-            "mangakitchen.page.prepare_agent_task"
+            "mangakitchen.page.update"
         ]
+        if maskExists,
+           backgroundExists,
+           !page.regions.isEmpty {
+            operations.append("mangakitchen.page.prepare_agent_task")
+        }
         if !page.regions.isEmpty {
             operations.append("mangakitchen.region.batch_update")
         }
         if page.regions.count > 1 {
             operations.append("mangakitchen.region.reorder")
         }
-        if maskExists, page.regions.allSatisfy({ !$0.translatedText.isEmpty }) {
+        if translationPreviewExists,
+           page.regions.allSatisfy({ !$0.translatedText.isEmpty }) {
             operations.append("mangakitchen.page.render")
         }
         return MCPPageInspection(
@@ -1761,6 +1819,7 @@ actor MCPWorkflowService {
                 hasMask: maskExists,
                 hasBackground: backgroundExists,
                 hasSuperResolvedBackground: superResolvedExists,
+                hasTranslationPreview: translationPreviewExists,
                 hasOutput: outputExists,
                 sourceURI: "mangakitchen://page/\(identifier)/source",
                 maskURI: maskExists ? "mangakitchen://page/\(identifier)/mask" : nil,
@@ -1852,6 +1911,7 @@ enum MCPServiceError: LocalizedError {
     case maskRequired
     case maskDataRequired
     case agentTranslationRequired
+    case translationPreviewRequired
     case outputDirectoryRequired
     case outputInsideSource
     case outputWouldOverwriteSource
@@ -1866,10 +1926,12 @@ enum MCPServiceError: LocalizedError {
         case .pageNotFound: "找不到指定的 page_id。"
         case .regionNotFound: "找不到指定的 region_id。"
         case .glossaryEntryNotFound: "找不到指定的 glossary entry_id。"
-        case .maskRequired: "翻譯前必須先執行文字與遮罩偵測。"
-        case .maskDataRequired: "App 無法建立可用的步驟二區域與遮罩；請在 App 中確認或調整本頁區域後，再呼叫 page.prepare_agent_task。不要尋找 .str 檔案。"
+        case .maskRequired: "翻譯前必須先完成步驟二的文字區域、遮罩與去字背景。"
+        case .maskDataRequired: "步驟二的區域、遮罩或去字背景尚未完成；請先在 App 完成並確認步驟二，再呼叫 page.prepare_agent_task。後續步驟不會代跑步驟二。"
         case .agentTranslationRequired:
-            "MCP 步驟三由 Agent 接手，不會呼叫 App 內建圖生文模型。請讀取頁面區域與原圖，抽取原文並翻譯，再以 region.update 寫回 source_text、translated_text 與排版設定，最後執行 page.compose。"
+            "MCP 步驟三由 Agent 接手，不會呼叫 App 內建圖生文模型。請先呼叫 page.prepare_agent_task，完成全部區域原文、譯文與排版後，以 page.submit_agent_result 一次回寫。"
+        case .translationPreviewRequired:
+            "步驟三尚未完成翻譯排字預覽；請先完成 page.submit_agent_result，再執行 page.render 儲存輸出。"
         case .outputDirectoryRequired: "合成前必須設定輸出目錄。"
         case .outputInsideSource: "輸出目錄不可等於來源目錄或位於來源目錄內。"
         case .outputWouldOverwriteSource: "輸出路徑會覆寫來源圖片。"
