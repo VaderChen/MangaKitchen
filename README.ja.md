@@ -1,6 +1,6 @@
 # 漫画キッチン（MangaKitchen）
 
-[繁體中文](README.md) | [English](README.en.md) | 日本語 | [한국어](README.ko.md)
+[繁體中文](README.zh-TW.md) | [English](README.md) | 日本語 | [한국어](README.ko.md)
 
 漫画キッチン（MangaKitchen）は、macOSネイティブの漫画翻訳ワークスペースです。フロントエンドはHTML + JavaScript、Swift Packageのバックエンドはドメインコア、Metal/Core ML Runtime、WKWebView Appの3層に分かれています。コアは特定のUIレイアウトに依存せず、モデル境界、ページ単位のワークフロー、台詞領域、マスク、組版を扱います。
 

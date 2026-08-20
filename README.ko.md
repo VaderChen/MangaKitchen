@@ -1,6 +1,6 @@
 # 만화 주방（MangaKitchen）
 
-[繁體中文](README.md) | [English](README.en.md) | [日本語](README.ja.md) | 한국어
+[繁體中文](README.zh-TW.md) | [English](README.md) | [日本語](README.ja.md) | 한국어
 
 만화 주방(MangaKitchen)은 macOS 네이티브 만화 번역 작업 공간입니다. 프런트엔드는 HTML + JavaScript로 유지하고, Swift Package 백엔드는 도메인 코어, Metal/Core ML Runtime, WKWebView App의 세 계층으로 분리합니다. 코어는 특정 UI 레이아웃에 종속되지 않고 모델 경계, 페이지별 워크플로, 대화 영역, 마스크 및 조판을 처리합니다.
 
