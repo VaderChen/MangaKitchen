@@ -39,6 +39,14 @@ public protocol ImageToImageGenerating: Sendable {
     ) async throws
 }
 
+public protocol ImageSuperResolving: Sendable {
+    func superResolve(
+        inputURL: URL,
+        outputURL: URL,
+        progress: @escaping InferenceProgress
+    ) async throws
+}
+
 /// 從影像候選建立供像素遮罩精修使用的區域。
 public protocol SemanticRegionDetecting: Sendable {
     func detectRegions(
@@ -55,6 +63,7 @@ public protocol RegionTextRecognizing: Sendable {
         pageURL: URL,
         regions: [DialogueRegion],
         sourceLanguageCodes: [String],
+        regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion]
 }
@@ -73,6 +82,8 @@ public protocol RegionTranslating: Sendable {
         pageURL: URL,
         targetLanguageCode: String,
         glossaryTerms: [ResolvedGlossaryTerm],
+        readingDirection: ReadingDirection,
+        qualityOptions: TranslationQualityOptions,
         regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion]
@@ -102,8 +113,24 @@ public protocol DialogueTypesetting: Sendable {
     func typeset(
         backgroundURL: URL,
         regions: [DialogueRegion],
-        outputURL: URL
+        outputURL: URL,
+        renderScale: Double
     ) async throws
+}
+
+public extension DialogueTypesetting {
+    func typeset(
+        backgroundURL: URL,
+        regions: [DialogueRegion],
+        outputURL: URL
+    ) async throws {
+        try await typeset(
+            backgroundURL: backgroundURL,
+            regions: regions,
+            outputURL: outputURL,
+            renderScale: 1
+        )
+    }
 }
 
 public protocol ModelManaging: Sendable {

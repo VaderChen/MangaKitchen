@@ -4,6 +4,13 @@ import ImageIO
 import MangaKitchenCore
 @preconcurrency import WebKit
 
+struct HTMLRenderedDialogueLayer: Sendable {
+    var regionID: UUID
+    var name: String
+    var outputURL: URL
+    var visible: Bool
+}
+
 actor HTMLDialogueTypesetter: DialogueTypesetting {
     private struct RegionPayload: Encodable {
         var sourceText: String
@@ -21,10 +28,58 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
     private var rendererInUse = false
     private var rendererWaiters: [CheckedContinuation<Void, Never>] = []
 
+    func renderTextLayers(
+        canvasURL: URL,
+        regions: [DialogueRegion],
+        outputDirectory: URL,
+        renderScale: Double
+    ) async throws -> [HTMLRenderedDialogueLayer] {
+        guard let source = CGImageSourceCreateWithURL(canvasURL as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
+            throw HTMLDialogueTypesetterError.invalidBackground(canvasURL)
+        }
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        let transparentURL = outputDirectory.appendingPathComponent("transparent-canvas.png")
+        try Self.writeTransparentCanvas(
+            width: width.intValue,
+            height: height.intValue,
+            to: transparentURL
+        )
+        defer { try? FileManager.default.removeItem(at: transparentURL) }
+
+        var rendered: [HTMLRenderedDialogueLayer] = []
+        for (index, region) in regions.enumerated()
+        where !region.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try Task.checkCancellation()
+            var renderedRegion = region
+            renderedRegion.style.isVisible = true
+            let outputURL = outputDirectory.appendingPathComponent(
+                String(format: "text-%04d-%@.png", index + 1, region.id.uuidString)
+            )
+            try await typeset(
+                backgroundURL: transparentURL,
+                regions: [renderedRegion],
+                outputURL: outputURL,
+                renderScale: renderScale
+            )
+            rendered.append(HTMLRenderedDialogueLayer(
+                regionID: region.id,
+                name: "Text \(index + 1)",
+                outputURL: outputURL,
+                visible: region.style.isVisible
+            ))
+        }
+        return rendered
+    }
+
     func typeset(
         backgroundURL: URL,
         regions: [DialogueRegion],
-        outputURL: URL
+        outputURL: URL,
+        renderScale: Double
     ) async throws {
         guard let source = CGImageSourceCreateWithURL(backgroundURL as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
@@ -35,7 +90,7 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
         }
 
         let payload = regions
-            .filter { !$0.translatedText.isEmpty }
+            .filter { $0.style.isVisible && !$0.translatedText.isEmpty }
             .map {
                 RegionPayload(
                     sourceText: $0.sourceText,
@@ -50,17 +105,24 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
                 )
             }
         let payloadData = try JSONEncoder().encode(payload)
+        let normalizedScale = renderScale.isFinite ? max(1, renderScale) : 1
         let html = Self.document(
-            backgroundURL: backgroundURL,
             regionsBase64: payloadData.base64EncodedString(),
             width: width.intValue,
-            height: height.intValue
+            height: height.intValue,
+            renderScale: normalizedScale
         )
         let temporaryURL = backgroundURL.deletingLastPathComponent()
             .appendingPathComponent(".mangakitchen-typesetting-\(UUID().uuidString)")
             .appendingPathExtension("html")
+        let renderedLayerURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".mangakitchen-typesetting-layer-\(UUID().uuidString)")
+            .appendingPathExtension("png")
         try html.write(to: temporaryURL, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        defer {
+            try? FileManager.default.removeItem(at: temporaryURL)
+            try? FileManager.default.removeItem(at: renderedLayerURL)
+        }
 
         await acquireRenderer()
         defer { releaseRenderer() }
@@ -69,6 +131,14 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
         try await renderer.render(
             htmlURL: temporaryURL,
             readAccessURL: backgroundURL.deletingLastPathComponent(),
+            outputURL: renderedLayerURL,
+            width: width.intValue,
+            height: height.intValue
+        )
+        try Task.checkCancellation()
+        try Self.composite(
+            backgroundURL: backgroundURL,
+            renderedLayerURL: renderedLayerURL,
             outputURL: outputURL,
             width: width.intValue,
             height: height.intValue
@@ -101,12 +171,11 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
     }
 
     private static func document(
-        backgroundURL: URL,
         regionsBase64: String,
         width: Int,
-        height: Int
+        height: Int,
+        renderScale: Double
     ) -> String {
-        let backgroundSource = htmlEscaped(backgroundURL.absoluteString)
         return """
         <!doctype html>
         <html>
@@ -122,13 +191,12 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
               overflow: hidden;
               background: transparent;
             }
-            #canvas, #background, #translation-layer {
+            #canvas, #translation-layer {
               position: absolute;
               inset: 0;
               width: 100%;
               height: 100%;
             }
-            #background { object-fit: fill; }
             #translation-layer { line-height: normal; pointer-events: none; }
             .translation-text {
               position: absolute;
@@ -155,12 +223,14 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
         </head>
         <body>
           <div id="canvas">
-            <img id="background" src="\(backgroundSource)" alt="">
             <div id="translation-layer"></div>
           </div>
           <script>
             const pixelWidth = \(width);
             const pixelHeight = \(height);
+            const renderScale = \(renderScale);
+            const logicalPixelWidth = pixelWidth / renderScale;
+            const logicalPixelHeight = pixelHeight / renderScale;
             const encodedRegions = "\(regionsBase64)";
             const bytes = Uint8Array.from(atob(encodedRegions), character => character.charCodeAt(0));
             const regions = JSON.parse(new TextDecoder().decode(bytes));
@@ -228,21 +298,22 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
               const bounds = translationLayoutBounds(region);
               const sourceArea = Math.max(
                 1,
-                bounds.width * pixelWidth * bounds.height * pixelHeight
+                bounds.width * logicalPixelWidth * bounds.height * logicalPixelHeight
               );
               const minimum = Math.max(4, region.style.minimumFontSize ?? 9);
               const maximum = Math.min(
                 512,
                 Math.max(minimum, region.style.maximumFontSize ?? 40)
               );
-              return region.style.fontSize
+              const sourceFontSize = region.style.fontSize
                 ?? clamp(Math.sqrt(sourceArea / sourceCount) * 1.08, minimum, maximum);
+              return sourceFontSize * renderScale;
             }
 
             function fitAutomaticTranslationText(element, region) {
               if (region.style.fontSize != null || !element.clientWidth || !element.clientHeight) return;
-              let lower = Math.max(3, region.style.minimumFontSize ?? 4);
-              let upper = Math.max(lower, region.style.maximumFontSize ?? 40);
+              let lower = Math.max(3, region.style.minimumFontSize ?? 4) * renderScale;
+              let upper = Math.max(lower, region.style.maximumFontSize ?? 40) * renderScale;
               for (let index = 0; index < 10; index += 1) {
                 const candidate = (lower + upper) / 2;
                 element.style.fontSize = `${candidate}px`;
@@ -272,24 +343,26 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
                 element.style.fontSize = `${translationSourceFontSize(region)}px`;
                 element.style.fontWeight = region.style.fontWeight === "bold" ? "700" : "400";
                 element.style.color = region.style.textColorHex;
+                element.style.textAlign = region.style.textAlignment ?? "center";
+                element.style.justifyContent = {
+                  start: "flex-start",
+                  end: "flex-end",
+                  center: "center",
+                }[region.style.textAlignment ?? "center"];
+                element.style.webkitTextStroke = `${Math.max(0, region.style.strokeWidth ?? 0) * renderScale}px ${region.style.strokeColorHex ?? "#FFFFFF"}`;
+                element.style.paintOrder = "stroke fill";
+                element.style.opacity = String(Math.min(1, Math.max(0, region.style.opacity ?? 1)));
+                element.style.transform = `translate(-50%, -50%) rotate(${region.style.rotationDegrees ?? 0}deg)`;
                 layer.append(element);
                 fitAutomaticTranslationText(element, region);
               }
             }
 
             window.mangaKitchenReady = (async () => {
-              const background = document.querySelector("#background");
-              if (!background.complete) {
-                await new Promise((resolve, reject) => {
-                  background.addEventListener("load", resolve, { once: true });
-                  background.addEventListener("error", reject, { once: true });
-                });
-              } else if (!background.naturalWidth) {
-                throw new Error("Background image failed to load.");
-              }
               await document.fonts.ready;
               renderRegions();
               document.body.getBoundingClientRect();
+              await new Promise(resolve => setTimeout(resolve, 50));
               return true;
             })();
             window.mangaKitchenTypesettingState = { status: "pending", error: "" };
@@ -306,12 +379,95 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
         """
     }
 
-    private static func htmlEscaped(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
+    private static func writeTransparentCanvas(width: Int, height: Int, to outputURL: URL) throws {
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage(),
+              let destination = CGImageDestinationCreateWithURL(
+               outputURL as CFURL,
+               "public.png" as CFString,
+               1,
+               nil
+              ) else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+    }
+
+    private static func composite(
+        backgroundURL: URL,
+        renderedLayerURL: URL,
+        outputURL: URL,
+        width: Int,
+        height: Int
+    ) throws {
+        guard let backgroundSource = CGImageSourceCreateWithURL(backgroundURL as CFURL, nil),
+              let background = CGImageSourceCreateImageAtIndex(
+                backgroundSource,
+                0,
+                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+              ),
+              let layerSource = CGImageSourceCreateWithURL(renderedLayerURL as CFURL, nil),
+              let layer = CGImageSourceCreateImageAtIndex(
+                layerSource,
+                0,
+                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+              ),
+              background.width == width,
+              background.height == height,
+              layer.width == width,
+              layer.height == height else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue
+            | CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        let canvas = CGRect(x: 0, y: 0, width: width, height: height)
+        context.setBlendMode(.copy)
+        context.draw(background, in: canvas)
+        context.setBlendMode(.normal)
+        context.draw(layer, in: canvas)
+        guard let image = context.makeImage() else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            "public.png" as CFString,
+            1,
+            nil
+        ) else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        try (data as Data).write(to: outputURL, options: .atomic)
     }
 }
 
@@ -337,6 +493,7 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
         )
         super.init()
         webView.navigationDelegate = self
+        webView.underPageBackgroundColor = .clear
         window.contentView = webView
         window.isExcludedFromWindowsMenu = true
         window.orderOut(nil)
@@ -359,11 +516,64 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
         let snapshotConfiguration = WKSnapshotConfiguration()
         snapshotConfiguration.rect = frame
         snapshotConfiguration.snapshotWidth = NSNumber(value: width)
-        let pngData: Data = try await awaitWebKitOperation(
-            named: "建立排版截圖",
+        try await setSnapshotBackground("#000000", webView: webView)
+        let blackBackgroundPNG = try await snapshot(
+            webView,
+            configuration: snapshotConfiguration,
+            operationName: "建立黑底排版截圖"
+        )
+        try await setSnapshotBackground("#FFFFFF", webView: webView)
+        let whiteBackgroundPNG = try await snapshot(
+            webView,
+            configuration: snapshotConfiguration,
+            operationName: "建立白底排版截圖"
+        )
+        let pngData = try Self.transparentLayerPNG(
+            blackBackgroundPNG: blackBackgroundPNG,
+            whiteBackgroundPNG: whiteBackgroundPNG,
+            width: width,
+            height: height
+        )
+        try pngData.write(to: outputURL, options: .atomic)
+    }
+
+    private func setSnapshotBackground(_ color: String, webView: WKWebView) async throws {
+        let applied: Bool = try await awaitWebKitOperation(
+            named: "設定排版截圖背景",
             webView: webView
         ) { completion in
-            webView.takeSnapshot(with: snapshotConfiguration) { image, error in
+            webView.evaluateJavaScript(
+                """
+                (() => {
+                  const color = "\(color)";
+                  document.documentElement.style.backgroundColor = color;
+                  document.body.style.backgroundColor = color;
+                  document.querySelector("#canvas").style.backgroundColor = color;
+                  document.body.getBoundingClientRect();
+                  return true;
+                })()
+                """
+            ) { value, error in
+                if let error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(value as? Bool == true))
+                }
+            }
+        }
+        guard applied else {
+            throw HTMLDialogueTypesetterError.invalidJavaScriptState
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+    }
+
+    private func snapshot(
+        _ webView: WKWebView,
+        configuration: WKSnapshotConfiguration,
+        operationName: String
+    ) async throws -> Data {
+        try await awaitWebKitOperation(named: operationName, webView: webView) { completion in
+            webView.takeSnapshot(with: configuration) { image, error in
                 if let error {
                     completion(.failure(error))
                 } else if let image {
@@ -376,7 +586,6 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
                 }
             }
         }
-        try pngData.write(to: outputURL, options: .atomic)
     }
 
     private func load(_ webView: WKWebView, htmlURL: URL, readAccessURL: URL) async throws {
@@ -511,6 +720,97 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
         ) else {
             throw HTMLDialogueTypesetterError.snapshotFailed
         }
+        return try pngData(from: cgImage)
+    }
+
+    private static func transparentLayerPNG(
+        blackBackgroundPNG: Data,
+        whiteBackgroundPNG: Data,
+        width: Int,
+        height: Int
+    ) throws -> Data {
+        guard let blackSource = CGImageSourceCreateWithData(blackBackgroundPNG as CFData, nil),
+              let blackImage = CGImageSourceCreateImageAtIndex(blackSource, 0, nil),
+              let whiteSource = CGImageSourceCreateWithData(whiteBackgroundPNG as CFData, nil),
+              let whiteImage = CGImageSourceCreateImageAtIndex(whiteSource, 0, nil),
+              blackImage.width == width,
+              blackImage.height == height,
+              whiteImage.width == width,
+              whiteImage.height == height else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        var pixels = try rgbaBytes(from: blackImage, width: width, height: height)
+        let whitePixels = try rgbaBytes(from: whiteImage, width: width, height: height)
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            let redDifference = max(0, Int(whitePixels[offset]) - Int(pixels[offset]))
+            let greenDifference = max(
+                0,
+                Int(whitePixels[offset + 1]) - Int(pixels[offset + 1])
+            )
+            let blueDifference = max(
+                0,
+                Int(whitePixels[offset + 2]) - Int(pixels[offset + 2])
+            )
+            let minimumDifference = min(redDifference, greenDifference, blueDifference)
+            let maximumDifference = max(redDifference, greenDifference, blueDifference)
+            let medianDifference = redDifference + greenDifference + blueDifference
+                - minimumDifference - maximumDifference
+            let alpha = UInt8(clamping: 255 - medianDifference)
+            pixels[offset] = min(pixels[offset], alpha)
+            pixels[offset + 1] = min(pixels[offset + 1], alpha)
+            pixels[offset + 2] = min(pixels[offset + 2], alpha)
+            pixels[offset + 3] = alpha
+        }
+        let pixelData = Data(pixels) as CFData
+        guard let provider = CGDataProvider(data: pixelData),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.union(
+                    CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+                ),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        return try pngData(from: image)
+    }
+
+    private static func rgbaBytes(from image: CGImage, width: Int, height: Int) throws -> [UInt8] {
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        )
+        let rendered = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: bitmapInfo.rawValue
+            ) else {
+                return false
+            }
+            context.setBlendMode(.copy)
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else {
+            throw HTMLDialogueTypesetterError.snapshotFailed
+        }
+        return pixels
+    }
+
+    private static func pngData(from image: CGImage) throws -> Data {
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data,
@@ -520,7 +820,7 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
         ) else {
             throw HTMLDialogueTypesetterError.snapshotFailed
         }
-        CGImageDestinationAddImage(destination, cgImage, nil)
+        CGImageDestinationAddImage(destination, image, nil)
         guard CGImageDestinationFinalize(destination) else {
             throw HTMLDialogueTypesetterError.snapshotFailed
         }

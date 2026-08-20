@@ -3,6 +3,7 @@ import Foundation
 public enum ModelCapability: String, Codable, CaseIterable, Hashable, Sendable {
     case imageToText
     case imageToImage
+    case superResolution
 }
 
 public enum ModelBackend: String, Codable, CaseIterable, Hashable, Sendable {
@@ -56,6 +57,7 @@ public enum PageProcessingStage: String, Codable, CaseIterable, Hashable, Sendab
     case detectingText
     case maskReady
     case translationReady
+    case superResolving
     case composing
 
     // 保留舊工作區資料與既有進度顯示相容性。
@@ -82,12 +84,19 @@ public enum PageProcessingActivity: String, Codable, CaseIterable, Hashable, Sen
     case preparingTranslationPreview
     case restoringBackground
     case typesettingTranslation
+    case superResolving
     case savingOutput
 }
 
 public enum DialogueFontWeight: String, Codable, CaseIterable, Hashable, Sendable {
     case regular
     case bold
+}
+
+public enum DialogueTextAlignment: String, Codable, CaseIterable, Hashable, Sendable {
+    case start
+    case center
+    case end
 }
 
 public struct DialogueStyle: Codable, Hashable, Sendable {
@@ -99,6 +108,25 @@ public struct DialogueStyle: Codable, Hashable, Sendable {
     public var maximumFontSize: Double
     public var writingDirection: WritingDirection
     public var textColorHex: String
+    public var textAlignment: DialogueTextAlignment
+    public var strokeColorHex: String
+    public var strokeWidth: Double
+    public var opacity: Double
+    public var rotationDegrees: Double
+    public var isVisible: Bool
+
+    public static func normalizedHexColor(_ value: String, fallback: String) -> String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard normalized.first == "#" else { return fallback }
+        let digits = normalized.dropFirst()
+        guard [3, 6].contains(digits.count), digits.allSatisfy({ $0.isHexDigit }) else {
+            return fallback
+        }
+        if digits.count == 3 {
+            return "#" + digits.map { "\($0)\($0)" }.joined()
+        }
+        return normalized
+    }
 
     public init(
         fontName: String = "PingFang TC",
@@ -107,7 +135,13 @@ public struct DialogueStyle: Codable, Hashable, Sendable {
         minimumFontSize: Double = 9,
         maximumFontSize: Double = 40,
         writingDirection: WritingDirection = .automatic,
-        textColorHex: String = "#111111"
+        textColorHex: String = "#111111",
+        textAlignment: DialogueTextAlignment = .center,
+        strokeColorHex: String = "#FFFFFF",
+        strokeWidth: Double = 0,
+        opacity: Double = 1,
+        rotationDegrees: Double = 0,
+        isVisible: Bool = true
     ) {
         self.fontName = fontName
         self.fontSize = fontSize
@@ -115,7 +149,13 @@ public struct DialogueStyle: Codable, Hashable, Sendable {
         self.minimumFontSize = minimumFontSize
         self.maximumFontSize = maximumFontSize
         self.writingDirection = writingDirection
-        self.textColorHex = textColorHex
+        self.textColorHex = Self.normalizedHexColor(textColorHex, fallback: "#111111")
+        self.textAlignment = textAlignment
+        self.strokeColorHex = Self.normalizedHexColor(strokeColorHex, fallback: "#FFFFFF")
+        self.strokeWidth = min(max(strokeWidth, 0), 20)
+        self.opacity = min(max(opacity, 0), 1)
+        self.rotationDegrees = min(max(rotationDegrees, -180), 180)
+        self.isVisible = isVisible
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -126,6 +166,12 @@ public struct DialogueStyle: Codable, Hashable, Sendable {
         case maximumFontSize
         case writingDirection
         case textColorHex
+        case textAlignment
+        case strokeColorHex
+        case strokeWidth
+        case opacity
+        case rotationDegrees
+        case isVisible
     }
 
     public init(from decoder: any Decoder) throws {
@@ -138,7 +184,23 @@ public struct DialogueStyle: Codable, Hashable, Sendable {
         maximumFontSize = try values.decodeIfPresent(Double.self, forKey: .maximumFontSize) ?? 40
         writingDirection = try values.decodeIfPresent(WritingDirection.self, forKey: .writingDirection)
             ?? .automatic
-        textColorHex = try values.decodeIfPresent(String.self, forKey: .textColorHex) ?? "#111111"
+        textColorHex = Self.normalizedHexColor(
+            try values.decodeIfPresent(String.self, forKey: .textColorHex) ?? "#111111",
+            fallback: "#111111"
+        )
+        textAlignment = try values.decodeIfPresent(DialogueTextAlignment.self, forKey: .textAlignment)
+            ?? .center
+        strokeColorHex = Self.normalizedHexColor(
+            try values.decodeIfPresent(String.self, forKey: .strokeColorHex) ?? "#FFFFFF",
+            fallback: "#FFFFFF"
+        )
+        strokeWidth = min(max(try values.decodeIfPresent(Double.self, forKey: .strokeWidth) ?? 0, 0), 20)
+        opacity = min(max(try values.decodeIfPresent(Double.self, forKey: .opacity) ?? 1, 0), 1)
+        rotationDegrees = min(
+            max(try values.decodeIfPresent(Double.self, forKey: .rotationDegrees) ?? 0, -180),
+            180
+        )
+        isVisible = try values.decodeIfPresent(Bool.self, forKey: .isVisible) ?? true
     }
 }
 
@@ -168,6 +230,47 @@ public struct MaskStroke: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+public enum TranslationLengthMode: String, Codable, CaseIterable, Hashable, Sendable {
+    case faithful
+    case balanced
+    case compact
+}
+
+public enum TranslationQAFlag: String, Codable, CaseIterable, Hashable, Sendable {
+    case missingTranslation
+    case glossaryMismatch
+    case numberMismatch
+    case excessiveLength
+    case modelUncertain
+    case sourceTextLeak
+    case reviewAdjusted
+}
+
+public struct TranslationQualityOptions: Codable, Hashable, Sendable {
+    public var usePageContext: Bool
+    public var reviewPassEnabled: Bool
+    public var qualityCheckEnabled: Bool
+    public var preserveLiteralTranslation: Bool
+    public var lengthMode: TranslationLengthMode
+    public var styleGuide: String
+
+    public init(
+        usePageContext: Bool = true,
+        reviewPassEnabled: Bool = true,
+        qualityCheckEnabled: Bool = true,
+        preserveLiteralTranslation: Bool = true,
+        lengthMode: TranslationLengthMode = .balanced,
+        styleGuide: String = ""
+    ) {
+        self.usePageContext = usePageContext
+        self.reviewPassEnabled = reviewPassEnabled
+        self.qualityCheckEnabled = qualityCheckEnabled
+        self.preserveLiteralTranslation = preserveLiteralTranslation
+        self.lengthMode = lengthMode
+        self.styleGuide = String(styleGuide.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_000))
+    }
+}
+
 public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     /// VLM／Agent 找到的來源文字區域，也是譯文的預設排版錨點。
@@ -192,7 +295,13 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     public var sourceText: String
     /// 相容舊 `.str` 的完成標記；新流程代表來源文字已由 VLM、Agent 或人工確認。
     public var ocrTextRefined: Bool
+    /// 忠實保留語意的直譯稿；最終排版仍使用 translatedText。
+    public var literalTranslatedText: String?
     public var translatedText: String
+    public var speakerID: String?
+    public var tone: String?
+    public var translationConfidence: Double?
+    public var translationQAFlags: [TranslationQAFlag]
     public var translationAnchor: NormalizedPoint?
     public var translationBounds: NormalizedRect?
     public var confidence: Double
@@ -218,7 +327,12 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         rawSourceText: String? = nil,
         sourceText: String,
         ocrTextRefined: Bool = false,
+        literalTranslatedText: String? = nil,
         translatedText: String = "",
+        speakerID: String? = nil,
+        tone: String? = nil,
+        translationConfidence: Double? = nil,
+        translationQAFlags: [TranslationQAFlag] = [],
         translationAnchor: NormalizedPoint? = nil,
         translationBounds: NormalizedRect? = nil,
         confidence: Double,
@@ -239,7 +353,12 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         self.rawSourceText = rawSourceText
         self.sourceText = sourceText
         self.ocrTextRefined = ocrTextRefined
+        self.literalTranslatedText = literalTranslatedText
         self.translatedText = translatedText
+        self.speakerID = speakerID
+        self.tone = tone
+        self.translationConfidence = translationConfidence.map { min(max($0, 0), 1) }
+        self.translationQAFlags = Array(Set(translationQAFlags)).sorted { $0.rawValue < $1.rawValue }
         self.translationAnchor = translationAnchor?.clamped()
         self.translationBounds = translationBounds?.clamped()
         self.confidence = confidence
@@ -264,7 +383,12 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         case rawSourceText
         case sourceText
         case ocrTextRefined
+        case literalTranslatedText
         case translatedText
+        case speakerID
+        case tone
+        case translationConfidence
+        case translationQAFlags
         case translationAnchor
         case translationBounds
         case confidence
@@ -294,7 +418,18 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         rawSourceText = try values.decodeIfPresent(String.self, forKey: .rawSourceText)
         sourceText = try values.decode(String.self, forKey: .sourceText)
         ocrTextRefined = try values.decodeIfPresent(Bool.self, forKey: .ocrTextRefined) ?? false
+        literalTranslatedText = try values.decodeIfPresent(String.self, forKey: .literalTranslatedText)
         translatedText = try values.decode(String.self, forKey: .translatedText)
+        speakerID = try values.decodeIfPresent(String.self, forKey: .speakerID)
+        tone = try values.decodeIfPresent(String.self, forKey: .tone)
+        translationConfidence = try values.decodeIfPresent(
+            Double.self,
+            forKey: .translationConfidence
+        ).map { min(max($0, 0), 1) }
+        translationQAFlags = try values.decodeIfPresent(
+            [TranslationQAFlag].self,
+            forKey: .translationQAFlags
+        ) ?? []
         translationAnchor = try values.decodeIfPresent(
             NormalizedPoint.self,
             forKey: .translationAnchor
@@ -334,6 +469,8 @@ public struct ComicPage: Identifiable, Codable, Hashable, Sendable {
     /// 來源目錄下的相對路徑；用於避免同名檔案互相覆蓋。
     public var relativeSourcePath: String?
     public var backgroundURL: URL?
+    /// 步驟三超解析後的乾淨背景；原尺寸 `backgroundURL` 保留作為遮罩預覽。
+    public var superResolvedBackgroundURL: URL?
     public var maskURL: URL?
     public var stringTableURL: URL?
     public var translationPreviewURL: URL?
@@ -363,6 +500,7 @@ public struct ComicPage: Identifiable, Codable, Hashable, Sendable {
         self.sourceURL = sourceURL
         self.relativeSourcePath = relativeSourcePath
         self.backgroundURL = nil
+        self.superResolvedBackgroundURL = nil
         self.maskURL = nil
         self.stringTableURL = nil
         self.translationPreviewURL = nil
@@ -387,6 +525,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
     /// 精細掃描：封閉區域偵測不到的地方（白底上的開口氣泡、無框台詞），
     /// 額外以網格逐塊送給圖生文模型辨識。會顯著增加每頁推論次數。
     public var fineScanEnabled: Bool
+    public var translationQuality: TranslationQualityOptions
 
     public init(
         sourceLanguageCodes: [String] = ["ja-JP", "zh-Hans", "zh-Hant", "en-US"],
@@ -396,7 +535,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         maskExpansion: Double = 0.035,
         useImageToImageRestoration: Bool = false,
         preserveUntranslatedRegions: Bool = false,
-        fineScanEnabled: Bool = false
+        fineScanEnabled: Bool = false,
+        translationQuality: TranslationQualityOptions = TranslationQualityOptions()
     ) {
         self.sourceLanguageCodes = sourceLanguageCodes
         self.targetLanguageCode = targetLanguageCode
@@ -406,6 +546,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.useImageToImageRestoration = useImageToImageRestoration
         self.preserveUntranslatedRegions = preserveUntranslatedRegions
         self.fineScanEnabled = fineScanEnabled
+        self.translationQuality = translationQuality
     }
 
     /// 實際交給翻譯器、詞表與 Agent 的目標語言；手動選擇時維持原值。
@@ -422,6 +563,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         case useImageToImageRestoration
         case preserveUntranslatedRegions
         case fineScanEnabled
+        case translationQuality
     }
 
     public init(from decoder: any Decoder) throws {
@@ -452,6 +594,10 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         fineScanEnabled = try values.decodeIfPresent(
             Bool.self, forKey: .fineScanEnabled
         ) ?? defaults.fineScanEnabled
+        translationQuality = try values.decodeIfPresent(
+            TranslationQualityOptions.self,
+            forKey: .translationQuality
+        ) ?? defaults.translationQuality
     }
 }
 
@@ -494,6 +640,7 @@ public struct PageCompositionResult: Codable, Hashable, Sendable {
     public var regions: [DialogueRegion]
     public var maskURL: URL
     public var backgroundURL: URL
+    public var superResolvedBackgroundURL: URL?
     public var outputURL: URL
     public var warnings: [String]
 
@@ -501,12 +648,14 @@ public struct PageCompositionResult: Codable, Hashable, Sendable {
         regions: [DialogueRegion],
         maskURL: URL,
         backgroundURL: URL,
+        superResolvedBackgroundURL: URL? = nil,
         outputURL: URL,
         warnings: [String] = []
     ) {
         self.regions = regions
         self.maskURL = maskURL
         self.backgroundURL = backgroundURL
+        self.superResolvedBackgroundURL = superResolvedBackgroundURL
         self.outputURL = outputURL
         self.warnings = warnings
     }

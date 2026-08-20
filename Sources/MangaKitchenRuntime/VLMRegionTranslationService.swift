@@ -2,14 +2,29 @@ import Foundation
 import MangaKitchenCore
 
 public actor VLMRegionTranslationService: RegionTranslating {
-    private struct PromptRegion: Encodable {
+    private struct PromptRegion: Codable {
+        var index: Int
         var id: UUID
         var sourceText: String
+        var existingTranslation: String?
+        var approximateCharacterLimit: Int
     }
 
-    private struct TranslationItem: Decodable {
+    private struct TranslationItem: Codable {
         var id: UUID
-        var translatedText: String
+        var literalTranslation: String?
+        var displayTranslation: String?
+        var translatedText: String?
+        var speakerID: String?
+        var tone: String?
+        var confidence: Double?
+        var qaFlags: [String]?
+
+        var resolvedDisplayTranslation: String? {
+            let value = displayTranslation ?? translatedText
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed?.isEmpty == false ? trimmed : nil
+        }
     }
 
     private let model: any ImageToTextGenerating
@@ -23,6 +38,8 @@ public actor VLMRegionTranslationService: RegionTranslating {
         pageURL: URL,
         targetLanguageCode: String,
         glossaryTerms: [ResolvedGlossaryTerm],
+        readingDirection: ReadingDirection,
+        qualityOptions: TranslationQualityOptions,
         regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
@@ -31,116 +48,311 @@ public actor VLMRegionTranslationService: RegionTranslating {
             return []
         }
 
-        let glossaryData = try JSONEncoder().encode(glossaryTerms)
-        guard let glossaryJSON = String(data: glossaryData, encoding: .utf8) else {
-            throw TranslationRuntimeError.promptEncodingFailed
-        }
-
-        let regionCount = regions.count
-        var translatedRegions: [DialogueRegion] = []
-        translatedRegions.reserveCapacity(regionCount)
-
-        for (index, region) in regions.enumerated() {
-            try Task.checkCancellation()
-            regionProgress(index + 1, regionCount)
-            progress(Double(index) / Double(regionCount))
-            do {
-                let translatedText = try await translateRegion(
-                    region,
-                    pageURL: pageURL,
-                    targetLanguageCode: targetLanguageCode,
-                    glossaryJSON: glossaryJSON,
-                    progress: { value in
-                        progress((Double(index) + value) / Double(regionCount))
-                    }
+        let glossaryJSON = try Self.json(glossaryTerms)
+        let promptRegions = regions.enumerated().map { index, region in
+            PromptRegion(
+                index: index + 1,
+                id: region.id,
+                sourceText: region.sourceText,
+                existingTranslation: region.translatedText.isEmpty ? nil : region.translatedText,
+                approximateCharacterLimit: Self.characterLimit(
+                    sourceText: region.sourceText,
+                    mode: qualityOptions.lengthMode
                 )
-                var translated = region
-                translated.translatedText = translatedText
-                translatedRegions.append(translated)
+            )
+        }
+        let promptRegionsJSON = try Self.json(promptRegions)
+        let draftEnd = qualityOptions.reviewPassEnabled ? 0.55 : 0.9
+
+        let drafts: [UUID: TranslationItem]
+        if qualityOptions.usePageContext {
+            do {
+                drafts = try await generateItems(
+                    pageURL: pageURL,
+                    prompt: Self.draftPrompt(
+                        targetLanguageCode: targetLanguageCode,
+                        readingDirection: readingDirection,
+                        glossaryJSON: glossaryJSON,
+                        regionsJSON: promptRegionsJSON,
+                        qualityOptions: qualityOptions
+                    ),
+                    expectedRegions: regions,
+                    progress: { value in progress(value * draftEnd) }
+                )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // 單一區域失敗時保留原先可用的譯文，讓其餘區域繼續處理。
-                translatedRegions.append(region)
+                drafts = try await generateIndividually(
+                    regions: regions,
+                    pageURL: pageURL,
+                    targetLanguageCode: targetLanguageCode,
+                    glossaryJSON: glossaryJSON,
+                    qualityOptions: qualityOptions,
+                    regionProgress: regionProgress,
+                    progress: { value in progress(value * draftEnd) }
+                )
             }
-            progress(Double(index + 1) / Double(regionCount))
+        } else {
+            drafts = try await generateIndividually(
+                regions: regions,
+                pageURL: pageURL,
+                targetLanguageCode: targetLanguageCode,
+                glossaryJSON: glossaryJSON,
+                qualityOptions: qualityOptions,
+                regionProgress: regionProgress,
+                progress: { value in progress(value * draftEnd) }
+            )
+        }
+        regionProgress(0, 0)
+
+        var reviewed = drafts
+        if qualityOptions.reviewPassEnabled, !drafts.isEmpty {
+            let reviewPayload = regions.compactMap { drafts[$0.id] }
+            if let reviewJSON = try? Self.json(reviewPayload),
+               let values = try? await generateItems(
+                   pageURL: pageURL,
+                   prompt: Self.reviewPrompt(
+                       targetLanguageCode: targetLanguageCode,
+                       readingDirection: readingDirection,
+                       glossaryJSON: glossaryJSON,
+                       regionsJSON: promptRegionsJSON,
+                       draftsJSON: reviewJSON,
+                       qualityOptions: qualityOptions
+                   ),
+                   expectedRegions: regions,
+                   progress: { value in progress(draftEnd + value * (0.9 - draftEnd)) }
+               ) {
+                reviewed.merge(values) { _, new in new }
+            }
         }
 
-        regionProgress(regionCount, regionCount)
+        var translatedRegions: [DialogueRegion] = []
+        translatedRegions.reserveCapacity(regions.count)
+        for region in regions {
+            try Task.checkCancellation()
+            var translated = region
+            if let item = reviewed[region.id], let display = item.resolvedDisplayTranslation {
+                let literal = item.literalTranslation?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                translated.literalTranslatedText = qualityOptions.preserveLiteralTranslation
+                    ? (literal?.isEmpty == false ? literal : display)
+                    : nil
+                translated.translatedText = display
+                translated.speakerID = Self.nonEmpty(item.speakerID)
+                translated.tone = Self.nonEmpty(item.tone)
+                translated.translationConfidence = item.confidence.map { min(max($0, 0), 1) }
+                var flags = Set((item.qaFlags ?? []).compactMap(TranslationQAFlag.init(rawValue:)))
+                if qualityOptions.reviewPassEnabled,
+                   drafts[region.id]?.resolvedDisplayTranslation != display {
+                    flags.insert(.reviewAdjusted)
+                }
+                if qualityOptions.qualityCheckEnabled {
+                    flags.formUnion(Self.qualityFlags(
+                        region: translated,
+                        glossaryTerms: glossaryTerms,
+                        lengthMode: qualityOptions.lengthMode
+                    ))
+                }
+                translated.translationQAFlags = flags.sorted { $0.rawValue < $1.rawValue }
+            } else if qualityOptions.qualityCheckEnabled {
+                translated.translationQAFlags = [.missingTranslation]
+            }
+            translatedRegions.append(translated)
+        }
+
         progress(1)
         return translatedRegions
     }
 
-    private func translateRegion(
-        _ region: DialogueRegion,
+    private func generateIndividually(
+        regions: [DialogueRegion],
         pageURL: URL,
         targetLanguageCode: String,
         glossaryJSON: String,
+        qualityOptions: TranslationQualityOptions,
+        regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
-    ) async throws -> String {
-        let payload = [PromptRegion(id: region.id, sourceText: region.sourceText)]
-        let data = try JSONEncoder().encode(payload)
-        guard let regionJSON = String(data: data, encoding: .utf8) else {
-            throw TranslationRuntimeError.promptEncodingFailed
+    ) async throws -> [UUID: TranslationItem] {
+        var result: [UUID: TranslationItem] = [:]
+        regionProgress(0, regions.count)
+        for (index, region) in regions.enumerated() {
+            try Task.checkCancellation()
+            let payload = [PromptRegion(
+                index: index + 1,
+                id: region.id,
+                sourceText: region.sourceText,
+                existingTranslation: region.translatedText.isEmpty ? nil : region.translatedText,
+                approximateCharacterLimit: Self.characterLimit(
+                    sourceText: region.sourceText,
+                    mode: qualityOptions.lengthMode
+                )
+            )]
+            do {
+                let values = try await generateItems(
+                    pageURL: pageURL,
+                    prompt: Self.draftPrompt(
+                        targetLanguageCode: targetLanguageCode,
+                        readingDirection: .topToBottom,
+                        glossaryJSON: glossaryJSON,
+                        regionsJSON: try Self.json(payload),
+                        qualityOptions: qualityOptions
+                    ),
+                    expectedRegions: [region],
+                    progress: { value in
+                        progress((Double(index) + value) / Double(regions.count))
+                    }
+                )
+                result.merge(values) { _, new in new }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // 單區失敗時保留既有譯文，其他區域繼續。
+            }
+            regionProgress(index + 1, regions.count)
+            progress(Double(index + 1) / Double(regions.count))
         }
+        return result
+    }
 
+    private func generateItems(
+        pageURL: URL,
+        prompt: String,
+        expectedRegions: [DialogueRegion],
+        progress: @escaping InferenceProgress
+    ) async throws -> [UUID: TranslationItem] {
         for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
             try Task.checkCancellation()
             let response = try await model.generateText(
                 imageURL: pageURL,
-                prompt: Self.prompt(
-                    targetLanguageCode: targetLanguageCode,
-                    glossaryJSON: glossaryJSON,
-                    regionsJSON: regionJSON,
-                    attempt: attempt
-                ),
-                maximumOutputTokens: 2_048,
+                prompt: prompt + "\n" + VLMStructuredResponseDecoder.retryInstruction(attempt: attempt),
+                maximumOutputTokens: min(16_384, max(2_048, expectedRegions.count * 384)),
                 progress: { value in
-                    let local = VLMStructuredResponseDecoder.mappedProgress(
-                        attempt: attempt,
-                        value: value
-                    )
-                    progress(local)
+                    progress(VLMStructuredResponseDecoder.mappedProgress(attempt: attempt, value: value))
                 }
             )
-            let decodedCandidates = VLMStructuredResponseDecoder.decodeArrays(
-                TranslationItem.self,
-                from: response
-            )
-            if let item = decodedCandidates
-                .flatMap({ $0 })
-                .first(where: { $0.id == region.id }),
-               !item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let expectedIDs = Set(expectedRegions.map(\.id))
+            let candidates = VLMStructuredResponseDecoder.decodeArrays(TranslationItem.self, from: response)
+            for candidate in candidates {
+                let items = candidate.filter { expectedIDs.contains($0.id) && $0.resolvedDisplayTranslation != nil }
+                guard !items.isEmpty else { continue }
+                return Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
             }
         }
-
         throw TranslationRuntimeError.invalidModelResponse
     }
 
-    private static func prompt(
+    private static func draftPrompt(
         targetLanguageCode: String,
+        readingDirection: ReadingDirection,
         glossaryJSON: String,
         regionsJSON: String,
-        attempt: Int
+        qualityOptions: TranslationQualityOptions
     ) -> String {
         """
-        You are translating speech balloons, captions, and sound effects on one comic page.
-        Translate every sourceText into the language identified by BCP-47 code "\(targetLanguageCode)".
-        Each sourceText has already been transcribed or confirmed. Do not re-transcribe or rewrite it.
-        Use the image only as context for speaker, tone, gender, ambiguity, and sound effects.
-        Keep names and terminology consistent. Be concise enough to fit the original region.
-        The terminology array below is authoritative. Whenever a sourceTerm occurs in a sourceText,
-        use its preferredTranslation exactly; never invent an alternative spelling or translation.
-        Terminology for this page and target language:
+        You are producing the first translation draft for one complete comic page.
+        Translate every sourceText into BCP-47 language "\(targetLanguageCode)".
+        Read all regions together in index order using reading direction "\(readingDirection.rawValue)".
+        Use the page image for speaker identity, relationships, gender, tone, ambiguity and visual context.
+        Keep the same speakerID for the same visible speaker. Use stable descriptive IDs when names are unknown.
+        literalTranslation must preserve the complete meaning. displayTranslation must sound natural and fit
+        approximateCharacterLimit without dropping plot facts, names, numbers, negation or emotional intent.
+        Length strategy: \(qualityOptions.lengthMode.rawValue).
+        Project style guide: \(qualityOptions.styleGuide.isEmpty ? "No additional style guide." : qualityOptions.styleGuide)
+        Terminology is authoritative; whenever sourceTerm occurs, use preferredTranslation exactly:
         \(glossaryJSON)
-        Do not add explanations. Return only a valid JSON array in this exact shape:
-        [{"id":"UUID","translatedText":"translated text"}]
-        Keep every UUID unchanged and return one item for every input item.
+        Return only one valid JSON array with every UUID unchanged, in this exact shape:
+        [{"id":"UUID","literalTranslation":"...","displayTranslation":"...","speakerID":"...","tone":"...","confidence":0.0,"qaFlags":[]}]
+        confidence is 0...1. qaFlags may only contain missingTranslation, glossaryMismatch, numberMismatch,
+        excessiveLength, modelUncertain or sourceTextLeak. Do not add explanations.
         Input regions:
         \(regionsJSON)
-        \(VLMStructuredResponseDecoder.retryInstruction(attempt: attempt))
         """
+    }
+
+    private static func reviewPrompt(
+        targetLanguageCode: String,
+        readingDirection: ReadingDirection,
+        glossaryJSON: String,
+        regionsJSON: String,
+        draftsJSON: String,
+        qualityOptions: TranslationQualityOptions
+    ) -> String {
+        """
+        You are the senior editor reviewing a complete comic-page translation into "\(targetLanguageCode)".
+        Compare every draft against its sourceText and the page image. Review in "\(readingDirection.rawValue)"
+        reading order. Correct mistranslation, omitted meaning, pronouns, negation, numbers, terminology,
+        inconsistent speaker IDs, forms of address, register, tone and unnatural dialogue.
+        Keep literalTranslation semantically complete. Make displayTranslation natural and concise for the balloon,
+        but never shorten by deleting story information. Length strategy: \(qualityOptions.lengthMode.rawValue).
+        Project style guide: \(qualityOptions.styleGuide.isEmpty ? "No additional style guide." : qualityOptions.styleGuide)
+        Authoritative terminology:
+        \(glossaryJSON)
+        Source regions:
+        \(regionsJSON)
+        Drafts:
+        \(draftsJSON)
+        Return only the complete corrected JSON array in the same shape as the drafts. Keep every UUID.
+        """
+    }
+
+    private static func qualityFlags(
+        region: DialogueRegion,
+        glossaryTerms: [ResolvedGlossaryTerm],
+        lengthMode: TranslationLengthMode
+    ) -> Set<TranslationQAFlag> {
+        var flags: Set<TranslationQAFlag> = []
+        let translated = region.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if translated.isEmpty { flags.insert(.missingTranslation) }
+        if let confidence = region.translationConfidence, confidence < 0.65 {
+            flags.insert(.modelUncertain)
+        }
+        for term in glossaryTerms where region.sourceText.localizedCaseInsensitiveContains(term.sourceTerm) {
+            if !translated.localizedCaseInsensitiveContains(term.preferredTranslation) {
+                flags.insert(.glossaryMismatch)
+            }
+        }
+        if numberTokens(in: region.sourceText) != numberTokens(in: translated) {
+            flags.insert(.numberMismatch)
+        }
+        let threshold: Double = switch lengthMode {
+        case .faithful: 2.4
+        case .balanced: 1.8
+        case .compact: 1.35
+        }
+        if Double(translated.count) > Double(max(1, region.sourceText.count)) * threshold {
+            flags.insert(.excessiveLength)
+        }
+        return flags
+    }
+
+    private static func numberTokens(in text: String) -> [String] {
+        guard let expression = try? NSRegularExpression(pattern: #"\d+(?:[.,]\d+)*"#) else {
+            return []
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.matches(in: text, range: range).compactMap { match in
+            Range(match.range, in: text).map { String(text[$0]) }
+        }
+    }
+
+    private static func characterLimit(sourceText: String, mode: TranslationLengthMode) -> Int {
+        let multiplier: Double = switch mode {
+        case .faithful: 2.0
+        case .balanced: 1.55
+        case .compact: 1.2
+        }
+        return max(8, Int((Double(max(1, sourceText.count)) * multiplier).rounded(.up)))
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    private static func json<T: Encodable>(_ value: T) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return String(decoding: try encoder.encode(value), as: UTF8.self)
     }
 }
 

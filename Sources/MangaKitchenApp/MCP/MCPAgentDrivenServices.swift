@@ -39,6 +39,8 @@ struct AgentDrivenTranslator: RegionTranslating {
         pageURL: URL,
         targetLanguageCode: String,
         glossaryTerms: [ResolvedGlossaryTerm],
+        readingDirection: ReadingDirection,
+        qualityOptions: TranslationQualityOptions,
         regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {

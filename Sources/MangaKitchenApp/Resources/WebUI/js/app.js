@@ -17,6 +17,7 @@ let selectedMaskRegionID = null;
 let selectedTranslationRegionID = null;
 let pendingRegionSelectionID = null;
 let regionContextTarget = null;
+let pageContextTarget = null;
 let calculationDialogState = null;
 let calculationElapsedTimer = null;
 let dismissedModelLoadingFailureID = null;
@@ -33,12 +34,14 @@ let regionUpdatesSuspended = false;
 let translationDrag = null;
 let translationResize = null;
 const canvasViewport = { pageID: null, scale: 1, x: 0, y: 0, drag: null };
+const canvasBaseSizes = new WeakMap();
 const colorSchemeStorageKey = "mangakitchen.color-scheme";
 const inspectorTabStorageKey = "mangakitchen.inspector-tab";
 
 const elements = {
   projectSelector: document.querySelector("#project-selector"),
   deleteProject: document.querySelector("#delete-project"),
+  appendPages: document.querySelector("#append-pages"),
   pageList: document.querySelector("#page-list"),
   pageCount: document.querySelector("#page-count"),
   pageSearch: document.querySelector("#page-search"),
@@ -61,6 +64,8 @@ const elements = {
   maskUndo: document.querySelector("#mask-undo"),
   maskRedo: document.querySelector("#mask-redo"),
   translationPrimaryTools: document.querySelector("#translation-primary-tools"),
+  translationUndo: document.querySelector("#translation-undo"),
+  translationRedo: document.querySelector("#translation-redo"),
   translationFontDecrease: document.querySelector("#translation-font-decrease"),
   translationFontIncrease: document.querySelector("#translation-font-increase"),
   translationFontRegular: document.querySelector("#translation-font-regular"),
@@ -72,15 +77,26 @@ const elements = {
   translationLayer: document.querySelector("#translation-layer"),
   resultPreviewCaption: document.querySelector("#result-preview-caption"),
   outputPlaceholder: document.querySelector("#output-placeholder"),
+  exportPSD: document.querySelector("#export-psd"),
   regionList: document.querySelector("#region-list"),
   regionCount: document.querySelector("#region-count"),
   regionAdd: document.querySelector("#add-text-region"),
   regionContextMenu: document.querySelector("#region-context-menu"),
   regionContextDuplicate: document.querySelector("#region-context-duplicate"),
   regionContextDelete: document.querySelector("#region-context-delete"),
+  pageContextMenu: document.querySelector("#page-context-menu"),
+  pageContextRename: document.querySelector("#page-context-rename"),
+  pageContextUp: document.querySelector("#page-context-up"),
+  pageContextDown: document.querySelector("#page-context-down"),
+  pageContextDelete: document.querySelector("#page-context-delete"),
+  pageRenameDialog: document.querySelector("#page-rename-dialog"),
+  pageRenameInput: document.querySelector("#page-rename-input"),
   batchList: document.querySelector("#batch-list"),
   progress: document.querySelector("#page-progress"),
   status: document.querySelector("#status"),
+  canvasInfo: document.querySelector("#canvas-info"),
+  canvasResolution: document.querySelector("#canvas-resolution"),
+  canvasZoom: document.querySelector("#canvas-zoom"),
   projectPath: document.querySelector("#project-path"),
   selectionSummary: document.querySelector("#selection-summary"),
   settingsDialog: document.querySelector("#settings-dialog"),
@@ -114,7 +130,6 @@ const elements = {
   dataDirectoryRestartNote: document.querySelector("#data-directory-restart-note"),
   settingsImageToTextModel: document.querySelector("#settings-image-to-text-model"),
   settingsImageToTextModelVariant: document.querySelector("#settings-image-to-text-model-variant"),
-  fineScan: document.querySelector("#fine-scan"),
   settingsImageToTextModelDownload: document.querySelector("#download-image-to-text-model"),
   settingsImageToTextModelClear: document.querySelector("#clear-image-to-text-model"),
   settingsImageToTextModelDelete: document.querySelector("#delete-image-to-text-model"),
@@ -122,6 +137,15 @@ const elements = {
   settingsImageToTextModelDownloadProgressBar: document.querySelector("#image-to-text-model-download-progress-bar"),
   settingsImageToTextModelDownloadStatus: document.querySelector("#image-to-text-model-download-status"),
   settingsImageToImageModel: document.querySelector("#settings-image-to-image-model"),
+  settingsAutomaticSuperResolution: document.querySelector("#settings-automatic-super-resolution"),
+  settingsSuperResolutionModel: document.querySelector("#settings-super-resolution-model"),
+  settingsSuperResolutionModelVariant: document.querySelector("#settings-super-resolution-model-variant"),
+  settingsSuperResolutionModelDownload: document.querySelector("#download-super-resolution-model"),
+  settingsSuperResolutionModelClear: document.querySelector("#clear-super-resolution-model"),
+  settingsSuperResolutionModelDelete: document.querySelector("#delete-super-resolution-model"),
+  settingsSuperResolutionModelDownloadProgress: document.querySelector("#super-resolution-model-download-progress"),
+  settingsSuperResolutionModelDownloadProgressBar: document.querySelector("#super-resolution-model-download-progress-bar"),
+  settingsSuperResolutionModelDownloadStatus: document.querySelector("#super-resolution-model-download-status"),
   settingsMCPEnabled: document.querySelector("#settings-mcp-enabled"),
   settingsMCPEndpointRow: document.querySelector("#settings-mcp-endpoint-row"),
   settingsMCPEndpoint: document.querySelector("#settings-mcp-endpoint"),
@@ -133,6 +157,15 @@ const elements = {
   readingDirection: document.querySelector("#reading-direction"),
   writingDirection: document.querySelector("#writing-direction"),
   fontName: document.querySelector("#font-name"),
+  fontNameTrigger: document.querySelector("#font-name-trigger"),
+  fontNameValue: document.querySelector("#font-name-value"),
+  fontNameList: document.querySelector("#font-name-list"),
+  translationPageContext: document.querySelector("#translation-page-context"),
+  translationReviewPass: document.querySelector("#translation-review-pass"),
+  translationQualityCheck: document.querySelector("#translation-quality-check"),
+  translationPreserveLiteral: document.querySelector("#translation-preserve-literal"),
+  translationLengthMode: document.querySelector("#translation-length-mode"),
+  translationStyleGuide: document.querySelector("#translation-style-guide"),
   useImageModel: document.querySelector("#use-image-model"),
   glossaryCount: document.querySelector("#glossary-count"),
   glossaryTargetLabel: document.querySelector("#glossary-target-label"),
@@ -142,6 +175,8 @@ const elements = {
   glossaryList: document.querySelector("#glossary-list"),
   cancel: document.querySelector("#cancel-processing"),
   reveal: document.querySelector("#reveal-output"),
+  superResolution: document.querySelector("#super-resolution"),
+  canvasPixelPreview: document.querySelector("#canvas-pixel-preview"),
   workflowNext: document.querySelector("#workflow-next"),
 };
 
@@ -192,6 +227,7 @@ const stageLabelKeys = {
   maskReady: "stageMaskReady",
   translating: "stageTranslating",
   translationReady: "stageTranslationReady",
+  superResolving: "stageSuperResolving",
   composing: "stageComposing",
   completed: "stageCompleted",
   failed: "stageFailed",
@@ -201,6 +237,7 @@ const operationLabelKeys = {
   rescan: "operationRescan",
   detectMasks: "operationDetectMasks",
   translate: "operationTranslate",
+  superResolve: "operationSuperResolve",
   compose: "operationCompose",
   fullPage: "operationFullPage",
 };
@@ -227,6 +264,7 @@ const processingActivityLabelKeys = {
   preparingTranslationPreview: "activityPreparingTranslationPreview",
   restoringBackground: "activityRestoringBackground",
   typesettingTranslation: "activityTypesettingTranslation",
+  superResolving: "activitySuperResolving",
   savingOutput: "activitySavingOutput",
 };
 
@@ -237,7 +275,7 @@ function activePage() {
 function workflowStepForPage(page) {
   if (!page) return "pages";
   if (["detectingText", "recognizing", "masking", "maskReady"].includes(page.stage)) return "mask";
-  if (["translating", "translationReady"].includes(page.stage)) return "translate";
+  if (["translating", "translationReady", "superResolving"].includes(page.stage)) return "translate";
   if (["composing", "restoringBackground", "typesetting", "completed"].includes(page.stage)) return "compose";
   return "pages";
 }
@@ -394,7 +432,7 @@ function stopRegionUpdateTimers() {
   for (const update of regionUpdateTimers.values()) clearTimeout(update.timer);
   regionUpdateTimers.clear();
   regionUpdatesSuspended = true;
-  for (const control of elements.regionList.querySelectorAll("textarea, select")) {
+  for (const control of elements.regionList.querySelectorAll("textarea, select, input, button")) {
     control.disabled = true;
   }
 }
@@ -441,11 +479,16 @@ function renderCalculationDialog() {
     : null;
   if (activityLabelKey) {
     const parameters = { title: currentPage.title };
-    const activityKey = currentPage.processingActivity === "translatingRegions"
-      && currentPage.processingRegionCount > 0
-      ? "activityTranslatingRegionProgress"
+    const regionProgressKeys = {
+      detectingRegions: "activityDetectingRegionProgress",
+      translatingRegions: "activityTranslatingRegionProgress",
+    };
+    const regionProgressKey = regionProgressKeys[currentPage.processingActivity];
+    const activityKey = regionProgressKey && currentPage.processingRegionCount > 0
+      ? regionProgressKey
       : activityLabelKey;
-    if (activityKey === "activityTranslatingRegionProgress") {
+    if (activityKey === "activityDetectingRegionProgress"
+        || activityKey === "activityTranslatingRegionProgress") {
       parameters.current = currentPage.processingRegionIndex ?? 0;
       parameters.total = currentPage.processingRegionCount;
     }
@@ -466,6 +509,9 @@ function renderCalculationDialog() {
 function calculationPageFraction(operation, page) {
   if (operation === "translate") {
     return Math.min(Math.max((page.progress - 0.25) / 0.4, 0), 1);
+  }
+  if (operation === "superResolve") {
+    return Math.min(Math.max((page.progress - 0.65) / 0.35, 0), 1);
   }
   return null;
 }
@@ -595,6 +641,19 @@ function showNotice(title, message, dismissLabel) {
   });
 }
 
+function requestPageName(page) {
+  elements.pageRenameInput.value = page.title;
+  elements.pageRenameDialog.returnValue = "cancel";
+  return new Promise((resolve) => {
+    elements.pageRenameDialog.addEventListener("close", () => {
+      const value = elements.pageRenameInput.value.trim();
+      resolve(elements.pageRenameDialog.returnValue === "confirm" && value ? value : null);
+    }, { once: true });
+    elements.pageRenameDialog.showModal();
+    elements.pageRenameInput.select();
+  });
+}
+
 async function deleteActiveProject() {
   const project = state.projects.find((item) => item.id === state.activeProjectID);
   if (!project || state.isProcessing || state.isSwitchingProject) return;
@@ -670,6 +729,59 @@ async function removeTextRegion(page, region, index) {
 function hideRegionContextMenu() {
   elements.regionContextMenu.hidden = true;
   regionContextTarget = null;
+}
+
+function hidePageContextMenu() {
+  elements.pageContextMenu.hidden = true;
+  pageContextTarget = null;
+}
+
+function currentPageContextTarget() {
+  return state?.pages.find((page) => page.id === pageContextTarget) ?? null;
+}
+
+function showPageContextMenu(event, page) {
+  event.preventDefault();
+  event.stopPropagation();
+  hideRegionContextMenu();
+  pageContextTarget = page.id;
+  const pageIndex = state.pages.findIndex((item) => item.id === page.id);
+  elements.pageContextUp.disabled = state.isProcessing || pageIndex <= 0;
+  elements.pageContextDown.disabled = state.isProcessing || pageIndex >= state.pages.length - 1;
+  elements.pageContextRename.disabled = state.isProcessing;
+  elements.pageContextDelete.disabled = state.isProcessing;
+  elements.pageContextMenu.hidden = false;
+  const width = elements.pageContextMenu.offsetWidth;
+  const height = elements.pageContextMenu.offsetHeight;
+  elements.pageContextMenu.style.left = `${Math.max(8, Math.min(event.clientX, window.innerWidth - width - 8))}px`;
+  elements.pageContextMenu.style.top = `${Math.max(8, Math.min(event.clientY, window.innerHeight - height - 8))}px`;
+  elements.pageContextRename.focus();
+}
+
+async function renameContextPage() {
+  const page = currentPageContextTarget();
+  hidePageContextMenu();
+  if (!page) return;
+  const name = await requestPageName(page);
+  if (name && name !== page.title) await invoke("renamePage", { pageID: page.id, name });
+}
+
+async function moveContextPage(offset) {
+  const page = currentPageContextTarget();
+  hidePageContextMenu();
+  if (page) await invoke("movePage", { pageID: page.id, offset });
+}
+
+async function removeContextPage() {
+  const page = currentPageContextTarget();
+  hidePageContextMenu();
+  if (!page) return;
+  const confirmed = await requestConfirmation(
+    t("removePageTitle", { title: page.title }),
+    t("removePageConfirmation"),
+    t("removePage")
+  );
+  if (confirmed) await invoke("removePages", { pageIDs: [page.id] });
 }
 
 function currentRegionContextTarget() {
@@ -811,6 +923,7 @@ function renderPageTreeFile(container, record, visiblePages, selected) {
   item.className = "page-item";
   if (page.id === state.selectedPageID) item.classList.add("active");
   if (selected.has(page.id)) item.classList.add("selected");
+  item.addEventListener("contextmenu", (event) => showPageContextMenu(event, page));
 
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
@@ -961,7 +1074,11 @@ function renderModels() {
   }
   for (const model of state.loadedModels) {
     const item = document.createElement("li");
-    const capability = model.capability === "imageToText" ? t("imageToText") : t("imageToImage");
+    const capability = model.capability === "imageToText"
+      ? t("imageToText")
+      : model.capability === "superResolution"
+        ? t("superResolutionLoaded")
+        : t("imageToImage");
     item.textContent = `${capability} · ${model.displayName}`;
     elements.modelList.append(item);
   }
@@ -1003,9 +1120,41 @@ function renderRegions(page) {
       removeTextRegion(page, region, index).catch(showError);
     });
     remove.disabled = state.isProcessing;
+    const visibility = makeIconButton(
+      region.style.isVisible === false ? "fa-eye-slash" : "fa-eye",
+      t(region.style.isVisible === false ? "showLayer" : "hideLayer"),
+      "quiet region-layer-button",
+      (event) => {
+        event.stopPropagation();
+        if (state.isProcessing) return;
+        const previous = region.style.isVisible !== false;
+        region.style.isVisible = !previous;
+        renderTranslationLayer(page);
+        renderRegions(page);
+        invoke("updateRegion", {
+          pageID: page.id,
+          regionID: region.id,
+          isVisible: !previous,
+        }).catch((error) => {
+          region.style.isVisible = previous;
+          renderPage();
+          showError(error);
+        });
+      }
+    );
+    const backward = makeIconButton("fa-arrow-down", t("sendLayerBackward"), "quiet region-layer-button", (event) => {
+      event.stopPropagation();
+      invoke("moveRegion", { pageID: page.id, regionID: region.id, offset: -1 }).catch(showError);
+    });
+    backward.disabled = state.isProcessing || index === 0;
+    const forward = makeIconButton("fa-arrow-up", t("bringLayerForward"), "quiet region-layer-button", (event) => {
+      event.stopPropagation();
+      invoke("moveRegion", { pageID: page.id, regionID: region.id, offset: 1 }).catch(showError);
+    });
+    forward.disabled = state.isProcessing || index === page.regions.length - 1;
     const metadata = document.createElement("div");
     metadata.className = "region-heading-meta";
-    metadata.append(confidence, remove);
+    metadata.append(confidence, backward, forward, visibility, remove);
     heading.append(label, metadata);
     heading.addEventListener("click", () => {
       if (activeWorkflowStep === "mask") {
@@ -1025,6 +1174,37 @@ function renderRegions(page) {
     editor.disabled = state.isProcessing || regionUpdatesSuspended;
     editor.setAttribute("aria-label", t("regionTranslationAria", { number: index + 1 }));
 
+    const translationMetadata = document.createElement("div");
+    translationMetadata.className = "translation-quality-metadata";
+    const metadataItems = [];
+    if (region.speakerID) metadataItems.push(`${t("translationSpeaker")}: ${region.speakerID}`);
+    if (region.tone) metadataItems.push(`${t("translationTone")}: ${region.tone}`);
+    if (Number.isFinite(region.translationConfidence)) {
+      metadataItems.push(`${t("translationConfidence")}: ${Math.round(region.translationConfidence * 100)}%`);
+    }
+    if (region.translationQAFlags?.length) {
+      metadataItems.push(`${t("translationQA")}: ${region.translationQAFlags.map((flag) => t(`translationQA_${flag}`)).join("、")}`);
+      translationMetadata.classList.toggle(
+        "has-warning",
+        region.translationQAFlags.some((flag) => flag !== "reviewAdjusted"),
+      );
+    }
+    if (region.literalTranslatedText) {
+      const literal = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = t("literalTranslation");
+      const text = document.createElement("p");
+      text.textContent = region.literalTranslatedText;
+      literal.append(summary, text);
+      translationMetadata.append(literal);
+    }
+    if (metadataItems.length) {
+      const summary = document.createElement("small");
+      summary.textContent = metadataItems.join(" · ");
+      translationMetadata.prepend(summary);
+    }
+    translationMetadata.hidden = !metadataItems.length && !region.literalTranslatedText;
+
     const direction = document.createElement("select");
     direction.disabled = state.isProcessing || regionUpdatesSuspended;
     for (const [value, labelKey] of [["automatic", "automaticTypesetting"], ["horizontal", "horizontal"], ["vertical", "vertical"]]) {
@@ -1035,8 +1215,79 @@ function renderRegions(page) {
       direction.append(option);
     }
 
+    const alignment = document.createElement("select");
+    for (const [value, labelKey] of [["start", "alignStart"], ["center", "alignCenter"], ["end", "alignEnd"]]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = t(labelKey);
+      option.selected = (region.style.textAlignment ?? "center") === value;
+      alignment.append(option);
+    }
+    const textColor = document.createElement("input");
+    textColor.type = "color";
+    textColor.value = region.style.textColorHex ?? "#111111";
+    const strokeColor = document.createElement("input");
+    strokeColor.type = "color";
+    strokeColor.value = region.style.strokeColorHex ?? "#FFFFFF";
+    const strokeWidth = document.createElement("input");
+    strokeWidth.type = "range";
+    strokeWidth.min = "0";
+    strokeWidth.max = "8";
+    strokeWidth.step = "0.25";
+    strokeWidth.value = String(region.style.strokeWidth ?? 0);
+    const opacity = document.createElement("input");
+    opacity.type = "range";
+    opacity.min = "0";
+    opacity.max = "100";
+    opacity.step = "1";
+    opacity.value = String(Math.round((region.style.opacity ?? 1) * 100));
+    const rotation = document.createElement("input");
+    rotation.type = "range";
+    rotation.min = "-180";
+    rotation.max = "180";
+    rotation.step = "1";
+    rotation.value = String(region.style.rotationDegrees ?? 0);
+
+    const styleControls = document.createElement("div");
+    styleControls.className = "region-style-controls";
+    styleControls.hidden = activeWorkflowStep !== "translate";
+    const makeStyleField = (labelKey, control, output = null) => {
+      const label = document.createElement("label");
+      const caption = document.createElement("span");
+      caption.textContent = t(labelKey);
+      label.append(caption, control);
+      if (output) label.append(output);
+      return label;
+    };
+    const strokeOutput = document.createElement("output");
+    strokeOutput.value = `${Number(strokeWidth.value).toFixed(2)} px`;
+    const opacityOutput = document.createElement("output");
+    opacityOutput.value = `${opacity.value}%`;
+    const rotationOutput = document.createElement("output");
+    rotationOutput.value = `${rotation.value}°`;
+    styleControls.append(
+      makeStyleField("textAlignment", alignment),
+      makeStyleField("textColor", textColor),
+      makeStyleField("strokeColor", strokeColor),
+      makeStyleField("strokeWidth", strokeWidth, strokeOutput),
+      makeStyleField("layerOpacity", opacity, opacityOutput),
+      makeStyleField("layerRotation", rotation, rotationOutput),
+    );
+
     const scheduleUpdate = () => {
       if (state.isProcessing || regionUpdatesSuspended) return;
+      region.translatedText = editor.value;
+      region.style.writingDirection = direction.value;
+      region.style.textAlignment = alignment.value;
+      region.style.textColorHex = textColor.value;
+      region.style.strokeColorHex = strokeColor.value;
+      region.style.strokeWidth = Number(strokeWidth.value);
+      region.style.opacity = Number(opacity.value) / 100;
+      region.style.rotationDegrees = Number(rotation.value);
+      strokeOutput.value = `${Number(strokeWidth.value).toFixed(2)} px`;
+      opacityOutput.value = `${opacity.value}%`;
+      rotationOutput.value = `${rotation.value}°`;
+      renderTranslationLayer(page);
       const timerKey = `${page.id}:${region.id}`;
       clearTimeout(regionUpdateTimers.get(timerKey)?.timer);
       const commit = () => invoke("updateRegion", {
@@ -1044,6 +1295,12 @@ function renderRegions(page) {
         regionID: region.id,
         translatedText: editor.value,
         writingDirection: direction.value,
+        textAlignment: alignment.value,
+        textColorHex: textColor.value,
+        strokeColorHex: strokeColor.value,
+        strokeWidth: Number(strokeWidth.value),
+        opacity: Number(opacity.value) / 100,
+        rotationDegrees: Number(rotation.value),
       });
       const timer = setTimeout(() => {
         if (regionUpdateTimers.get(timerKey)?.timer !== timer) return;
@@ -1059,10 +1316,16 @@ function renderRegions(page) {
     };
     editor.addEventListener("input", scheduleUpdate);
     direction.addEventListener("change", scheduleUpdate);
+    alignment.addEventListener("change", scheduleUpdate);
+    textColor.addEventListener("input", scheduleUpdate);
+    strokeColor.addEventListener("input", scheduleUpdate);
+    strokeWidth.addEventListener("input", scheduleUpdate);
+    opacity.addEventListener("input", scheduleUpdate);
+    rotation.addEventListener("input", scheduleUpdate);
     const controls = document.createElement("div");
     controls.className = "region-controls";
     controls.append(direction);
-    row.append(heading, source, editor, controls);
+    row.append(heading, source, editor, translationMetadata, controls, styleControls);
     elements.regionList.append(row);
   }
 
@@ -1374,42 +1637,131 @@ function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
-function canvasStackForStage(stage) {
-  return stage === elements.sourceImageStage
-    ? elements.sourceImageStack
-    : elements.outputPreviewStack;
+function canvasScaleForPage(page) {
+  const scale = Number(page?.superResolutionScale);
+  return page?.superResolutionApplied && Number.isFinite(scale) ? Math.max(1, scale) : 1;
 }
 
-function clampCanvasPan(stage) {
-  let stack = canvasStackForStage(stage);
-  // 兩個 stage 共用同一組 viewport，但輸出預覽在還沒合成前是 hidden 的，
-  // offsetWidth 為 0 會讓可平移範圍算成 0、位移被夾死 —— 畫面明明是放大的
-  // 卻拖不動。沒有版面尺寸時改用另一個看得見的 stack 當基準。
-  if (!stack?.offsetWidth || !stack?.offsetHeight) {
-    const fallback = stack === elements.sourceImageStack
-      ? elements.outputPreviewStack
-      : elements.sourceImageStack;
-    if (fallback?.offsetWidth && fallback?.offsetHeight) stack = fallback;
+function resetCanvasStackLayout(stack, image) {
+  canvasBaseSizes.delete(stack);
+  stack.style.removeProperty("width");
+  stack.style.removeProperty("height");
+  stack.style.removeProperty("max-width");
+  stack.dataset.canvasScale = "1";
+  image.style.removeProperty("width");
+  image.style.removeProperty("height");
+  image.style.removeProperty("max-width");
+  image.style.removeProperty("max-height");
+}
+
+function applyCanvasStackLayout(stack, image) {
+  if (!stack || !image?.naturalWidth || !image?.naturalHeight || stack.hidden) return;
+  let baseSize = canvasBaseSizes.get(stack);
+  if (!baseSize) {
+    const appliedScale = Math.max(0.0001, Number(stack.dataset.canvasScale) || 1);
+    baseSize = {
+      width: Math.max(1, stack.offsetWidth / appliedScale),
+      height: Math.max(1, stack.offsetHeight / appliedScale),
+    };
+    canvasBaseSizes.set(stack, baseSize);
   }
-  if (!stack?.offsetWidth || !stack?.offsetHeight || canvasViewport.scale <= 1) {
+  const width = baseSize.width * canvasViewport.scale;
+  const height = baseSize.height * canvasViewport.scale;
+  stack.style.maxWidth = "none";
+  stack.style.width = `${width}px`;
+  stack.style.height = `${height}px`;
+  stack.dataset.canvasScale = String(canvasViewport.scale);
+  image.style.width = `${width}px`;
+  image.style.height = `${height}px`;
+  image.style.maxWidth = "none";
+  image.style.maxHeight = "none";
+}
+
+function clampCanvasPan() {
+  const canvases = [
+    { stage: elements.sourceImageStage, stack: elements.sourceImageStack },
+    { stage: elements.outputImageStage, stack: elements.outputPreviewStack },
+  ].filter(({ stage, stack }) => !stack.hidden
+    && stack.offsetWidth
+    && stack.offsetHeight
+    && stage.clientWidth
+    && stage.clientHeight);
+  if (!canvases.length || canvasViewport.scale <= 1) {
     canvasViewport.x = 0;
     canvasViewport.y = 0;
     return;
   }
-  const maximumX = Math.max(0, (stack.offsetWidth * canvasViewport.scale - stage.clientWidth) / 2);
-  const maximumY = Math.max(0, (stack.offsetHeight * canvasViewport.scale - stage.clientHeight) / 2);
-  canvasViewport.x = clamp(canvasViewport.x, -maximumX, maximumX);
-  canvasViewport.y = clamp(canvasViewport.y, -maximumY, maximumY);
+  const ranges = canvases.map(({ stage, stack }) => {
+    const stageRect = stage.getBoundingClientRect();
+    const stackRect = stack.getBoundingClientRect();
+    const viewportLeft = stageRect.left + stage.clientLeft;
+    const viewportTop = stageRect.top + stage.clientTop;
+    const viewportRight = viewportLeft + stage.clientWidth;
+    const viewportBottom = viewportTop + stage.clientHeight;
+    const unshiftedLeft = stackRect.left - canvasViewport.x;
+    const unshiftedTop = stackRect.top - canvasViewport.y;
+    const unshiftedRight = unshiftedLeft + stackRect.width;
+    const unshiftedBottom = unshiftedTop + stackRect.height;
+    return {
+      minimumX: stackRect.width > stage.clientWidth
+        ? viewportRight - unshiftedRight
+        : 0,
+      maximumX: stackRect.width > stage.clientWidth
+        ? viewportLeft - unshiftedLeft
+        : 0,
+      minimumY: stackRect.height > stage.clientHeight
+        ? viewportBottom - unshiftedBottom
+        : 0,
+      maximumY: stackRect.height > stage.clientHeight
+        ? viewportTop - unshiftedTop
+        : 0,
+    };
+  });
+  const minimumX = Math.max(...ranges.map((range) => range.minimumX));
+  const maximumX = Math.min(...ranges.map((range) => range.maximumX));
+  const minimumY = Math.max(...ranges.map((range) => range.minimumY));
+  const maximumY = Math.min(...ranges.map((range) => range.maximumY));
+  canvasViewport.x = minimumX <= maximumX
+    ? clamp(canvasViewport.x, minimumX, maximumX)
+    : (minimumX + maximumX) / 2;
+  canvasViewport.y = minimumY <= maximumY
+    ? clamp(canvasViewport.y, minimumY, maximumY)
+    : (minimumY + maximumY) / 2;
+}
+
+function applyCanvasTransform() {
+  const transform = `translate3d(${canvasViewport.x}px, ${canvasViewport.y}px, 0)`;
+  elements.sourceImageStack.style.transform = transform;
+  elements.outputPreviewStack.style.transform = transform;
 }
 
 function applyCanvasViewport() {
-  const transform = `translate3d(${canvasViewport.x}px, ${canvasViewport.y}px, 0) scale(${canvasViewport.scale})`;
-  elements.sourceImageStack.style.transform = transform;
-  elements.outputPreviewStack.style.transform = transform;
+  applyCanvasStackLayout(elements.sourceImageStack, elements.sourcePreview);
+  applyCanvasStackLayout(elements.outputPreviewStack, elements.outputPreview);
+  applyCanvasTransform();
+  clampCanvasPan();
+  applyCanvasTransform();
   for (const stage of [elements.sourceImageStage, elements.outputImageStage]) {
     stage.classList.toggle("canvas-pannable", canvasViewport.scale > 1);
     stage.classList.toggle("canvas-panning", canvasViewport.drag?.stage === stage);
   }
+  renderCanvasInfo(activePage());
+}
+
+function renderCanvasInfo(page) {
+  if (!page) {
+    elements.canvasInfo.hidden = true;
+    return;
+  }
+  elements.canvasInfo.hidden = false;
+  const resolutionScale = canvasScaleForPage(page);
+  const outputWidth = page.superResolutionPixelWidth
+    ?? Math.round(page.pixelWidth * resolutionScale);
+  const outputHeight = page.superResolutionPixelHeight
+    ?? Math.round(page.pixelHeight * resolutionScale);
+  const resolutionMarker = page.superResolutionApplied ? " *" : "";
+  elements.canvasResolution.textContent = `${t("imageResolution")}: ${outputWidth} × ${outputHeight}${resolutionMarker}`;
+  elements.canvasZoom.textContent = `${t("canvasZoom")}: ${canvasViewport.scale.toFixed(2)}×`;
 }
 
 function resetCanvasViewport(pageID) {
@@ -1424,19 +1776,66 @@ function resetCanvasViewport(pageID) {
 function zoomCanvas(event) {
   if (!activePage()) return;
   event.preventDefault();
+  const canvases = [
+    { stage: elements.sourceImageStage, stack: elements.sourceImageStack },
+    { stage: elements.outputImageStage, stack: elements.outputPreviewStack },
+  ];
+  const canvas = canvases.find(({ stage, stack }) => stage === event.currentTarget
+    && !stack.hidden
+    && stack.offsetWidth
+    && stack.offsetHeight)
+    ?? canvases.find(({ stack }) => !stack.hidden && stack.offsetWidth && stack.offsetHeight);
+  if (!canvas) return;
+  const { stage, stack } = canvas;
+  const stageRect = stage.getBoundingClientRect();
+  const stackRect = stack.getBoundingClientRect();
+  const viewportCenterX = stageRect.left + stage.clientLeft + stage.clientWidth / 2;
+  const viewportCenterY = stageRect.top + stage.clientTop + stage.clientHeight / 2;
+  const anchorX = stackRect.width > 0
+    ? clamp((viewportCenterX - stackRect.left) / stackRect.width, 0, 1)
+    : 0.5;
+  const anchorY = stackRect.height > 0
+    ? clamp((viewportCenterY - stackRect.top) / stackRect.height, 0, 1)
+    : 0.5;
   const previous = canvasViewport.scale;
-  let next = clamp(previous * Math.exp(-event.deltaY * 0.0015), 0.5, 4);
+  const previousX = canvasViewport.x;
+  const previousY = canvasViewport.y;
+  let next = clamp(previous * Math.exp(-event.deltaY * 0.0015), 0.5, 12);
   if (Math.abs(next - 1) < 0.025) next = 1;
   canvasViewport.scale = next;
   if (next <= 1) {
     canvasViewport.x = 0;
     canvasViewport.y = 0;
   } else {
-    canvasViewport.x *= next / previous;
-    canvasViewport.y *= next / previous;
-    clampCanvasPan(event.currentTarget);
+    applyCanvasStackLayout(elements.sourceImageStack, elements.sourcePreview);
+    applyCanvasStackLayout(elements.outputPreviewStack, elements.outputPreview);
+    const resizedRect = stack.getBoundingClientRect();
+    const unshiftedLeft = resizedRect.left - previousX;
+    const unshiftedTop = resizedRect.top - previousY;
+    canvasViewport.x = viewportCenterX - unshiftedLeft - anchorX * resizedRect.width;
+    canvasViewport.y = viewportCenterY - unshiftedTop - anchorY * resizedRect.height;
   }
   applyCanvasViewport();
+  renderTranslationLayer(activePage());
+}
+
+function showNativePixelPreview() {
+  const page = activePage();
+  if (!page) return;
+  const image = page.superResolutionApplied && !elements.outputPreview.hidden
+    ? elements.outputPreview
+    : elements.sourcePreview;
+  const renderedWidth = image.getBoundingClientRect().width / Math.max(canvasViewport.scale, 0.0001);
+  const renderedHeight = image.getBoundingClientRect().height / Math.max(canvasViewport.scale, 0.0001);
+  if (!image.naturalWidth || !image.naturalHeight || renderedWidth <= 0 || renderedHeight <= 0) return;
+  canvasViewport.scale = clamp(Math.min(
+    image.naturalWidth / renderedWidth,
+    image.naturalHeight / renderedHeight,
+  ), 0.5, 12);
+  canvasViewport.x = 0;
+  canvasViewport.y = 0;
+  applyCanvasViewport();
+  renderTranslationLayer(page);
 }
 
 function beginCanvasPan(event) {
@@ -1462,7 +1861,6 @@ function continueCanvasPan(event) {
   if (!drag || drag.pointerID !== event.pointerId || drag.stage !== event.currentTarget) return;
   canvasViewport.x = drag.originX + event.clientX - drag.startX;
   canvasViewport.y = drag.originY + event.clientY - drag.startY;
-  clampCanvasPan(drag.stage);
   applyCanvasViewport();
   event.preventDefault();
 }
@@ -1612,10 +2010,10 @@ function updateTranslationElementBounds(element, bounds) {
   element.style.height = `${Math.max(0.01, bounds.height) * 100}%`;
 }
 
-function fitAutomaticTranslationText(element, page, region) {
+function fitAutomaticTranslationText(element, page, region, resolutionScale = canvasScaleForPage(page)) {
   if (region.style.fontSize != null || !element.clientWidth || !element.clientHeight) return;
-  let lower = Math.max(3, region.style.minimumFontSize ?? 4);
-  let upper = Math.max(lower, region.style.maximumFontSize ?? 40);
+  let lower = Math.max(3, region.style.minimumFontSize ?? 4) * resolutionScale;
+  let upper = Math.max(lower, region.style.maximumFontSize ?? 40) * resolutionScale;
   for (let index = 0; index < 10; index += 1) {
     const candidate = (lower + upper) / 2;
     element.style.fontSize = `${candidate}px`;
@@ -1797,21 +2195,24 @@ function renderTranslationLayer(page) {
   renderTranslationFontTools(page);
   const visible = activeWorkflowStep === "translate"
     && !elements.outputPreviewStack.hidden
-    && page.regions.some((region) => region.translatedText.trim());
+    && page.regions.some((region) => region.style.isVisible !== false && region.translatedText.trim());
   elements.translationLayer.hidden = !visible;
   if (!visible) return;
 
   const displayWidth = elements.outputPreview.clientWidth;
   const displayHeight = elements.outputPreview.clientHeight;
-  const scaleX = displayWidth > 0 ? displayWidth / Math.max(1, page.pixelWidth) : 1;
-  const scaleY = displayHeight > 0 ? displayHeight / Math.max(1, page.pixelHeight) : scaleX;
-  elements.translationLayer.style.width = `${page.pixelWidth}px`;
-  elements.translationLayer.style.height = `${page.pixelHeight}px`;
+  const resolutionScale = canvasScaleForPage(page);
+  const logicalWidth = Math.max(1, page.pixelWidth * resolutionScale);
+  const logicalHeight = Math.max(1, page.pixelHeight * resolutionScale);
+  const scaleX = displayWidth > 0 ? displayWidth / logicalWidth : 1;
+  const scaleY = displayHeight > 0 ? displayHeight / logicalHeight : scaleX;
+  elements.translationLayer.style.width = `${logicalWidth}px`;
+  elements.translationLayer.style.height = `${logicalHeight}px`;
   elements.translationLayer.style.transformOrigin = "top left";
   elements.translationLayer.style.transform = `scale(${scaleX}, ${scaleY})`;
 
   for (const [index, region] of page.regions.entries()) {
-    if (!region.translatedText.trim()) continue;
+    if (region.style.isVisible === false || !region.translatedText.trim()) continue;
     const direction = resolvedTranslationDirection(region);
     const bounds = translationLayoutBounds(region);
     const text = document.createElement("div");
@@ -1821,9 +2222,19 @@ function renderTranslationLayer(page) {
     text.textContent = region.translatedText;
     text.title = t("dragTranslationText", { number: index + 1 });
     text.style.fontFamily = region.style.fontName;
-    text.style.fontSize = `${translationSourceFontSize(page, region)}px`;
+    text.style.fontSize = `${translationSourceFontSize(page, region) * resolutionScale}px`;
     text.style.fontWeight = region.style.fontWeight === "bold" ? "700" : "400";
     text.style.color = region.style.textColorHex;
+    text.style.textAlign = region.style.textAlignment ?? "center";
+    text.style.justifyContent = {
+      start: "flex-start",
+      end: "flex-end",
+      center: "center",
+    }[region.style.textAlignment ?? "center"];
+    text.style.webkitTextStroke = `${Math.max(0, region.style.strokeWidth ?? 0) * resolutionScale}px ${region.style.strokeColorHex ?? "#FFFFFF"}`;
+    text.style.paintOrder = "stroke fill";
+    text.style.opacity = String(clamp(region.style.opacity ?? 1, 0, 1));
+    text.style.transform = `translate(-50%, -50%) rotate(${region.style.rotationDegrees ?? 0}deg)`;
     updateTranslationElementBounds(text, bounds);
     updateTranslationElementPosition(text, translationAnchor(region));
     text.addEventListener("pointerdown", (event) => beginTranslationDrag(event, page, region, text));
@@ -1838,6 +2249,12 @@ function renderTranslationLayer(page) {
     resizeHandle.addEventListener("pointermove", continueTranslationResize);
     resizeHandle.addEventListener("pointerup", (event) => finishTranslationResize(event));
     resizeHandle.addEventListener("pointercancel", (event) => finishTranslationResize(event, true));
+    const interactionScale = Math.max(0.0001, Math.min(Math.abs(scaleX), Math.abs(scaleY)));
+    const handleSize = 14 / interactionScale;
+    resizeHandle.style.width = `${handleSize}px`;
+    resizeHandle.style.height = `${handleSize}px`;
+    resizeHandle.style.borderWidth = `${1 / interactionScale}px`;
+    resizeHandle.style.borderRadius = `${2 / interactionScale}px`;
     text.append(resizeHandle);
     elements.translationLayer.append(text);
     fitAutomaticTranslationText(text, page, region);
@@ -1846,6 +2263,7 @@ function renderTranslationLayer(page) {
 
 function showOutputPreview(source, alt) {
   if (elements.outputPreview.dataset.source !== source) {
+    resetCanvasStackLayout(elements.outputPreviewStack, elements.outputPreview);
     elements.outputPreview.dataset.source = source;
     elements.outputPreview.src = source;
   }
@@ -1866,6 +2284,7 @@ function renderPage() {
   const page = activePage();
   syncWorkflowStep(page);
   const hasProject = Boolean(state.activeProjectID);
+  elements.appendPages.disabled = !hasProject || state.isProcessing || state.isSwitchingProject;
   elements.emptyState.hidden = hasProject && Boolean(page);
   elements.workspace.hidden = !page;
   const outputStepActive = activeWorkflowStep === "compose";
@@ -1884,10 +2303,28 @@ function renderPage() {
   elements.reveal.disabled = outputStepActive
     ? !page?.outputPreviewURL
     : !page || state.isProcessing || !hasImageToTextModel;
+  elements.exportPSD.hidden = !outputStepActive;
+  elements.exportPSD.disabled = !outputStepActive || !page || state.isProcessing
+    || !Boolean(page.outputPreviewURL || page.translationPreviewURL || page.maskAppliedPreviewURL);
+  const hasSuperResolutionModel = state.loadedModels.some(
+    (model) => model.capability === "superResolution"
+  );
+  elements.superResolution.hidden = !page || activeWorkflowStep !== "translate";
+  elements.superResolution.disabled = !page?.maskAppliedPreviewURL
+    || state.isProcessing
+    || Boolean(page?.superResolutionApplied);
+  elements.superResolution.title = page?.superResolutionApplied
+    ? t("superResolutionApplied")
+    : hasSuperResolutionModel
+      ? t("superResolution")
+      : t("superResolutionModelRequired");
+  elements.superResolution.setAttribute("aria-label", elements.superResolution.title);
+  elements.canvasPixelPreview.disabled = !page || state.isProcessing;
   elements.workflowNext.hidden = !page || outputStepActive;
   elements.workflowNext.disabled = !page || state.isProcessing;
   elements.progress.value = page?.progress ?? 0;
   elements.projectPath.textContent = state.sourceDirectoryPath ?? "";
+  renderCanvasInfo(page);
   if (!page) {
     hideOutputPreview();
     renderMaskEditor(null);
@@ -1902,6 +2339,7 @@ function renderPage() {
   }
 
   if (elements.sourcePreview.dataset.source !== page.sourcePreviewURL) {
+    resetCanvasStackLayout(elements.sourceImageStack, elements.sourcePreview);
     elements.sourcePreview.dataset.source = page.sourcePreviewURL;
     elements.sourcePreview.src = page.sourcePreviewURL;
   }
@@ -1917,6 +2355,12 @@ function renderPage() {
     showOutputPreview(
       `${page.maskAppliedPreviewURL}?updated=${page.maskRevision ?? "current"}`,
       t("maskedComicPage")
+    );
+  } else if (activeWorkflowStep === "translate" && page.superResolvedBackgroundPreviewURL) {
+    elements.resultPreviewCaption.textContent = t("translationResult");
+    showOutputPreview(
+      page.superResolvedBackgroundPreviewURL,
+      t("translationPreview")
     );
   } else if (activeWorkflowStep === "translate" && page.maskAppliedPreviewURL) {
     elements.resultPreviewCaption.textContent = t("translationResult");
@@ -1948,8 +2392,8 @@ function renderPage() {
       : t("noOutputYet");
   }
   elements.outputPlaceholder.classList.toggle("processing", outputPending);
-  renderTranslationLayer(page);
   applyCanvasViewport();
+  renderTranslationLayer(page);
   renderRegions(page);
 }
 
@@ -1969,16 +2413,63 @@ function renderSettings() {
       const option = document.createElement("option");
       option.value = fontName;
       option.textContent = fontName;
+      option.style.fontFamily = fontName;
+      return option;
+    }));
+    elements.fontNameList.replaceChildren(...availableFonts.map((fontName) => {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "font-preview-option";
+      option.dataset.fontName = fontName;
+      option.setAttribute("role", "option");
+      const name = document.createElement("span");
+      name.className = "font-preview-name";
+      name.textContent = fontName;
+      name.style.fontFamily = fontName;
+      const sample = document.createElement("span");
+      sample.className = "font-preview-sample";
+      sample.textContent = "Aa 字 あ";
+      sample.style.fontFamily = fontName;
+      option.append(name, sample);
+      option.addEventListener("click", () => {
+        elements.fontName.value = fontName;
+        closeFontPreviewList();
+        elements.fontName.dispatchEvent(new Event("change", { bubbles: true }));
+      });
       return option;
     }));
     elements.fontName.dataset.optionsSignature = fontOptionsSignature;
   }
   elements.fontName.value = selectedFont;
+  elements.fontName.style.fontFamily = selectedFont;
+  elements.fontNameValue.textContent = selectedFont;
+  elements.fontNameValue.style.fontFamily = selectedFont;
+  for (const option of elements.fontNameList.querySelectorAll(".font-preview-option")) {
+    option.setAttribute("aria-selected", String(option.dataset.fontName === selectedFont));
+  }
+  const quality = options.translationQuality ?? {};
+  elements.translationPageContext.checked = quality.usePageContext ?? true;
+  elements.translationReviewPass.checked = quality.reviewPassEnabled ?? true;
+  elements.translationQualityCheck.checked = quality.qualityCheckEnabled ?? true;
+  elements.translationPreserveLiteral.checked = quality.preserveLiteralTranslation ?? true;
+  elements.translationLengthMode.value = quality.lengthMode ?? "balanced";
+  if (document.activeElement !== elements.translationStyleGuide) {
+    elements.translationStyleGuide.value = quality.styleGuide ?? "";
+  }
   elements.useImageModel.checked = false;
   elements.useImageModel.disabled = true;
-  elements.fineScan.checked = Boolean(options.fineScanEnabled);
-  elements.fineScan.disabled = !state.activeProjectID;
-  for (const control of [elements.targetLanguage, elements.readingDirection, elements.writingDirection, elements.fontName]) {
+  for (const control of [
+    elements.targetLanguage,
+    elements.readingDirection,
+    elements.writingDirection,
+    elements.fontName,
+    elements.translationPageContext,
+    elements.translationReviewPass,
+    elements.translationQualityCheck,
+    elements.translationPreserveLiteral,
+    elements.translationLengthMode,
+    elements.translationStyleGuide,
+  ]) {
     control.disabled = !state.activeProjectID;
   }
 }
@@ -1994,6 +2485,10 @@ function globalSettingsPayload(overrides = {}) {
     imageToTextModelDownloadDirectoryPath: current.imageToTextModelDownloadDirectoryPath,
     imageToTextModelVariant: current.imageToTextModelVariant,
     imageToImageModelPath: current.imageToImageModelPath,
+    automaticSuperResolutionEnabled: current.automaticSuperResolutionEnabled,
+    superResolutionModelPath: current.superResolutionModelPath,
+    superResolutionModelDownloadDirectoryPath: current.superResolutionModelDownloadDirectoryPath,
+    superResolutionModelVariant: current.superResolutionModelVariant,
     mcpEnabled: current.mcpEnabled,
     mcpPort: current.mcpPort,
     mcpAllowedClients: current.mcpAllowedClients,
@@ -2116,6 +2611,67 @@ function renderGlobalSettings() {
       : t("modelDownloadProgress", { progress });
   }
   elements.settingsImageToImageModel.value = settings.imageToImageModelPath ?? "";
+  elements.settingsAutomaticSuperResolution.checked = settings.automaticSuperResolutionEnabled;
+  elements.settingsSuperResolutionModel.value = settings.superResolutionModelDownloadDirectoryPath ?? "";
+  const superResolutionOptions = settings.superResolutionModelOptions ?? [];
+  const superResolutionSignature = superResolutionOptions.map((model) => [
+    model.id,
+    model.displayName,
+    model.recommended,
+    model.installed,
+    t("recommended"),
+    t("modelDownloaded"),
+  ].join(":")).join("\n");
+  if (elements.settingsSuperResolutionModelVariant.dataset.optionsSignature !== superResolutionSignature) {
+    elements.settingsSuperResolutionModelVariant.replaceChildren(...superResolutionOptions.map((model) => {
+      const option = document.createElement("option");
+      option.value = model.id;
+      const annotations = [];
+      if (model.recommended) annotations.push(t("recommended"));
+      if (model.installed) annotations.push(t("modelDownloaded"));
+      option.textContent = annotations.length > 0
+        ? `${model.displayName}（${annotations.join(" · ")}）`
+        : model.displayName;
+      return option;
+    }));
+    elements.settingsSuperResolutionModelVariant.dataset.optionsSignature = superResolutionSignature;
+  }
+  elements.settingsSuperResolutionModelVariant.value = settings.superResolutionModelVariant;
+  const superResolutionDownload = settings.modelDownloadState?.capability === "superResolution"
+    ? settings.modelDownloadState
+    : null;
+  const superResolutionDownloading = Boolean(superResolutionDownload);
+  const superResolutionDirectorySelected = Boolean(settings.superResolutionModelDownloadDirectoryPath);
+  elements.settingsAutomaticSuperResolution.disabled = !settings.superResolutionModelInstalled;
+  elements.settingsSuperResolutionModelDownload.disabled = !superResolutionDirectorySelected
+    || settings.superResolutionModelInstalled
+    || superResolutionDownloading;
+  elements.settingsSuperResolutionModelDownload.textContent = settings.superResolutionModelInstalled
+    ? t("modelInstalled")
+    : superResolutionDownloading ? t("downloadingModel") : t("downloadModel");
+  elements.settingsSuperResolutionModelVariant.disabled = superResolutionDownloading;
+  elements.settingsSuperResolutionModelClear.disabled = !superResolutionDownloading
+    && !settings.superResolutionModelDownloadDirectoryPath
+    && !settings.superResolutionModelPath;
+  elements.settingsSuperResolutionModelClear.textContent = superResolutionDownloading
+    ? t("stopDownload") : t("clear");
+  elements.settingsSuperResolutionModelClear.classList.toggle("danger-text", superResolutionDownloading);
+  elements.settingsSuperResolutionModelDelete.hidden = !settings.superResolutionModelInstalled;
+  elements.settingsSuperResolutionModelDelete.disabled = superResolutionDownloading || state.isProcessing;
+  elements.settingsSuperResolutionModelDownloadProgress.hidden = !superResolutionDownloading;
+  if (superResolutionDownload) {
+    const progress = Math.round(superResolutionDownload.progress * 100);
+    elements.settingsSuperResolutionModelDownloadProgressBar.value = superResolutionDownload.progress;
+    elements.settingsSuperResolutionModelDownloadStatus.textContent = superResolutionDownload.totalByteCount > 0
+      ? t("modelDownloadProgressDetail", {
+          progress,
+          downloaded: formatByteCount(superResolutionDownload.downloadedByteCount),
+          total: formatByteCount(superResolutionDownload.totalByteCount),
+          speed: superResolutionDownload.bytesPerSecond > 0
+            ? formatByteCount(superResolutionDownload.bytesPerSecond) : "—",
+        })
+      : t("modelDownloadProgress", { progress });
+  }
   elements.settingsMCPEnabled.checked = settings.mcpEnabled;
   elements.settingsMCPEndpointRow.hidden = !settings.mcpEnabled;
   elements.settingsMCPEndpoint.value = settings.mcpEndpointURL ?? "";
@@ -2363,17 +2919,70 @@ async function choosePreferenceDirectory(method, overrides) {
   await updateGlobalSettings(overrides.value(result.path));
 }
 
-elements.fineScan?.addEventListener("change", () => updateSettings());
-
 function updateSettings() {
+  const previousDefaultFont = state?.options.defaultStyle.fontName;
+  const nextDefaultFont = elements.fontName.value;
+  const previousRegionFonts = [];
+  elements.fontName.style.fontFamily = elements.fontName.value;
+  elements.fontNameValue.textContent = elements.fontName.value;
+  elements.fontNameValue.style.fontFamily = elements.fontName.value;
+  if (state && previousDefaultFont !== nextDefaultFont) {
+    state.options.defaultStyle.fontName = nextDefaultFont;
+    for (const page of state.pages) {
+      for (const region of page.regions) {
+        if (region.style.fontName !== previousDefaultFont) continue;
+        previousRegionFonts.push([region, region.style.fontName]);
+        region.style.fontName = nextDefaultFont;
+      }
+    }
+    renderTranslationLayer(activePage());
+  }
   invoke("updateSettings", {
     targetLanguageCode: elements.targetLanguage.value,
     readingDirection: elements.readingDirection.value,
     writingDirection: elements.writingDirection.value,
     fontName: elements.fontName.value,
+    translationQuality: {
+      usePageContext: elements.translationPageContext.checked,
+      reviewPassEnabled: elements.translationReviewPass.checked,
+      qualityCheckEnabled: elements.translationQualityCheck.checked,
+      preserveLiteralTranslation: elements.translationPreserveLiteral.checked,
+      lengthMode: elements.translationLengthMode.value,
+      styleGuide: elements.translationStyleGuide.value,
+    },
     useImageToImageRestoration: false,
-    fineScanEnabled: elements.fineScan?.checked ?? false,
-  }).catch(showError);
+  }).catch((error) => {
+    if (state && previousDefaultFont !== nextDefaultFont) {
+      state.options.defaultStyle.fontName = previousDefaultFont;
+      for (const [region, fontName] of previousRegionFonts) region.style.fontName = fontName;
+      renderTranslationLayer(activePage());
+      renderSettings();
+    }
+    showError(error);
+  });
+}
+
+function closeFontPreviewList() {
+  elements.fontNameList.hidden = true;
+  elements.fontNameTrigger.setAttribute("aria-expanded", "false");
+}
+
+function openFontPreviewList() {
+  const bounds = elements.fontNameTrigger.getBoundingClientRect();
+  const spaceBelow = window.innerHeight - bounds.bottom - 10;
+  const spaceAbove = bounds.top - 10;
+  const opensAbove = spaceBelow < 220 && spaceAbove > spaceBelow;
+  const maximumHeight = Math.max(140, Math.min(360, opensAbove ? spaceAbove : spaceBelow));
+  elements.fontNameList.style.left = `${Math.max(8, Math.min(bounds.left, window.innerWidth - Math.max(260, bounds.width) - 8))}px`;
+  elements.fontNameList.style.width = `${Math.max(260, bounds.width)}px`;
+  elements.fontNameList.style.maxHeight = `${maximumHeight}px`;
+  elements.fontNameList.style.top = opensAbove
+    ? `${Math.max(8, bounds.top - maximumHeight - 4)}px`
+    : `${bounds.bottom + 4}px`;
+  elements.fontNameList.hidden = false;
+  elements.fontNameTrigger.setAttribute("aria-expanded", "true");
+  const selected = elements.fontNameList.querySelector('[aria-selected="true"]');
+  selected?.scrollIntoView({ block: "nearest" });
 }
 
 async function runBatch(operation, pageIDs, forceRecalculation = false) {
@@ -2419,10 +3028,28 @@ elements.outputPreview.addEventListener("error", () => {
   elements.outputPlaceholder.classList.remove("processing");
 });
 elements.outputPreview.addEventListener("load", () => {
-  renderTranslationLayer(activePage());
-  applyCanvasViewport();
+  resetCanvasStackLayout(elements.outputPreviewStack, elements.outputPreview);
+  requestAnimationFrame(() => {
+    applyCanvasViewport();
+    renderTranslationLayer(activePage());
+  });
 });
-elements.sourcePreview.addEventListener("load", applyCanvasViewport);
+elements.sourcePreview.addEventListener("load", () => {
+  resetCanvasStackLayout(elements.sourceImageStack, elements.sourcePreview);
+  requestAnimationFrame(() => {
+    applyCanvasViewport();
+    renderTranslationLayer(activePage());
+  });
+});
+
+window.addEventListener("resize", () => {
+  resetCanvasStackLayout(elements.sourceImageStack, elements.sourcePreview);
+  resetCanvasStackLayout(elements.outputPreviewStack, elements.outputPreview);
+  requestAnimationFrame(() => {
+    applyCanvasViewport();
+    renderTranslationLayer(activePage());
+  });
+});
 
 for (const stage of [elements.sourceImageStage, elements.outputImageStage]) {
   stage.addEventListener("wheel", zoomCanvas, { passive: false });
@@ -2502,7 +3129,17 @@ for (const [index, tab] of inspectorTabs.entries()) {
 }
 showInspectorTab(localStorage.getItem(inspectorTabStorageKey) ?? "project");
 document.querySelector("#empty-create-project").addEventListener("click", () => invoke("chooseSourceDirectory").catch(showError));
+elements.appendPages.addEventListener("click", () => invoke("appendPages").catch(showError));
 document.querySelector("#rescan-source").addEventListener("click", () => invoke("rescanSourceDirectory").catch(showError));
+document.querySelector("#export-psd").addEventListener("click", async () => {
+  try {
+    await flushPendingRegionUpdates();
+    const pageIDs = state?.selectedPageIDs?.length ? state.selectedPageIDs : (activePage() ? [activePage().id] : []);
+    await invoke("exportPSD", { pageIDs });
+  } catch (error) {
+    showError(error);
+  }
+});
 document.querySelector("#process-selected").addEventListener("click", () => {
   runBatchWithCalculationDialog("fullPage", state?.selectedPageIDs ?? []).catch(showError);
 });
@@ -2522,14 +3159,25 @@ elements.glossaryAdd.addEventListener("click", addGlossaryEntry);
 elements.regionAdd.addEventListener("click", () => addTextRegion().catch(showError));
 elements.regionContextDuplicate.addEventListener("click", () => duplicateContextRegion().catch(showError));
 elements.regionContextDelete.addEventListener("click", () => deleteContextRegion().catch(showError));
+elements.pageContextRename.addEventListener("click", () => renameContextPage().catch(showError));
+elements.pageContextUp.addEventListener("click", () => moveContextPage(-1).catch(showError));
+elements.pageContextDown.addEventListener("click", () => moveContextPage(1).catch(showError));
+elements.pageContextDelete.addEventListener("click", () => removeContextPage().catch(showError));
 document.addEventListener("pointerdown", (event) => {
   if (!elements.regionContextMenu.hidden && !elements.regionContextMenu.contains(event.target)) {
     hideRegionContextMenu();
   }
+  if (!elements.pageContextMenu.hidden && !elements.pageContextMenu.contains(event.target)) {
+    hidePageContextMenu();
+  }
 }, true);
-window.addEventListener("blur", hideRegionContextMenu);
+window.addEventListener("blur", () => {
+  hideRegionContextMenu();
+  hidePageContextMenu();
+});
 window.addEventListener("resize", () => {
   hideRegionContextMenu();
+  hidePageContextMenu();
   renderTranslationLayer(activePage());
 });
 document.querySelector("#select-visible").addEventListener("click", () => {
@@ -2553,6 +3201,24 @@ document.querySelector("#reveal-output").addEventListener("click", () => {
 elements.workflowNext.addEventListener("click", () => {
   advanceWorkflowStep().catch(showError);
 });
+elements.superResolution.addEventListener("click", () => {
+  const page = activePage();
+  if (!page) return;
+  const hasModel = state.loadedModels.some((model) => model.capability === "superResolution");
+  if (!hasModel) {
+    showNotice(
+      t("superResolutionModelRequiredTitle"),
+      t("superResolutionModelRequired"),
+      t("openSettings")
+    ).then(() => {
+      showSettingsPage("models");
+      elements.settingsDialog.showModal();
+    });
+    return;
+  }
+  runBatchWithCalculationDialog("superResolve", [page.id]).catch(showError);
+});
+elements.canvasPixelPreview.addEventListener("click", showNativePixelPreview);
 
 elements.maskBrush.addEventListener("click", () => {
   maskTool = "add";
@@ -2567,6 +3233,14 @@ elements.maskBrushSize.addEventListener("input", () => {
   updateMaskBrushCursor();
 });
 elements.translationFontDecrease.addEventListener("click", () => adjustSelectedTranslationFontSize(-1));
+elements.translationUndo.addEventListener("click", () => {
+  const page = activePage();
+  if (page) invoke("undoRegionEdit", { pageID: page.id }).catch(showError);
+});
+elements.translationRedo.addEventListener("click", () => {
+  const page = activePage();
+  if (page) invoke("redoRegionEdit", { pageID: page.id }).catch(showError);
+});
 elements.translationFontIncrease.addEventListener("click", () => adjustSelectedTranslationFontSize(1));
 elements.translationFontRegular.addEventListener("click", () => setSelectedTranslationFontWeight("regular"));
 elements.translationFontBold.addEventListener("click", () => setSelectedTranslationFontWeight("bold"));
@@ -2602,9 +3276,10 @@ elements.maskDrawingLayer.addEventListener("pointerup", (event) => finishMaskStr
 elements.maskDrawingLayer.addEventListener("pointercancel", (event) => finishMaskStroke(event, true));
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !elements.regionContextMenu.hidden) {
+  if (event.key === "Escape" && (!elements.regionContextMenu.hidden || !elements.pageContextMenu.hidden)) {
     event.preventDefault();
     hideRegionContextMenu();
+    hidePageContextMenu();
     return;
   }
   const target = event.target;
@@ -2612,6 +3287,13 @@ document.addEventListener("keydown", (event) => {
       || target instanceof HTMLTextAreaElement
       || target instanceof HTMLSelectElement
       || target?.isContentEditable) return;
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
+    const page = activePage();
+    if (!page || activeWorkflowStep !== "translate") return;
+    event.preventDefault();
+    invoke(event.shiftKey ? "redoRegionEdit" : "undoRegionEdit", { pageID: page.id }).catch(showError);
+    return;
+  }
   const delta = event.key === "+" || event.code === "NumpadAdd"
     ? 1
     : event.key === "-" || event.code === "NumpadSubtract"
@@ -2644,6 +3326,11 @@ elements.settingsImageCompositingBackend.addEventListener("change", () => {
 });
 elements.settingsMCPEnabled.addEventListener("change", () => {
   updateGlobalSettings({ mcpEnabled: elements.settingsMCPEnabled.checked });
+});
+elements.settingsAutomaticSuperResolution.addEventListener("change", () => {
+  updateGlobalSettings({
+    automaticSuperResolutionEnabled: elements.settingsAutomaticSuperResolution.checked,
+  });
 });
 elements.settingsMCPPort.addEventListener("change", () => {
   const port = Number(elements.settingsMCPPort.value);
@@ -2720,6 +3407,56 @@ document.querySelector("#choose-image-to-image-model").addEventListener("click",
 document.querySelector("#clear-image-to-image-model").addEventListener("click", () => {
   updateGlobalSettings({ imageToImageModelPath: null });
 });
+document.querySelector("#choose-super-resolution-model").addEventListener("click", () => {
+  invoke("chooseModelDownloadDirectory", { capability: "superResolution" })
+    .then((result) => {
+      if (!result?.path) return;
+      updateGlobalSettings({
+        superResolutionModelDownloadDirectoryPath: result.path,
+        superResolutionModelVariant: result.variant ?? state.globalSettings.superResolutionModelVariant,
+      });
+    })
+    .catch(showError);
+});
+elements.settingsSuperResolutionModelVariant.addEventListener("change", () => {
+  updateGlobalSettings({
+    superResolutionModelVariant: elements.settingsSuperResolutionModelVariant.value,
+  });
+});
+elements.settingsSuperResolutionModelDownload.addEventListener("click", () => {
+  invoke("downloadPreferredModel", {
+    capability: "superResolution",
+    variantID: elements.settingsSuperResolutionModelVariant.value,
+  }).catch(showError);
+});
+elements.settingsSuperResolutionModelClear.addEventListener("click", () => {
+  if (state.globalSettings.modelDownloadState?.capability === "superResolution") {
+    invoke("cancelModelDownload").catch(showError);
+    return;
+  }
+  updateGlobalSettings({
+    automaticSuperResolutionEnabled: false,
+    superResolutionModelPath: null,
+    superResolutionModelDownloadDirectoryPath: null,
+  });
+});
+elements.settingsSuperResolutionModelDelete.addEventListener("click", () => {
+  const settings = state.globalSettings;
+  if (!settings.superResolutionModelInstalled) return;
+  const modelName = elements.settingsSuperResolutionModelVariant.selectedOptions[0]?.textContent
+    ?? settings.superResolutionModelVariant;
+  requestConfirmation(
+    t("deleteInstalledModelTitle"),
+    t("deleteInstalledModelConfirmation", { name: modelName }),
+    t("delete")
+  ).then((confirmed) => {
+    if (!confirmed) return;
+    return invoke("deleteInstalledModel", {
+      capability: "superResolution",
+      variantID: settings.superResolutionModelVariant,
+    });
+  }).catch(showError);
+});
 function addMCPClient() {
   const client = elements.settingsMCPClient.value.trim().toLocaleLowerCase();
   if (!client) {
@@ -2749,9 +3486,58 @@ window.addEventListener("mangakitchen-language-change", () => {
   syncNativeInterfaceLanguage().catch(showError);
 });
 
-for (const control of [elements.targetLanguage, elements.readingDirection, elements.writingDirection, elements.fontName, elements.useImageModel]) {
+elements.fontNameTrigger.addEventListener("click", () => {
+  if (elements.fontNameList.hidden) openFontPreviewList();
+  else closeFontPreviewList();
+});
+elements.fontNameTrigger.addEventListener("keydown", (event) => {
+  if (["ArrowDown", "Enter", " "].includes(event.key)) {
+    event.preventDefault();
+    openFontPreviewList();
+    elements.fontNameList.querySelector('[aria-selected="true"]')?.focus();
+  }
+});
+elements.fontNameList.addEventListener("keydown", (event) => {
+  const options = [...elements.fontNameList.querySelectorAll(".font-preview-option")];
+  const index = options.indexOf(document.activeElement);
+  let destination = null;
+  if (event.key === "ArrowDown") destination = options[Math.min(options.length - 1, index + 1)];
+  if (event.key === "ArrowUp") destination = options[Math.max(0, index - 1)];
+  if (event.key === "Home") destination = options[0];
+  if (event.key === "End") destination = options.at(-1);
+  if (event.key === "Escape") {
+    closeFontPreviewList();
+    elements.fontNameTrigger.focus();
+    event.preventDefault();
+    return;
+  }
+  if (destination) {
+    destination.focus();
+    destination.scrollIntoView({ block: "nearest" });
+    event.preventDefault();
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (elements.fontNameList.hidden) return;
+  if (elements.fontNameList.contains(event.target) || elements.fontNameTrigger.contains(event.target)) return;
+  closeFontPreviewList();
+});
+
+for (const control of [
+  elements.targetLanguage,
+  elements.readingDirection,
+  elements.writingDirection,
+  elements.fontName,
+  elements.useImageModel,
+  elements.translationPageContext,
+  elements.translationReviewPass,
+  elements.translationQualityCheck,
+  elements.translationPreserveLiteral,
+  elements.translationLengthMode,
+]) {
   control.addEventListener("change", updateSettings);
 }
+elements.translationStyleGuide.addEventListener("change", updateSettings);
 
 applyColorScheme(colorSchemeSetting());
 applyTranslations();

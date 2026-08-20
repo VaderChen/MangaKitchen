@@ -26,11 +26,6 @@
         <button id="delete-project" class="quiet icon-button danger-text" data-i18n-title="deleteProject" data-i18n-aria-label="deleteProject" title="刪除專案" aria-label="刪除專案" disabled><i class="fa-solid fa-trash-can" aria-hidden="true"></i></button>
       </div>
       <div class="workflow-center">
-        <label id="fine-scan-toggle" class="fine-scan-toggle" data-i18n-title="fineScanHint" title="開啟後每頁會多出數次模型推論，速度慢很多">
-          <input id="fine-scan" type="checkbox" role="switch">
-          <span data-i18n="fineScan">精細掃描 (Beta)</span>
-          <small data-i18n="fineScanSlow">較慢</small>
-        </label>
         <div class="workflow-steps">
           <button class="workflow-step active" data-step="pages"><span>1</span><span class="step-label" data-i18n="pages">頁面</span></button>
           <button id="detect-selected" class="workflow-step" data-step="mask"><span>2</span><span class="step-label" data-i18n="mask">遮罩</span></button>
@@ -54,7 +49,10 @@
             <strong data-i18n="pages">頁面</strong>
             <small id="page-count">0 頁</small>
           </div>
-          <button id="rescan-source" class="quiet" data-i18n="rescan">重掃</button>
+          <div class="page-heading-actions">
+            <button id="append-pages" class="quiet" data-i18n="addPages">加入頁面</button>
+            <button id="rescan-source" class="quiet" data-i18n="rescan">重掃</button>
+          </div>
         </div>
 
         <div class="page-tools">
@@ -105,6 +103,8 @@
               </label>
             </div>
             <div id="translation-primary-tools" class="translation-primary-tools" role="toolbar" data-i18n-aria-label="translationFontTools" aria-label="翻譯文字字級工具" hidden>
+              <button id="translation-undo" type="button" class="secondary icon-button" title="復原文字區域修改（⌘Z）" aria-label="復原文字區域修改"><i class="fa-solid fa-rotate-left" aria-hidden="true"></i></button>
+              <button id="translation-redo" type="button" class="secondary icon-button" title="重做文字區域修改（⇧⌘Z）" aria-label="重做文字區域修改"><i class="fa-solid fa-rotate-right" aria-hidden="true"></i></button>
               <span data-i18n="translationFontSize">字級</span>
               <button id="translation-font-decrease" type="button" class="icon-button" data-i18n-title="decreaseTranslationFontSize" data-i18n-aria-label="decreaseTranslationFontSize" title="縮小翻譯文字（-）" aria-label="縮小翻譯文字（-）"><i class="fa-solid fa-minus" aria-hidden="true"></i></button>
               <output id="translation-font-size-value">—</output>
@@ -112,6 +112,10 @@
               <button id="translation-font-regular" type="button" class="icon-button translation-weight" data-i18n-title="regularTranslationFont" data-i18n-aria-label="regularTranslationFont" title="正常字重" aria-label="正常字重"><i class="fa-solid fa-font" aria-hidden="true"></i></button>
               <button id="translation-font-bold" type="button" class="icon-button translation-weight" data-i18n-title="boldTranslationFont" data-i18n-aria-label="boldTranslationFont" title="粗體" aria-label="粗體"><i class="fa-solid fa-bold" aria-hidden="true"></i></button>
             </div>
+            <div class="canvas-toolbar-spacer"></div>
+            <button id="canvas-pixel-preview" type="button" class="secondary" data-i18n-title="pixelPreview" data-i18n-aria-label="pixelPreview" title="以輸出原生像素檢視" aria-label="以輸出原生像素檢視" disabled>1:1</button>
+            <button id="super-resolution" type="button" class="secondary" data-i18n="superResolutionShort" data-i18n-title="superResolution" data-i18n-aria-label="superResolution" title="超高解析度" aria-label="超高解析度" hidden disabled><i class="fa-solid fa-expand" aria-hidden="true"></i> <span>超高解析度</span></button>
+            <button id="export-psd" class="secondary" data-i18n="exportPSD" disabled>輸出 PSD</button>
             <button id="reveal-output" class="secondary" disabled>重新計算</button>
             <button id="workflow-next" type="button" class="primary icon-button" data-i18n-title="nextWorkflowStep" data-i18n-aria-label="nextWorkflowStep" title="下一步" aria-label="下一步" disabled><i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
           </header>
@@ -186,11 +190,36 @@
               <option value="vertical" data-i18n="vertical">直排</option>
             </select>
           </label>
-          <label><span data-i18n="defaultFont">預設字型</span>
-            <select id="font-name">
-              <option value="PingFang TC">PingFang TC</option>
-            </select>
-          </label>
+          <div class="font-picker-field">
+            <span data-i18n="defaultFont">預設字型</span>
+            <div class="font-picker">
+              <button id="font-name-trigger" type="button" class="font-picker-trigger" aria-haspopup="listbox" aria-expanded="false" data-i18n-aria-label="defaultFont" aria-label="預設字型">
+                <span id="font-name-value">PingFang TC</span>
+                <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+              </button>
+              <div id="font-name-list" class="font-preview-list" role="listbox" hidden></div>
+              <select id="font-name" tabindex="-1" aria-hidden="true" hidden>
+                <option value="PingFang TC">PingFang TC</option>
+              </select>
+            </div>
+          </div>
+          <fieldset class="translation-quality-settings">
+            <legend data-i18n="translationQuality">翻譯品質</legend>
+            <label class="checkbox-label"><input id="translation-page-context" type="checkbox"> <span data-i18n="translationPageContext">使用整頁語境</span></label>
+            <label class="checkbox-label"><input id="translation-review-pass" type="checkbox"> <span data-i18n="translationReviewPass">執行二次校稿</span></label>
+            <label class="checkbox-label"><input id="translation-quality-check" type="checkbox"> <span data-i18n="translationQualityCheck">執行翻譯 QA</span></label>
+            <label class="checkbox-label"><input id="translation-preserve-literal" type="checkbox"> <span data-i18n="translationPreserveLiteral">保留直譯稿</span></label>
+            <label><span data-i18n="translationLengthMode">顯示譯文長度</span>
+              <select id="translation-length-mode">
+                <option value="faithful" data-i18n="translationLengthFaithful">忠實</option>
+                <option value="balanced" data-i18n="translationLengthBalanced">平衡</option>
+                <option value="compact" data-i18n="translationLengthCompact">精簡</option>
+              </select>
+            </label>
+            <label><span data-i18n="translationStyleGuide">翻譯風格指南</span>
+              <textarea id="translation-style-guide" maxlength="4000" rows="4" data-i18n-placeholder="translationStyleGuidePlaceholder" placeholder="例如：角色稱謂、語氣、禁用詞與標點規則"></textarea>
+            </label>
+          </fieldset>
           <label class="checkbox-label"><input id="use-image-model" type="checkbox" disabled> <span data-i18n="useImageModel">使用圖生圖修補</span></label>
         </section>
 
@@ -235,6 +264,11 @@
     <footer class="status-bar">
       <progress id="page-progress" value="0" max="1"></progress>
       <span id="status" data-i18n="initializing">初始化中…</span>
+      <span id="canvas-info" hidden>
+        <span id="canvas-resolution"></span>
+        <span class="status-info-divider" aria-hidden="true"></span>
+        <span id="canvas-zoom"></span>
+      </span>
       <span id="project-path"></span>
     </footer>
 
@@ -327,6 +361,39 @@
                   <small id="image-to-text-model-download-status"></small>
                 </div>
               </div>
+              <div class="settings-path-group">
+                <div class="settings-card-heading">
+                  <strong data-i18n="superResolutionModel">超解析模型</strong>
+                  <span data-i18n="npuPreferred">優先使用 NPU</span>
+                </div>
+                <label class="settings-switch-row">
+                  <span>
+                    <strong data-i18n="automaticSuperResolution">自動執行超解析</strong>
+                    <small data-i18n="automaticSuperResolutionHelp">步驟三背景修補後、HTML 排版前自動執行。</small>
+                  </span>
+                  <input id="settings-automatic-super-resolution" type="checkbox" role="switch">
+                </label>
+                <div class="settings-field">
+                  <label for="settings-super-resolution-model" data-i18n="superResolutionModel">超解析模型</label>
+                  <div class="settings-directory-row">
+                    <input id="settings-super-resolution-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+                    <button id="choose-super-resolution-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
+                  </div>
+                </div>
+                <label class="settings-field">
+                  <span data-i18n="modelVersion">模型版本</span>
+                  <select id="settings-super-resolution-model-variant"></select>
+                </label>
+                <div class="settings-actions">
+                  <button id="download-super-resolution-model" type="button" class="primary" data-i18n="downloadModel" disabled>下載</button>
+                  <button id="clear-super-resolution-model" type="button" class="quiet" data-i18n="clear">清除</button>
+                  <button id="delete-super-resolution-model" type="button" class="quiet danger-text" data-i18n="delete" hidden>刪除</button>
+                </div>
+                <div id="super-resolution-model-download-progress" class="model-download-progress" hidden>
+                  <progress id="super-resolution-model-download-progress-bar" value="0" max="1"></progress>
+                  <small id="super-resolution-model-download-status"></small>
+                </div>
+              </div>
               <div class="settings-path-group settings-card-disabled" aria-disabled="true">
                 <div class="settings-card-heading">
                   <strong data-i18n="imageToImageModel">圖生圖模型</strong>
@@ -386,7 +453,7 @@
             </section>
 
             <section class="settings-page settings-about" data-settings-page="about" hidden>
-              <div class="about-mark">M</div>
+              <img class="about-mark" src="./MangaKitchen-AppIcon.png" data-i18n-alt="appTitle" alt="漫畫廚房">
               <h3 data-i18n="appTitle">漫畫廚房</h3>
               <p><span data-i18n="version">版本</span> <span id="settings-app-version">0.1.0</span></p>
             </section>
@@ -403,6 +470,27 @@
       <button id="region-context-duplicate" type="button" role="menuitem" data-i18n="duplicate">複製</button>
       <button id="region-context-delete" type="button" role="menuitem" class="danger-text" data-i18n="delete">刪除</button>
     </div>
+
+    <div id="page-context-menu" class="popup-menu" role="menu" data-i18n-aria-label="pageActions" aria-label="頁面操作" hidden>
+      <button id="page-context-rename" type="button" role="menuitem" data-i18n="renamePage">重新命名</button>
+      <button id="page-context-up" type="button" role="menuitem" data-i18n="movePageUp">往上移</button>
+      <button id="page-context-down" type="button" role="menuitem" data-i18n="movePageDown">往下移</button>
+      <button id="page-context-delete" type="button" role="menuitem" class="danger-text" data-i18n="removePage">從專案移除</button>
+    </div>
+
+    <dialog id="page-rename-dialog" aria-labelledby="page-rename-title">
+      <form method="dialog" class="confirmation-dialog-shell">
+        <h2 id="page-rename-title" data-i18n="renamePage">重新命名</h2>
+        <label class="dialog-field">
+          <span data-i18n="pageName">頁面名稱</span>
+          <input id="page-rename-input" maxlength="200" required>
+        </label>
+        <div class="confirmation-dialog-actions">
+          <button type="submit" value="cancel" formnovalidate class="secondary" data-i18n="cancel">取消</button>
+          <button type="submit" value="confirm" class="primary" data-i18n="rename">重新命名</button>
+        </div>
+      </form>
+    </dialog>
 
     <dialog id="model-loading-dialog" aria-labelledby="model-loading-title" aria-describedby="model-loading-message">
       <div class="model-loading-dialog-shell">

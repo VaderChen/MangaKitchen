@@ -17,9 +17,11 @@ public struct WorkspaceSnapshot: Codable, Hashable, Sendable {
     public var modelDirectories: [URL]
     public var sourceDirectoryURL: URL?
     public var outputDirectoryURL: URL?
+    /// 使用者從專案移除、但不刪除來源檔案的相對路徑。
+    public var excludedSourceRelativePaths: Set<String>
 
     public init(
-        schemaVersion: Int = 3,
+        schemaVersion: Int = 4,
         projectID: UUID = UUID(),
         name: String,
         createdAt: Date = Date(),
@@ -31,7 +33,8 @@ public struct WorkspaceSnapshot: Codable, Hashable, Sendable {
         selectedPageIDs: Set<UUID> = [],
         modelDirectories: [URL],
         sourceDirectoryURL: URL? = nil,
-        outputDirectoryURL: URL? = nil
+        outputDirectoryURL: URL? = nil,
+        excludedSourceRelativePaths: Set<String> = []
     ) {
         self.schemaVersion = schemaVersion
         self.projectID = projectID
@@ -46,6 +49,7 @@ public struct WorkspaceSnapshot: Codable, Hashable, Sendable {
         self.modelDirectories = modelDirectories
         self.sourceDirectoryURL = sourceDirectoryURL
         self.outputDirectoryURL = outputDirectoryURL
+        self.excludedSourceRelativePaths = excludedSourceRelativePaths
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -62,6 +66,7 @@ public struct WorkspaceSnapshot: Codable, Hashable, Sendable {
         case modelDirectories
         case sourceDirectoryURL
         case outputDirectoryURL
+        case excludedSourceRelativePaths
     }
 
     /// schema 1 沒有專案識別與複選欄位，讀入時自動補齊供遷移使用。
@@ -80,6 +85,10 @@ public struct WorkspaceSnapshot: Codable, Hashable, Sendable {
         modelDirectories = try values.decodeIfPresent([URL].self, forKey: .modelDirectories) ?? []
         sourceDirectoryURL = try values.decodeIfPresent(URL.self, forKey: .sourceDirectoryURL)
         outputDirectoryURL = try values.decodeIfPresent(URL.self, forKey: .outputDirectoryURL)
+        excludedSourceRelativePaths = try values.decodeIfPresent(
+            Set<String>.self,
+            forKey: .excludedSourceRelativePaths
+        ) ?? []
         projectID = try values.decodeIfPresent(UUID.self, forKey: .projectID) ?? UUID()
         name = try values.decodeIfPresent(String.self, forKey: .name)
             ?? sourceDirectoryURL?.lastPathComponent
@@ -118,6 +127,7 @@ public struct ComicProjectSummary: Identifiable, Codable, Hashable, Sendable {
 public enum BatchOperation: String, Codable, CaseIterable, Hashable, Sendable {
     case detectMasks
     case translate
+    case superResolve
     case compose
     case fullPage
 }

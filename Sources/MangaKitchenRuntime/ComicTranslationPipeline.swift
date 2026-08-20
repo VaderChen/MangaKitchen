@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import MangaKitchenCore
 
 public actor ComicTranslationPipeline {
@@ -9,6 +10,7 @@ public actor ComicTranslationPipeline {
     private let maskGenerator: any DialogueMaskGenerating
     private let backgroundRestorer: any PageBackgroundRestoring
     private let typesetter: any DialogueTypesetting
+    private let superResolver: (any ImageSuperResolving)?
     private let outputRoot: URL
 
     public init(
@@ -19,7 +21,8 @@ public actor ComicTranslationPipeline {
         maskGenerator: any DialogueMaskGenerating,
         backgroundRestorer: any PageBackgroundRestoring,
         typesetter: any DialogueTypesetting,
-        outputRoot: URL
+        outputRoot: URL,
+        superResolver: (any ImageSuperResolving)? = nil
     ) {
         self.regionDetector = regionDetector
         self.textRecognizer = textRecognizer
@@ -28,6 +31,7 @@ public actor ComicTranslationPipeline {
         self.maskGenerator = maskGenerator
         self.backgroundRestorer = backgroundRestorer
         self.typesetter = typesetter
+        self.superResolver = superResolver
         self.outputRoot = outputRoot
     }
 
@@ -214,12 +218,13 @@ public actor ComicTranslationPipeline {
         if let textRecognizer {
             activity(.preparingTextModel)
             progress(.translating, 0)
+            activity(.detectingRegions)
             recognizedRegions = try await textRecognizer.recognizeRegions(
                 pageURL: page.sourceURL,
                 regions: regions,
-                sourceLanguageCodes: options.sourceLanguageCodes
+                sourceLanguageCodes: options.sourceLanguageCodes,
+                regionProgress: regionProgress
             ) { value in
-                if value > 0 { activity(.detectingRegions) }
                 progress(.translating, min(max(value, 0), 1) * 0.4)
             }
         } else {
@@ -228,8 +233,6 @@ public actor ComicTranslationPipeline {
         let translatableRegions = recognizedRegions.filter {
             !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
-        let regionCount = translatableRegions.count
-        regionProgress(0, regionCount)
         guard !translatableRegions.isEmpty else {
             progress(.translationReady, 1)
             return recognizedRegions
@@ -242,17 +245,18 @@ public actor ComicTranslationPipeline {
         )
         activity(.preparingTextModel)
         progress(.translating, textRecognizer == nil ? 0 : 0.4)
+        activity(.translatingRegions)
         let translatedCandidates = try await translator.translate(
             regions: translatableRegions,
             pageURL: page.sourceURL,
             targetLanguageCode: targetLanguageCode,
             glossaryTerms: glossaryTerms,
+            readingDirection: options.readingDirection,
+            qualityOptions: options.translationQuality,
             regionProgress: regionProgress
         ) { value in
-            if value > 0 { activity(.translatingRegions) }
             progress(.translating, 0.4 + min(max(value, 0), 1) * 0.6)
         }
-        regionProgress(regionCount, regionCount)
         progress(.translationReady, 1)
         let translatedByID = translatedCandidates.reduce(into: [UUID: DialogueRegion]()) { result, region in
             result[region.id] = region
@@ -267,8 +271,11 @@ public actor ComicTranslationPipeline {
         options: ProcessingOptions,
         outputURL requestedOutputURL: URL? = nil,
         existingMaskURL: URL? = nil,
+        existingSuperResolvedBackgroundURL: URL? = nil,
+        useSuperResolution: Bool = false,
         activity: @escaping PagePipelineActivity = { _ in },
-        progress: @escaping PagePipelineProgress
+        progress: @escaping PagePipelineProgress,
+        superResolutionProgress: @escaping InferenceProgress = { _ in }
     ) async throws -> PageCompositionResult {
         try Task.checkCancellation()
         let urls = try artifactURLs(for: page)
@@ -322,11 +329,44 @@ public actor ComicTranslationPipeline {
             progress(.composing, 0.12 + value * 0.68)
         }
 
+        var superResolvedBackgroundURL: URL?
+        var typesettingBackgroundURL = urls.background
+        var enhancementWarnings: [String] = []
+        if useSuperResolution, let superResolver {
+            if let cachedURL = existingSuperResolvedBackgroundURL,
+               cachedURL.lastPathComponent == urls.superResolvedBackground.lastPathComponent,
+               FileManager.default.fileExists(atPath: cachedURL.path) {
+                superResolvedBackgroundURL = cachedURL
+                typesettingBackgroundURL = cachedURL
+            } else {
+                activity(.superResolving)
+                do {
+                    try await superResolver.superResolve(
+                        inputURL: urls.background,
+                        outputURL: urls.superResolvedBackground,
+                        progress: superResolutionProgress
+                    )
+                    superResolvedBackgroundURL = urls.superResolvedBackground
+                    typesettingBackgroundURL = urls.superResolvedBackground
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    enhancementWarnings.append(
+                        "超解析失敗，已使用原尺寸背景繼續排版：\(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+
         activity(.typesettingTranslation)
+        let renderScale = superResolvedBackgroundURL.flatMap {
+            Self.renderScale(page: page, imageURL: $0)
+        } ?? 1
         try await typesetter.typeset(
-            backgroundURL: urls.background,
+            backgroundURL: typesettingBackgroundURL,
             regions: renderedRegions,
-            outputURL: outputURL
+            outputURL: outputURL,
+            renderScale: renderScale
         )
         progress(.composing, 1)
 
@@ -334,8 +374,9 @@ public actor ComicTranslationPipeline {
             regions: prepared.regions,
             maskURL: maskURL,
             backgroundURL: urls.background,
+            superResolvedBackgroundURL: superResolvedBackgroundURL,
             outputURL: outputURL,
-            warnings: prepared.warnings + restorationWarnings
+            warnings: prepared.warnings + restorationWarnings + enhancementWarnings
         )
     }
 
@@ -379,22 +420,63 @@ public actor ComicTranslationPipeline {
     public func rerender(
         backgroundURL: URL,
         regions: [DialogueRegion],
-        outputURL: URL
+        outputURL: URL,
+        renderScale: Double = 1
     ) async throws {
         try await typesetter.typeset(
             backgroundURL: backgroundURL,
             regions: regions,
-            outputURL: outputURL
+            outputURL: outputURL,
+            renderScale: renderScale
         )
     }
 
-    private func artifactURLs(for page: ComicPage) throws -> (mask: URL, background: URL, output: URL) {
+    public func superResolve(
+        page: ComicPage,
+        inputURL: URL,
+        progress: @escaping InferenceProgress
+    ) async throws -> URL {
+        guard let superResolver else {
+            throw ModelRuntimeError.capabilityNotLoaded(.superResolution)
+        }
+        let urls = try artifactURLs(for: page)
+        try await superResolver.superResolve(
+            inputURL: inputURL,
+            outputURL: urls.superResolvedBackground,
+            progress: progress
+        )
+        return urls.superResolvedBackground
+    }
+
+    private func artifactURLs(for page: ComicPage) throws -> (
+        mask: URL,
+        background: URL,
+        superResolvedBackground: URL,
+        output: URL
+    ) {
         let pageDirectory = outputRoot.appendingPathComponent(page.id.uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: pageDirectory, withIntermediateDirectories: true)
         return (
             pageDirectory.appendingPathComponent("dialogue-mask.png"),
             pageDirectory.appendingPathComponent("background.png"),
+            pageDirectory.appendingPathComponent("background-sr.png"),
             pageDirectory.appendingPathComponent("translated.png")
+        )
+    }
+
+    private static func renderScale(page: ComicPage, imageURL: URL) -> Double? {
+        guard let source = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+            return nil
+        }
+        return max(
+            1,
+            min(
+                Double(width) / Double(max(1, page.pixelWidth)),
+                Double(height) / Double(max(1, page.pixelHeight))
+            )
         )
     }
 }

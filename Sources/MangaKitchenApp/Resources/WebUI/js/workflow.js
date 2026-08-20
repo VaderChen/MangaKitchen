@@ -18,12 +18,17 @@ export const workflow = Object.freeze({
     invoke("choosePreferredModelDirectory", { capability }),
   createProject: () => invoke("chooseSourceDirectory"),
   chooseSourceDirectory: () => invoke("chooseSourceDirectory"),
+  appendPages: () => invoke("appendPages"),
   switchProject: (projectID) => invoke("switchProject", { projectID }),
   deleteProject: (projectID) => invoke("deleteProject", { projectID }),
   renameProject: (name) => invoke("renameProject", { name }),
   rescanSourceDirectory: () => invoke("rescanSourceDirectory"),
   resetPages: (pageIDs) => invoke("resetPages", { pageIDs }),
+  renamePage: (pageID, name) => invoke("renamePage", { pageID, name }),
+  movePage: (pageID, offset) => invoke("movePage", { pageID, offset }),
+  removePages: (pageIDs) => invoke("removePages", { pageIDs }),
   chooseOutputDirectory: () => invoke("chooseOutputDirectory"),
+  exportPSD: (pageIDs) => invoke("exportPSD", { pageIDs }),
   chooseModel: () => invoke("chooseModel"),
 
   runBatch: (operation, pageIDs, forceRecalculation = false) =>
@@ -32,6 +37,7 @@ export const workflow = Object.freeze({
     invoke(scope === "all" ? "detectMasksAll" : "detectMasksSelected"),
   translate: (scope = "selected") =>
     invoke(scope === "all" ? "translateAll" : "translateSelected"),
+  superResolve: () => invoke("superResolveSelected"),
   compose: (scope = "selected") =>
     invoke(scope === "all" ? "composeAll" : "composeSelected"),
   runFullPage: (scope = "selected") =>
@@ -56,8 +62,12 @@ export const workflow = Object.freeze({
     invoke("undoMaskStroke", { pageID, regionID }),
   redoMaskStroke: (pageID, regionID) =>
     invoke("redoMaskStroke", { pageID, regionID }),
+  undoRegionEdit: (pageID) => invoke("undoRegionEdit", { pageID }),
+  redoRegionEdit: (pageID) => invoke("redoRegionEdit", { pageID }),
   removeRegion: (pageID, regionID) =>
     invoke("removeRegion", { pageID, regionID }),
+  moveRegion: (pageID, regionID, offset) =>
+    invoke("moveRegion", { pageID, regionID, offset }),
   updateRegion: (pageID, regionID, changes) =>
     invoke("updateRegion", { pageID, regionID, ...changes }),
   updateSettings: (changes) => invoke("updateSettings", changes),

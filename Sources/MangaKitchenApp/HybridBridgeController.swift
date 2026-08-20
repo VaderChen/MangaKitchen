@@ -119,6 +119,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "importPages", "chooseSourceDirectory":
             chooseSourceDirectory()
             return nil
+        case "appendPages":
+            chooseAdditionalPages()
+            return nil
+        case "exportPSD":
+            try exportPSD(params)
+            return nil
         case "switchProject":
             guard let projectID = uuid(params["projectID"]) else {
                 throw BridgeError.invalidParameters
@@ -147,6 +153,28 @@ final class HybridBridgeController: NSObject, ObservableObject {
             let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
             guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
             store.resetPages(pageIDs)
+            return nil
+        case "renamePage":
+            guard let pageID = uuid(params["pageID"]),
+                  let name = params["name"] as? String else {
+                throw BridgeError.invalidParameters
+            }
+            store.renamePage(pageID: pageID, name: name)
+            return nil
+        case "movePage":
+            guard let pageID = uuid(params["pageID"]),
+                  let offset = (params["offset"] as? NSNumber)?.intValue else {
+                throw BridgeError.invalidParameters
+            }
+            store.movePage(pageID: pageID, offset: offset)
+            return nil
+        case "removePages":
+            guard let rawPageIDs = params["pageIDs"] as? [String] else {
+                throw BridgeError.invalidParameters
+            }
+            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
+            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
+            store.removePages(pageIDs)
             return nil
         case "chooseOutputDirectory":
             return chooseOutputDirectory()
@@ -206,6 +234,9 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "composeSelected":
             store.composeSelectedPage()
             return nil
+        case "superResolveSelected":
+            store.superResolveSelectedPage()
+            return nil
         case "processAll":
             store.processAllPages()
             return nil
@@ -252,8 +283,24 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "redoMaskStroke":
             try redoMaskStroke(params)
             return nil
+        case "undoRegionEdit":
+            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
+            store.undoRegionEdit(pageID: pageID)
+            return nil
+        case "redoRegionEdit":
+            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
+            store.redoRegionEdit(pageID: pageID)
+            return nil
         case "removeRegion":
             try removeRegion(params)
+            return nil
+        case "moveRegion":
+            guard let pageID = uuid(params["pageID"]),
+                  let regionID = uuid(params["regionID"]),
+                  let offset = (params["offset"] as? NSNumber)?.intValue else {
+                throw BridgeError.invalidParameters
+            }
+            store.moveRegion(pageID: pageID, regionID: regionID, offset: offset)
             return nil
         case "updateRegion":
             try updateRegion(params)
@@ -273,11 +320,35 @@ final class HybridBridgeController: NSObject, ObservableObject {
         let panel = NSOpenPanel()
         panel.title = localized("sourcePanelTitle")
         panel.prompt = localized("createProject")
-        panel.allowsMultipleSelection = false
-        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
         panel.canChooseDirectories = true
+        guard panel.runModal() == .OK else { return }
+        store.importPages(from: panel.urls)
+    }
+
+    private func chooseAdditionalPages() {
+        let panel = NSOpenPanel()
+        panel.title = localized("additionalPagesPanelTitle")
+        panel.prompt = localized("addPages")
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        guard panel.runModal() == .OK else { return }
+        store.appendPages(from: panel.urls)
+    }
+
+    private func exportPSD(_ params: [String: Any]) throws {
+        let pageIDs = (params["pageIDs"] as? [String])?.compactMap(UUID.init(uuidString:)) ?? Array(store.selectedPageIDs)
+        guard !pageIDs.isEmpty else { throw BridgeError.invalidParameters }
+        let panel = NSOpenPanel()
+        panel.title = "選擇 PSD 輸出資料夾"
+        panel.canCreateDirectories = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        store.openProject(from: url)
+        store.exportPSD(pageIDs: pageIDs, to: url)
     }
 
     private func chooseOutputDirectory() -> [String: Any]? {
@@ -324,9 +395,13 @@ final class HybridBridgeController: NSObject, ObservableObject {
             throw BridgeError.invalidParameters
         }
         guard let selected = chooseDirectory(
-            title: localized(capability == .imageToText
-                ? "imageToTextModelPanelTitle"
-                : "imageToImageModelPanelTitle"),
+            title: localized(
+                capability == .imageToText
+                    ? "imageToTextModelPanelTitle"
+                    : capability == .superResolution
+                        ? "superResolutionModelPanelTitle"
+                        : "imageToImageModelPanelTitle"
+            ),
             prompt: localized("choose")
         ), let path = selected["path"] as? String else { return nil }
         let manifest = try ModelManifest.load(from: URL(fileURLWithPath: path))
@@ -339,18 +414,20 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private func chooseModelDownloadDirectory(_ params: [String: Any]) throws -> [String: Any]? {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
-              capability == .imageToText else {
+              capability == .imageToText || capability == .superResolution else {
             throw BridgeError.invalidParameters
         }
         guard let selected = chooseDirectory(
-            title: localized("imageToTextModelDownloadDirectoryPanelTitle"),
+            title: localized(capability == .imageToText
+                ? "imageToTextModelDownloadDirectoryPanelTitle"
+                : "superResolutionModelDownloadDirectoryPanelTitle"),
             prompt: localized("choose")
         ), let path = selected["path"] as? String else { return nil }
         let selectedURL = URL(fileURLWithPath: path).standardizedFileURL
         if let model = DownloadableModelCatalog.model(
             matching: selectedURL,
             capability: capability
-        ), DownloadableModelCatalog.isCompleteModelDirectory(selectedURL) {
+        ), DownloadableModelCatalog.isCompleteModelDirectory(selectedURL, model: model) {
             return [
                 "path": selectedURL.deletingLastPathComponent().path,
                 "variant": model.id,
@@ -362,10 +439,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private func downloadPreferredModel(_ params: [String: Any]) throws {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
-              capability == .imageToText,
+              capability == .imageToText || capability == .superResolution,
               let variantID = params["variantID"] as? String,
               let model = DownloadableModelCatalog.model(id: variantID, capability: capability),
-              let directoryPath = preferences.settings.imageToTextModelDownloadDirectoryPath else {
+              let directoryPath = capability == .imageToText
+                ? preferences.settings.imageToTextModelDownloadDirectoryPath
+                : preferences.settings.superResolutionModelDownloadDirectoryPath else {
             throw BridgeError.invalidParameters
         }
         let storageDirectoryURL = URL(fileURLWithPath: directoryPath).standardizedFileURL
@@ -373,15 +452,23 @@ final class HybridBridgeController: NSObject, ObservableObject {
             guard let self, case let .success(modelDirectoryURL) = result else { return }
             let previous = preferences.settings
             var updated = previous
-            updated.imageToTextModelDownloadDirectoryPath = storageDirectoryURL.path
-            updated.imageToTextModelVariant = model.id
-            updated.imageToTextModelPath = modelDirectoryURL.path
+            if capability == .imageToText {
+                updated.imageToTextModelDownloadDirectoryPath = storageDirectoryURL.path
+                updated.imageToTextModelVariant = model.id
+                updated.imageToTextModelPath = modelDirectoryURL.path
+            } else {
+                updated.superResolutionModelDownloadDirectoryPath = storageDirectoryURL.path
+                updated.superResolutionModelVariant = model.id
+                updated.superResolutionModelPath = modelDirectoryURL.path
+            }
             preferences.replace(with: updated)
             let current = preferences.settings
-            if previous.imageToTextModelPath != current.imageToTextModelPath {
+            if previous.imageToTextModelPath != current.imageToTextModelPath
+                || previous.superResolutionModelPath != current.superResolutionModelPath {
                 store.applyPreferredModels(
                     imageToTextPath: current.imageToTextModelPath,
-                    imageToImagePath: current.imageToImageModelPath
+                    imageToImagePath: current.imageToImageModelPath,
+                    superResolutionPath: current.superResolutionModelPath
                 )
             }
         }
@@ -390,10 +477,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private func deleteInstalledModel(_ params: [String: Any]) throws {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
-              capability == .imageToText,
+              capability == .imageToText || capability == .superResolution,
               let variantID = params["variantID"] as? String,
               let model = DownloadableModelCatalog.model(id: variantID, capability: capability),
-              let directoryPath = preferences.settings.imageToTextModelDownloadDirectoryPath else {
+              let directoryPath = capability == .imageToText
+                ? preferences.settings.imageToTextModelDownloadDirectoryPath
+                : preferences.settings.superResolutionModelDownloadDirectoryPath else {
             throw BridgeError.invalidParameters
         }
         let storageDirectoryURL = URL(fileURLWithPath: directoryPath).standardizedFileURL
@@ -405,17 +494,25 @@ final class HybridBridgeController: NSObject, ObservableObject {
             storageDirectoryURL: storageDirectoryURL,
             model: model
         )
-        if previous.imageToTextModelPath.map({
+        if capability == .imageToText {
+            if previous.imageToTextModelPath.map({
+                URL(fileURLWithPath: $0).standardizedFileURL == deletedDirectoryURL
+            }) == true {
+                updated.imageToTextModelPath = nil
+            }
+        } else if previous.superResolutionModelPath.map({
             URL(fileURLWithPath: $0).standardizedFileURL == deletedDirectoryURL
         }) == true {
-            updated.imageToTextModelPath = nil
+            updated.superResolutionModelPath = nil
         }
         preferences.replace(with: updated)
         let current = preferences.settings
-        if previous.imageToTextModelPath != current.imageToTextModelPath {
+        if previous.imageToTextModelPath != current.imageToTextModelPath
+            || previous.superResolutionModelPath != current.superResolutionModelPath {
             store.applyPreferredModels(
                 imageToTextPath: current.imageToTextModelPath,
-                imageToImagePath: current.imageToImageModelPath
+                imageToImagePath: current.imageToImageModelPath,
+                superResolutionPath: current.superResolutionModelPath
             )
         }
     }
@@ -432,6 +529,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
                 id: imageToTextModelVariant,
                 capability: .imageToText
               ) != nil,
+              let superResolutionModelVariant = params["superResolutionModelVariant"] as? String,
+              DownloadableModelCatalog.model(
+                id: superResolutionModelVariant,
+                capability: .superResolution
+              ) != nil,
+              let automaticSuperResolutionEnabled = params["automaticSuperResolutionEnabled"] as? Bool,
               let mcpEnabled = params["mcpEnabled"] as? Bool,
               let mcpPort = integer(params["mcpPort"]),
               (1...65_535).contains(mcpPort),
@@ -451,6 +554,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
         ] as? String
         updated.imageToTextModelVariant = imageToTextModelVariant
         updated.imageToImageModelPath = params["imageToImageModelPath"] as? String
+        updated.automaticSuperResolutionEnabled = automaticSuperResolutionEnabled
+        updated.superResolutionModelPath = params["superResolutionModelPath"] as? String
+        updated.superResolutionModelDownloadDirectoryPath = params[
+            "superResolutionModelDownloadDirectoryPath"
+        ] as? String
+        updated.superResolutionModelVariant = superResolutionModelVariant
         updated.mcpEnabled = mcpEnabled
         updated.mcpPort = mcpPort
         updated.mcpAllowedClients = allowedClients
@@ -461,11 +570,16 @@ final class HybridBridgeController: NSObject, ObservableObject {
             store.setImageCompositingBackend(current.resolvedImageCompositingBackend)
         }
         if previous.imageToTextModelPath != current.imageToTextModelPath
-            || previous.imageToImageModelPath != current.imageToImageModelPath {
+            || previous.imageToImageModelPath != current.imageToImageModelPath
+            || previous.superResolutionModelPath != current.superResolutionModelPath {
             store.applyPreferredModels(
                 imageToTextPath: current.imageToTextModelPath,
-                imageToImagePath: current.imageToImageModelPath
+                imageToImagePath: current.imageToImageModelPath,
+                superResolutionPath: current.superResolutionModelPath
             )
+        }
+        if previous.automaticSuperResolutionEnabled != current.automaticSuperResolutionEnabled {
+            store.setAutomaticSuperResolutionEnabled(current.automaticSuperResolutionEnabled)
         }
         if previous.dataDirectoryPath != current.dataDirectoryPath {
             store.statusMessage = localized("dataDirectoryRestartRequired")
@@ -493,6 +607,10 @@ final class HybridBridgeController: NSObject, ObservableObject {
         if let fontName = params["fontName"] as? String, !fontName.isEmpty {
             value.defaultStyle.fontName = fontName
         }
+        value.defaultStyle.fontName = FontFamilyCatalog.normalizedFontName(
+            value.defaultStyle.fontName,
+            for: value.resolvedTargetLanguageCode
+        )
         if let enabled = params["fineScanEnabled"] as? Bool {
             value.fineScanEnabled = enabled
         }
@@ -502,6 +620,31 @@ final class HybridBridgeController: NSObject, ObservableObject {
         value.useImageToImageRestoration = false
         if let preserve = params["preserveUntranslatedRegions"] as? Bool {
             value.preserveUntranslatedRegions = preserve
+        }
+        if let rawQuality = params["translationQuality"] as? [String: Any] {
+            var quality = value.translationQuality
+            if let enabled = rawQuality["usePageContext"] as? Bool {
+                quality.usePageContext = enabled
+            }
+            if let enabled = rawQuality["reviewPassEnabled"] as? Bool {
+                quality.reviewPassEnabled = enabled
+            }
+            if let enabled = rawQuality["qualityCheckEnabled"] as? Bool {
+                quality.qualityCheckEnabled = enabled
+            }
+            if let enabled = rawQuality["preserveLiteralTranslation"] as? Bool {
+                quality.preserveLiteralTranslation = enabled
+            }
+            if let rawMode = rawQuality["lengthMode"] as? String,
+               let mode = TranslationLengthMode(rawValue: rawMode) {
+                quality.lengthMode = mode
+            }
+            if let styleGuide = rawQuality["styleGuide"] as? String {
+                quality.styleGuide = String(
+                    styleGuide.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_000)
+                )
+            }
+            value.translationQuality = quality
         }
         store.setOptions(value)
     }
@@ -546,6 +689,8 @@ final class HybridBridgeController: NSObject, ObservableObject {
             .flatMap(WritingDirection.init(rawValue:))
         let fontWeight = (params["fontWeight"] as? String)
             .flatMap(DialogueFontWeight.init(rawValue:))
+        let textAlignment = (params["textAlignment"] as? String)
+            .flatMap(DialogueTextAlignment.init(rawValue:))
         store.updateRegion(
             pageID: pageID,
             regionID: regionID,
@@ -559,6 +704,13 @@ final class HybridBridgeController: NSObject, ObservableObject {
             fontName: params["fontName"] as? String,
             fontSize: double(params["fontSize"]),
             fontWeight: fontWeight,
+            textAlignment: textAlignment,
+            textColorHex: params["textColorHex"] as? String,
+            strokeColorHex: params["strokeColorHex"] as? String,
+            strokeWidth: double(params["strokeWidth"]),
+            opacity: double(params["opacity"]),
+            rotationDegrees: double(params["rotationDegrees"]),
+            isVisible: params["isVisible"] as? Bool,
             useAutomaticFontSize: params["useAutomaticFontSize"] as? Bool,
             writingDirection: direction,
             automaticMaskEnabled: params["automaticMaskEnabled"] as? Bool

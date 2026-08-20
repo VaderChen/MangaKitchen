@@ -1,5 +1,6 @@
 import Foundation
 import Hub
+import MangaKitchenRuntime
 
 struct HuggingFaceModelDownloader: Sendable {
     private static let segmentByteCount: Int64 = 16 * 1_024 * 1_024
@@ -17,7 +18,7 @@ struct HuggingFaceModelDownloader: Sendable {
             storageDirectoryURL: storageDirectoryURL,
             model: model
         )
-        if DownloadableModelCatalog.isCompleteModelDirectory(targetDirectoryURL) {
+        if DownloadableModelCatalog.isCompleteModelDirectory(targetDirectoryURL, model: model) {
             progressHandler(.completed)
             return targetDirectoryURL
         }
@@ -72,7 +73,8 @@ struct HuggingFaceModelDownloader: Sendable {
             throw error
         }
         try Task.checkCancellation()
-        guard DownloadableModelCatalog.isCompleteModelDirectory(downloadedDirectoryURL) else {
+        try prepareDownloadedModel(downloadedDirectoryURL, model: model)
+        guard DownloadableModelCatalog.isCompleteModelDirectory(downloadedDirectoryURL, model: model) else {
             throw ModelDownloadError.incompleteRepository(model.repositoryID)
         }
 
@@ -80,7 +82,7 @@ struct HuggingFaceModelDownloader: Sendable {
             try fileManager.removeItem(at: targetDirectoryURL)
         }
         try fileManager.moveItem(at: downloadedDirectoryURL, to: targetDirectoryURL)
-        guard DownloadableModelCatalog.isCompleteModelDirectory(targetDirectoryURL) else {
+        guard DownloadableModelCatalog.isCompleteModelDirectory(targetDirectoryURL, model: model) else {
             throw ModelDownloadError.incompleteRepository(model.repositoryID)
         }
         await progress.finish()
@@ -170,6 +172,94 @@ struct HuggingFaceModelDownloader: Sendable {
             )
         }
         return files
+    }
+
+    private func prepareDownloadedModel(
+        _ directoryURL: URL,
+        model: DownloadableModelDescriptor
+    ) throws {
+        if model.format == .mlxDirectory, model.capability == .superResolution {
+            let modelFile = "model.safetensors"
+            guard FileManager.default.fileExists(
+                atPath: directoryURL.appendingPathComponent(modelFile).path
+            ) else {
+                throw ModelDownloadError.incompleteRepository(model.repositoryID)
+            }
+            let manifest = ModelManifest(
+                id: model.id,
+                displayName: model.displayName,
+                capability: .superResolution,
+                backend: .mlxSwift,
+                modelFile: modelFile,
+                superResolutionScale: model.outputScale
+            )
+            let manifestURL = directoryURL.appendingPathComponent("mangakitchen-model.json")
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+            return
+        }
+        guard model.format == .coreMLZip else { return }
+        let fileManager = FileManager.default
+        let zipFiles = try fileManager.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter { $0.pathExtension.lowercased() == "zip" }
+        guard let archiveURL = zipFiles.first else {
+            throw ModelDownloadError.incompleteRepository(model.repositoryID)
+        }
+        let extractionURL = directoryURL.appendingPathComponent(".coreml-extracted", isDirectory: true)
+        if fileManager.fileExists(atPath: extractionURL.path) {
+            try fileManager.removeItem(at: extractionURL)
+        }
+        try fileManager.createDirectory(at: extractionURL, withIntermediateDirectories: true)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-x", "-k", archiveURL.path, extractionURL.path]
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let message = String(
+                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? "無法解壓 Core ML 模型。"
+            throw ModelDownloadError.archiveExtractionFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        let modelFileURL = fileManager.enumerator(
+            at: extractionURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )?.compactMap { $0 as? URL }.first {
+            $0.lastPathComponent == "realesrganAnime512.mlmodel"
+        }
+        guard let modelFileURL else {
+            throw ModelDownloadError.incompleteRepository(model.repositoryID)
+        }
+        let destinationURL = directoryURL.appendingPathComponent(modelFileURL.lastPathComponent)
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
+        }
+        try fileManager.copyItem(at: modelFileURL, to: destinationURL)
+        let manifest = ModelManifest(
+            id: model.id,
+            displayName: model.displayName,
+            capability: .superResolution,
+            backend: .coreML,
+            modelFile: destinationURL.lastPathComponent,
+            inputs: ModelManifest.Inputs(image: "input"),
+            outputs: ModelManifest.Outputs(image: "activation_out"),
+            superResolutionScale: model.outputScale
+        )
+        let manifestURL = directoryURL.appendingPathComponent("mangakitchen-model.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+        try? fileManager.removeItem(at: archiveURL)
+        try? fileManager.removeItem(at: extractionURL)
     }
 
     private func sourceURL(repositoryID: String, filename: String) -> URL {
@@ -532,6 +622,7 @@ private enum ModelDownloadError: LocalizedError, Sendable {
     case unexpectedHTTPStatus(String, Int)
     case invalidContentRange(String)
     case invalidSegment(String, Int64, Int64)
+    case archiveExtractionFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -553,6 +644,8 @@ private enum ModelDownloadError: LocalizedError, Sendable {
             "模型伺服器回傳了錯誤的分段範圍：\(filename)"
         case let .invalidSegment(filename, expected, actual):
             "模型分段大小不符：\(filename)（預期 \(expected) bytes，實際 \(actual) bytes）"
+        case let .archiveExtractionFailed(message):
+            "Core ML 模型解壓失敗：\(message)"
         }
     }
 }

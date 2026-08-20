@@ -14,9 +14,68 @@ struct AppPreferences: Codable, Equatable, Sendable {
     var imageToTextModelDownloadDirectoryPath: String?
     var imageToTextModelVariant: String?
     var imageToImageModelPath: String?
+    var automaticSuperResolutionEnabled = false
+    var superResolutionModelPath: String?
+    var superResolutionModelDownloadDirectoryPath: String?
+    var superResolutionModelVariant: String?
     var mcpEnabled = false
     var mcpPort = 12_080
     var mcpAllowedClients: [String] = ["127.0.0.1"]
+
+    private enum CodingKeys: String, CodingKey {
+        case interfaceLanguage
+        case colorScheme
+        case dataDirectoryPath
+        case imageCompositingBackend
+        case imageToTextModelPath
+        case imageToTextModelDownloadDirectoryPath
+        case imageToTextModelVariant
+        case imageToImageModelPath
+        case automaticSuperResolutionEnabled
+        case superResolutionModelPath
+        case superResolutionModelDownloadDirectoryPath
+        case superResolutionModelVariant
+        case mcpEnabled
+        case mcpPort
+        case mcpAllowedClients
+    }
+
+    init() {}
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        interfaceLanguage = try values.decodeIfPresent(String.self, forKey: .interfaceLanguage) ?? "auto"
+        colorScheme = try values.decodeIfPresent(String.self, forKey: .colorScheme) ?? "auto"
+        dataDirectoryPath = try values.decodeIfPresent(String.self, forKey: .dataDirectoryPath)
+        imageCompositingBackend = try values.decodeIfPresent(
+            ImageCompositingBackend.self,
+            forKey: .imageCompositingBackend
+        ) ?? .cpu
+        imageToTextModelPath = try values.decodeIfPresent(String.self, forKey: .imageToTextModelPath)
+        imageToTextModelDownloadDirectoryPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .imageToTextModelDownloadDirectoryPath
+        )
+        imageToTextModelVariant = try values.decodeIfPresent(String.self, forKey: .imageToTextModelVariant)
+        imageToImageModelPath = try values.decodeIfPresent(String.self, forKey: .imageToImageModelPath)
+        automaticSuperResolutionEnabled = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .automaticSuperResolutionEnabled
+        ) ?? false
+        superResolutionModelPath = try values.decodeIfPresent(String.self, forKey: .superResolutionModelPath)
+        superResolutionModelDownloadDirectoryPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .superResolutionModelDownloadDirectoryPath
+        )
+        superResolutionModelVariant = try values.decodeIfPresent(
+            String.self,
+            forKey: .superResolutionModelVariant
+        )
+        mcpEnabled = try values.decodeIfPresent(Bool.self, forKey: .mcpEnabled) ?? false
+        mcpPort = try values.decodeIfPresent(Int.self, forKey: .mcpPort) ?? 12_080
+        mcpAllowedClients = try values.decodeIfPresent([String].self, forKey: .mcpAllowedClients)
+            ?? ["127.0.0.1"]
+    }
 
     mutating func normalize() {
         if !Self.supportedInterfaceLanguages.contains(interfaceLanguage) {
@@ -56,7 +115,7 @@ struct AppPreferences: Codable, Equatable, Sendable {
             if let directlySelectedModel = DownloadableModelCatalog.model(
                 matching: storageURL,
                 capability: .imageToText
-            ), DownloadableModelCatalog.isCompleteModelDirectory(storageURL) {
+            ), DownloadableModelCatalog.isCompleteModelDirectory(storageURL, model: directlySelectedModel) {
                 storageURL.deleteLastPathComponent()
                 self.imageToTextModelDownloadDirectoryPath = storageURL.path
                 imageToTextModelVariant = directlySelectedModel.id
@@ -71,6 +130,22 @@ struct AppPreferences: Codable, Equatable, Sendable {
             )?.path
         }
         imageToImageModelPath = Self.normalizedOptionalPath(imageToImageModelPath)
+        superResolutionModelPath = Self.normalizedOptionalPath(superResolutionModelPath)
+        superResolutionModelDownloadDirectoryPath = Self.normalizedOptionalPath(
+            superResolutionModelDownloadDirectoryPath
+        )
+        let selectedSuperResolutionModel = superResolutionModelVariant.flatMap {
+            DownloadableModelCatalog.model(id: $0, capability: .superResolution)
+        } ?? DownloadableModelCatalog.defaultSuperResolutionModel
+        superResolutionModelVariant = selectedSuperResolutionModel.id
+        if let superResolutionModelDownloadDirectoryPath {
+            let storageURL = URL(fileURLWithPath: superResolutionModelDownloadDirectoryPath)
+                .standardizedFileURL
+            superResolutionModelPath = DownloadableModelCatalog.installedModelDirectory(
+                storageDirectoryURL: storageURL,
+                model: selectedSuperResolutionModel
+            )?.path
+        }
         if !(1...65_535).contains(mcpPort) {
             mcpPort = 12_080
         }
@@ -86,6 +161,13 @@ struct AppPreferences: Codable, Equatable, Sendable {
             id: imageToTextModelVariant ?? "",
             capability: .imageToText
         )?.id ?? DownloadableModelCatalog.defaultImageToTextModel.id
+    }
+
+    var resolvedSuperResolutionModelVariant: String {
+        DownloadableModelCatalog.model(
+            id: superResolutionModelVariant ?? "",
+            capability: .superResolution
+        )?.id ?? DownloadableModelCatalog.defaultSuperResolutionModel.id
     }
 
     private static func normalizedOptionalPath(_ value: String?) -> String? {

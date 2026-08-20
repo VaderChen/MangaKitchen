@@ -294,7 +294,7 @@ public actor MetalBubbleCleaner {
                 }
             }
             sampledRings = ring;
-            if (ringSampleCount >= 6 || radius >= float(searchRadius)) break;
+            if (sampleCount >= directions || radius >= float(searchRadius)) break;
         }
 
         if (sampleCount == 0) {
@@ -302,12 +302,14 @@ public actor MetalBubbleCleaner {
             return;
         }
 
-        uint dominantBin = 0;
-        uint dominantCount = 0;
+        uint targetRank = max(1u, (sampleCount * 9u + 9u) / 10u);
+        uint cumulativeCount = 0;
+        uint dominantBin = 15;
         for (uint bin = 0; bin < 16; ++bin) {
-            if (luminanceHistogram[bin] >= dominantCount) {
+            cumulativeCount += luminanceHistogram[bin];
+            if (cumulativeCount >= targetRank) {
                 dominantBin = bin;
-                dominantCount = luminanceHistogram[bin];
+                break;
             }
         }
 

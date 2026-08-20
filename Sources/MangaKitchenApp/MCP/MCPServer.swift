@@ -50,6 +50,9 @@ struct MangaKitchenMCPServer {
             do {
                 let arguments = request.arguments ?? [:]
                 switch request.name {
+                case "mangakitchen.contract.describe":
+                    return try success("目前 MCP 契約版本。", await service.contractDescription())
+
                 case "mangakitchen.workspace.list":
                     let states = await service.listWorkspaces()
                     return try success("目前共有 \(states.count) 個工作區。", states)
@@ -136,6 +139,23 @@ struct MangaKitchenMCPServer {
                     let model = try await service.loadModel(directoryURL: directory)
                     return try success("模型已載入：\(model.displayName)", model)
 
+                case "mangakitchen.page.inspect":
+                    let inspection = try await service.inspectPage(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id")
+                    )
+                    return try success("頁面狀態與 revision 已讀取。", inspection)
+
+                case "mangakitchen.page.update":
+                    let result = try await service.updatePage(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
+                        title: try optionalString(arguments, "title"),
+                        position: try optionalInteger(arguments, "position")
+                    )
+                    return try success("頁面資料已更新。", result)
+
                 case "mangakitchen.page.prepare_agent_task":
                     let progress = progressReporter(request: request, server: server)
                     let payload = try await service.prepareAgentTask(
@@ -165,10 +185,38 @@ struct MangaKitchenMCPServer {
                     let result = try await service.submitAgentResult(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
                         results: try requiredAgentRegionResults(arguments, "regions"),
                         progress: progressReporter(request: request, server: server)
                     )
                     return try success("Agent 結果已一次回寫，步驟四合成完成。", result)
+
+                case "mangakitchen.page.render":
+                    let result = try await service.renderPage(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
+                        progress: progressReporter(request: request, server: server)
+                    )
+                    return try success("頁面已依目前 HTML 排版合成。", result)
+
+                case "mangakitchen.region.batch_update":
+                    let result = try await service.batchUpdateRegions(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
+                        patches: try requiredRegionPatches(arguments, "regions")
+                    )
+                    return try success("區域 patch 已原子套用。", result)
+
+                case "mangakitchen.region.reorder":
+                    let result = try await service.reorderRegions(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
+                        orderedRegionIDs: try requiredUUIDArray(arguments, "ordered_region_ids")
+                    )
+                    return try success("區域順序已更新。", result)
 
                 case "mangakitchen.page.detect_masks":
                     return try await runWorkflow(
@@ -254,7 +302,14 @@ struct MangaKitchenMCPServer {
                             as: DialogueFontWeight.self
                         ),
                         useAutomaticFontSize: arguments["automatic_font_size"]?.boolValue,
-                        writingDirection: try optionalEnum(arguments, "writing_direction", as: WritingDirection.self)
+                        writingDirection: try optionalEnum(arguments, "writing_direction", as: WritingDirection.self),
+                        textAlignment: try optionalEnum(arguments, "text_alignment", as: DialogueTextAlignment.self),
+                        textColorHex: arguments["text_color"]?.stringValue,
+                        strokeColorHex: arguments["stroke_color"]?.stringValue,
+                        strokeWidth: number(arguments["stroke_width"]),
+                        opacity: number(arguments["opacity"]),
+                        rotationDegrees: number(arguments["rotation_degrees"]),
+                        isVisible: arguments["is_visible"]?.boolValue
                     )
                     return try success("對話區域已更新；未修改 bounds／bubble_bounds 時會保留既有遮罩。", region)
 
@@ -282,6 +337,12 @@ struct MangaKitchenMCPServer {
             let pages = await service.resources()
             var resources = [
                 Resource(
+                    name: "MangaKitchen MCP 契約",
+                    uri: "mangakitchen://contract/current",
+                    description: "目前工具、欄位、revision 與原子更新規則",
+                    mimeType: "application/json"
+                ),
+                Resource(
                     name: "MangaKitchen 工作區列表",
                     uri: "mangakitchen://workspace/list",
                     description: "目前 MCP process 內已開啟的所有目錄專案",
@@ -306,12 +367,27 @@ struct MangaKitchenMCPServer {
                     mimeType: "application/json"
                 )
             ]
+            let state = await service.state()
+            if let workspaceID = state.workspaceID {
+                resources.append(Resource(
+                    name: "目前工作區能力",
+                    uri: "mangakitchen://workspace/\(workspaceID.uuidString.lowercased())/capabilities",
+                    description: "目前工作區可使用的 MCP 契約能力",
+                    mimeType: "application/json"
+                ))
+            }
             for page in pages {
                 let base = "mangakitchen://page/\(page.id.uuidString.lowercased())"
                 resources.append(Resource(
                     name: "頁面 \(page.index)：\(page.title)",
                     uri: base,
                     description: "漫畫頁面狀態與所有對話區域",
+                    mimeType: "application/json"
+                ))
+                resources.append(Resource(
+                    name: "\(page.title) 區域",
+                    uri: base + "/regions",
+                    description: "頁面 revision 與全部可編輯區域",
                     mimeType: "application/json"
                 ))
                 resources.append(Resource(
@@ -343,9 +419,21 @@ struct MangaKitchenMCPServer {
         await server.withMethodHandler(ListResourceTemplates.self) { _ in
             .init(templates: [
                 .init(
+                    uriTemplate: "mangakitchen://workspace/{workspace_id}/capabilities",
+                    name: "MangaKitchen 工作區能力",
+                    description: "依 workspace_id 讀取契約能力",
+                    mimeType: "application/json"
+                ),
+                .init(
                     uriTemplate: "mangakitchen://page/{page_id}",
                     name: "MangaKitchen 頁面",
                     description: "依 page_id 讀取頁面及對話區域狀態",
+                    mimeType: "application/json"
+                ),
+                .init(
+                    uriTemplate: "mangakitchen://page/{page_id}/regions",
+                    name: "MangaKitchen 頁面區域",
+                    description: "依 page_id 讀取 revision 與全部區域",
                     mimeType: "application/json"
                 ),
                 .init(
@@ -420,6 +508,27 @@ struct MangaKitchenMCPServer {
         return value
     }
 
+    private static func requiredRevision(_ arguments: [String: Value]) throws -> String {
+        try requiredString(arguments, "expected_revision")
+    }
+
+    private static func optionalString(_ arguments: [String: Value], _ key: String) throws -> String? {
+        guard let raw = arguments[key] else { return nil }
+        guard let value = raw.stringValue else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是字串。")
+        }
+        return value
+    }
+
+    private static func optionalInteger(_ arguments: [String: Value], _ key: String) throws -> Int? {
+        guard let raw = arguments[key] else { return nil }
+        if let value = raw.intValue { return value }
+        if let value = raw.doubleValue, value.isFinite, value.rounded() == value {
+            return Int(exactly: value)
+        }
+        throw MCPServiceError.invalidArguments("\(key) 必須是整數。")
+    }
+
     private static func optionalUUID(_ arguments: [String: Value], _ key: String) throws -> UUID? {
         guard arguments[key] != nil else { return nil }
         return try requiredUUID(arguments, key)
@@ -453,6 +562,13 @@ struct MangaKitchenMCPServer {
             }
             return id
         }
+    }
+
+    private static func requiredUUIDArray(_ arguments: [String: Value], _ key: String) throws -> [UUID] {
+        guard let values = try optionalUUIDArray(arguments, key), !values.isEmpty else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是非空 UUID 字串陣列。")
+        }
+        return values
     }
 
     private static func requiredFileURL(_ arguments: [String: Value], _ key: String) throws -> URL {
@@ -544,6 +660,76 @@ struct MangaKitchenMCPServer {
         return NormalizedPoint(x: x, y: y).clamped()
     }
 
+    private static func optionalFiniteNumber(
+        _ arguments: [String: Value],
+        _ key: String,
+        range: ClosedRange<Double>? = nil
+    ) throws -> Double? {
+        guard let raw = arguments[key] else { return nil }
+        guard let value = number(raw), value.isFinite else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是有限數值。")
+        }
+        if let range, !range.contains(value) {
+            throw MCPServiceError.invalidArguments("\(key) 必須介於 \(range.lowerBound)...\(range.upperBound)。")
+        }
+        return value
+    }
+
+    private static func optionalBoolean(_ arguments: [String: Value], _ key: String) throws -> Bool? {
+        guard let raw = arguments[key] else { return nil }
+        guard let value = raw.boolValue else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是布林值。")
+        }
+        return value
+    }
+
+    private static func optionalColor(_ arguments: [String: Value], _ key: String) throws -> String? {
+        guard let value = try optionalString(arguments, key) else { return nil }
+        let pattern = /^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$/
+        guard value.wholeMatch(of: pattern) != nil else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是 #RRGGBB 或 #RRGGBBAA。")
+        }
+        return value
+    }
+
+    private static func requiredRegionPatches(
+        _ arguments: [String: Value],
+        _ key: String
+    ) throws -> [MCPRegionPatch] {
+        guard let values = arguments[key]?.arrayValue, (1...64).contains(values.count) else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是含 1...64 筆資料的陣列。")
+        }
+        return try values.enumerated().map { offset, item in
+            guard let object = item.objectValue else {
+                throw MCPServiceError.invalidArguments("\(key)[\(offset)] 必須是物件。")
+            }
+            if object["bounds"]?.isNull == true {
+                throw MCPServiceError.invalidArguments("\(key)[\(offset)].bounds 不接受 null。")
+            }
+            return MCPRegionPatch(
+                regionID: try requiredUUID(object, "region_id"),
+                sourceText: try optionalString(object, "source_text"),
+                translatedText: try optionalString(object, "translated_text"),
+                translationAnchor: try optionalPointUpdate(object, "translation_anchor"),
+                translationBounds: try optionalRectUpdate(object, "translation_bounds"),
+                bounds: try optionalRect(object, "bounds"),
+                bubbleBounds: try optionalRectUpdate(object, "bubble_bounds"),
+                fontName: try optionalString(object, "font_name"),
+                fontSize: try optionalNumberUpdate(object, "font_size"),
+                automaticFontSize: try optionalBoolean(object, "automatic_font_size"),
+                fontWeight: try optionalEnum(object, "font_weight", as: DialogueFontWeight.self),
+                writingDirection: try optionalEnum(object, "writing_direction", as: WritingDirection.self),
+                textAlignment: try optionalEnum(object, "text_alignment", as: DialogueTextAlignment.self),
+                textColorHex: try optionalColor(object, "text_color"),
+                strokeColorHex: try optionalColor(object, "stroke_color"),
+                strokeWidth: try optionalFiniteNumber(object, "stroke_width", range: 0...20),
+                opacity: try optionalFiniteNumber(object, "opacity", range: 0...1),
+                rotationDegrees: try optionalFiniteNumber(object, "rotation_degrees", range: -180...180),
+                isVisible: try optionalBoolean(object, "is_visible")
+            )
+        }
+    }
+
     private static func requiredAgentRegionProposals(
         _ arguments: [String: Value],
         _ key: String
@@ -592,13 +778,33 @@ struct MangaKitchenMCPServer {
                 regionID: regionID,
                 sourceText: sourceText,
                 translatedText: translatedText,
+                literalTranslatedText: try optionalString(object, "literal_translated_text"),
+                speakerID: try optionalString(object, "speaker_id"),
+                tone: try optionalString(object, "tone"),
+                translationConfidence: try optionalFiniteNumber(
+                    object,
+                    "translation_confidence",
+                    range: 0...1
+                ),
+                translationQAFlags: try optionalEnumArray(
+                    object,
+                    "translation_qa_flags",
+                    as: TranslationQAFlag.self
+                ),
                 translationAnchor: try optionalPoint(object, "translation_anchor"),
                 translationBounds: try optionalRect(object, "translation_bounds"),
                 fontName: object["font_name"]?.stringValue,
                 fontSize: fontSize,
                 fontWeight: try optionalEnum(object, "font_weight", as: DialogueFontWeight.self),
                 automaticFontSize: object["automatic_font_size"]?.boolValue,
-                writingDirection: try optionalEnum(object, "writing_direction", as: WritingDirection.self)
+                writingDirection: try optionalEnum(object, "writing_direction", as: WritingDirection.self),
+                textAlignment: try optionalEnum(object, "text_alignment", as: DialogueTextAlignment.self),
+                textColorHex: object["text_color"]?.stringValue,
+                strokeColorHex: object["stroke_color"]?.stringValue,
+                strokeWidth: number(object["stroke_width"]),
+                opacity: number(object["opacity"]),
+                rotationDegrees: number(object["rotation_degrees"]),
+                isVisible: object["is_visible"]?.boolValue
             )
         }
     }
@@ -642,6 +848,23 @@ struct MangaKitchenMCPServer {
         return try requiredEnum(arguments, key, as: type)
     }
 
+    private static func optionalEnumArray<T: RawRepresentable>(
+        _ arguments: [String: Value],
+        _ key: String,
+        as type: T.Type
+    ) throws -> [T]? where T.RawValue == String {
+        guard let raw = arguments[key] else { return nil }
+        guard let values = raw.arrayValue else {
+            throw MCPServiceError.invalidArguments("\(key) 必須是字串陣列。")
+        }
+        return try values.map { value in
+            guard let rawValue = value.stringValue, let item = T(rawValue: rawValue) else {
+                throw MCPServiceError.invalidArguments("\(key) 包含不受支援的值。")
+            }
+            return item
+        }
+    }
+
     private static func imageMIMEType(for url: URL) -> String {
         switch url.pathExtension.lowercased() {
         case "jpg", "jpeg": "image/jpeg"
@@ -654,6 +877,11 @@ struct MangaKitchenMCPServer {
 
     private static var toolDefinitions: [Tool] {
         let workspaceID = property("string", "由 workspace.open 回傳的工作區 UUID")
+        let pageID = property("string", "頁面 UUID")
+        let expectedRevision = property(
+            "string",
+            "最近一次 page.inspect 或 page.prepare_agent_task 回傳的 opaque revision"
+        )
         let pageIDs = Value.object([
             "type": "array",
             "description": "要處理的 page_id；省略或空陣列代表全部頁面",
@@ -712,15 +940,58 @@ struct MangaKitchenMCPServer {
                 "region_id": property("string", "App 回傳的既有區域 UUID"),
                 "source_text": property("string", "該區域的原文；空白分鏡可填 NIL"),
                 "translated_text": property("string", "該區域的翻譯文字"),
+                "literal_translated_text": property("string", "忠實保留完整語意的直譯稿"),
+                "speaker_id": property("string", "整頁一致的角色或說話者 ID"),
+                "tone": property("string", "角色語氣、情緒或敬語描述"),
+                "translation_confidence": rangedNumber(0, 1),
+                "translation_qa_flags": .object([
+                    "type": "array",
+                    "items": enumProperty(TranslationQAFlag.allCases.map(\.rawValue)),
+                    "uniqueItems": true
+                ]),
                 "translation_anchor": point,
                 "translation_bounds": bounds,
                 "font_name": property("string", "macOS 字型名稱"),
                 "font_size": property("number", "固定字級 4...512；省略代表沿用或自動配適"),
                 "font_weight": enumProperty(["regular", "bold"]),
                 "automatic_font_size": property("boolean", "true 代表使用自動配適字級"),
-                "writing_direction": enumProperty(["automatic", "horizontal", "vertical"])
+                "writing_direction": enumProperty(["automatic", "horizontal", "vertical"]),
+                "text_alignment": enumProperty(["start", "center", "end"]),
+                "text_color": property("string", "CSS 十六進位文字顏色，例如 #111111"),
+                "stroke_color": property("string", "CSS 十六進位描邊顏色，例如 #FFFFFF"),
+                "stroke_width": property("number", "HTML/CSS 描邊寬度，0...20"),
+                "opacity": property("number", "圖層不透明度，0...1"),
+                "rotation_degrees": property("number", "圖層旋轉角度，-180...180"),
+                "is_visible": property("boolean", "是否在畫布、PNG 與 PSD 中顯示")
             ]),
             "required": ["region_id", "source_text", "translated_text"],
+            "additionalProperties": false
+        ])
+        let regionPatch = Value.object([
+            "type": "object",
+            "description": "區域 partial patch；省略代表沿用，只有標示 nullable 的欄位接受 null",
+            "properties": .object([
+                "region_id": property("string", "既有區域 UUID"),
+                "source_text": property("string", "來源原文"),
+                "translated_text": property("string", "翻譯文字"),
+                "translation_anchor": nullable(point),
+                "translation_bounds": nullable(bounds),
+                "bounds": bounds,
+                "bubble_bounds": nullable(bubbleBounds),
+                "font_name": property("string", "macOS 字型名稱"),
+                "font_size": nullable(property("number", "固定字級；null 代表恢復自動配適")),
+                "automatic_font_size": property("boolean", "是否使用自動配適字級"),
+                "font_weight": enumProperty(["regular", "bold"]),
+                "writing_direction": enumProperty(["automatic", "horizontal", "vertical"]),
+                "text_alignment": enumProperty(["start", "center", "end"]),
+                "text_color": property("string", "#RRGGBB 或 #RRGGBBAA"),
+                "stroke_color": property("string", "#RRGGBB 或 #RRGGBBAA"),
+                "stroke_width": rangedNumber(0, 20),
+                "opacity": rangedNumber(0, 1),
+                "rotation_degrees": rangedNumber(-180, 180),
+                "is_visible": property("boolean", "是否顯示")
+            ]),
+            "required": ["region_id"],
             "additionalProperties": false
         ])
         let translations = Value.object([
@@ -733,6 +1004,14 @@ struct MangaKitchenMCPServer {
         let readOnly = Tool.Annotations(readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false)
 
         return [
+            Tool(
+                name: "mangakitchen.contract.describe",
+                title: "讀取 MCP 契約",
+                description: "讀取目前契約版本、座標系、限制、nullable 欄位、工具與不變量。",
+                inputSchema: objectSchema([:], required: []),
+                annotations: readOnly,
+                outputSchema: genericOutputSchema
+            ),
             Tool(
                 name: "mangakitchen.workspace.list",
                 title: "列出漫畫工作區",
@@ -823,6 +1102,31 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
+                name: "mangakitchen.page.inspect",
+                title: "檢查頁面",
+                description: "讀取完整頁面、產物、可用操作與 opaque revision；所有後續寫入都必須回傳此 revision。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID
+                ], required: ["workspace_id", "page_id"]),
+                annotations: readOnly,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.update",
+                title: "更新頁面資料",
+                description: "以 optimistic concurrency 更新頁面標題或一基準頁序；revision 不符時整筆拒絕。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision,
+                    "title": property("string", "新頁面標題，最多 200 字元"),
+                    "position": rangedInteger(1, nil, "新的一基準頁序")
+                ], required: ["workspace_id", "page_id", "expected_revision"]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
                 name: "mangakitchen.page.prepare_agent_task",
                 title: "準備單頁 Agent 工作包",
                 description: "唯一頁面處理入口。缺少步驟二時 App 會先建立區域與像素遮罩，再一次回傳內嵌 regionData JSON 與原圖 image content；其中既有 sourceText／translatedText 是需要對照原圖校稿的草稿，既有排版欄位也可由 Agent 修正。Agent 不得搜尋 .str 檔案、讀取額外 page resource、自行偵測或重建區域。",
@@ -840,14 +1144,64 @@ struct MangaKitchenMCPServer {
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": property("string", "工作包中的單頁 UUID"),
+                    "expected_revision": expectedRevision,
                     "regions": .object([
                         "type": "array",
                         "description": "工作包中全部區域的結果；region_id 必須與工作包完全一致",
                         "items": agentResult,
                         "maxItems": 64
                     ])
-                ], required: ["workspace_id", "page_id", "regions"]),
+                ], required: ["workspace_id", "page_id", "expected_revision", "regions"]),
                 annotations: mutating,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.render",
+                title: "渲染頁面",
+                description: "依目前區域的 HTML/CSS 排版重新產生畫布輸出；不重新翻譯或重建區域。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision
+                ], required: ["workspace_id", "page_id", "expected_revision"]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.region.batch_update",
+                title: "批次更新區域",
+                description: "先驗證完整批次，再一次套用 1...64 個 partial patch；任一筆無效時不寫入任何資料。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision,
+                    "regions": .object([
+                        "type": "array",
+                        "items": regionPatch,
+                        "minItems": 1,
+                        "maxItems": 64
+                    ])
+                ], required: ["workspace_id", "page_id", "expected_revision", "regions"]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.region.reorder",
+                title: "重排區域順序",
+                description: "以完整 region_id 陣列原子更新閱讀與 PSD 圖層順序。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision,
+                    "ordered_region_ids": .object([
+                        "type": "array",
+                        "items": property("string", "區域 UUID"),
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "uniqueItems": true
+                    ])
+                ], required: ["workspace_id", "page_id", "expected_revision", "ordered_region_ids"]),
+                annotations: idempotent,
                 outputSchema: genericOutputSchema
             ),
             Tool(
@@ -948,7 +1302,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.region.update",
                 title: "更新對話區域",
-                description: "逐區寫入 Agent 抽取的原文、譯文、落點、字型、字級、字重與排字方向。只要沒有修改 bounds 或 bubble_bounds，就直接保留步驟二已完成的像素遮罩；只有修改遮罩幾何時才會重建遮罩。",
+                description: "逐區寫入 Agent 抽取的原文、譯文、落點、字型、字級、字重、排字方向、對齊、顏色、描邊、透明度、旋轉與可見性。只要沒有修改 bounds 或 bubble_bounds，就直接保留步驟二已完成的像素遮罩；只有修改遮罩幾何時才會重建遮罩。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": property("string", "頁面 UUID"),
@@ -962,7 +1316,14 @@ struct MangaKitchenMCPServer {
                     "font_size": property("number", "固定字級 4...512；傳 null 等同 automatic_font_size: true，恢復自動配適"),
                     "font_weight": enumProperty(["regular", "bold"]),
                     "automatic_font_size": property("boolean", "true 代表恢復自動配適字級"),
-                    "writing_direction": enumProperty(["automatic", "horizontal", "vertical"])
+                    "writing_direction": enumProperty(["automatic", "horizontal", "vertical"]),
+                    "text_alignment": enumProperty(["start", "center", "end"]),
+                    "text_color": property("string", "CSS 十六進位文字顏色"),
+                    "stroke_color": property("string", "CSS 十六進位描邊顏色"),
+                    "stroke_width": property("number", "描邊寬度 0...20"),
+                    "opacity": property("number", "不透明度 0...1"),
+                    "rotation_degrees": property("number", "旋轉角度 -180...180"),
+                    "is_visible": property("boolean", "圖層是否顯示")
                 ], required: ["workspace_id", "page_id", "region_id"]),
                 annotations: mutating,
                 outputSchema: genericOutputSchema
@@ -1033,6 +1394,39 @@ struct MangaKitchenMCPServer {
             "type": "string",
             "enum": .array(values.map(Value.string))
         ])
+    }
+
+    private static func nullable(_ schema: Value) -> Value {
+        .object([
+            "anyOf": .array([
+                schema,
+                .object(["type": "null"])
+            ])
+        ])
+    }
+
+    private static func rangedNumber(_ minimum: Double, _ maximum: Double) -> Value {
+        .object([
+            "type": "number",
+            "minimum": .double(minimum),
+            "maximum": .double(maximum)
+        ])
+    }
+
+    private static func rangedInteger(
+        _ minimum: Int,
+        _ maximum: Int?,
+        _ description: String
+    ) -> Value {
+        var schema: [String: Value] = [
+            "type": "integer",
+            "minimum": .int(minimum),
+            "description": .string(description)
+        ]
+        if let maximum {
+            schema["maximum"] = .int(maximum)
+        }
+        return .object(schema)
     }
 
     private static func json<T: Encodable>(_ value: T) throws -> String {

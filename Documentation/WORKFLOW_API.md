@@ -61,6 +61,10 @@
 
 ## 共用資料規則
 
+`DialogueStyle` 除字型、字級、字重與書寫方向外，也保存 `textAlignment`、`textColorHex`、`strokeColorHex`、`strokeWidth`、`opacity`、`rotationDegrees` 與 `isVisible`。WebUI、HTML PNG 排版與 HTML 分層 PSD 必須消費同一份樣式，不得各自建立不同預設。
+
+`TranslationQualityOptions` 預設啟用整頁語境、二次校稿、翻譯 QA 與直譯稿保存，長度策略為 `balanced`。本機 VLM 第一階段一次讀取整頁有序區域，產生直譯稿、顯示譯文、角色、語氣與信心；第二階段再以相同整頁資料統一稱謂、詞表、數字、否定、語氣與長度。QA 會檢查缺譯、詞表、數字、長度及低信心，結果保存於 `.str`，不只存在記憶體。
+
 - `NormalizedPoint` 與 `NormalizedRect` 都以原圖左上角為原點，範圍為 `0...1`。
 - 遮罩畫筆的 `diameter` 是相對於原圖短邊的比例，範圍為 `0.001...1`。
 - `MaskStroke.mode` 為 `add` 或 `erase`，筆劃依保存順序套用。
@@ -217,19 +221,27 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `setInterfaceLanguage(language)` | 設定 `auto`、`zh-Hant`、`en`、`ja` 或 `ko`，立即重繪並保存偏好 |
 | `updateGlobalSettings(settings)` | 更新完整全域設定；包含色系、資料位置、偏好模型與 MCP 網路設定 |
 | `chooseDataDirectory()` | 開啟原生資料目錄選擇面板；回傳 `{ path }`，套用後需重新啟動 |
-| `choosePreferredModelDirectory(capability)` | 選取並驗證 `imageToText` 或 `imageToImage` 模型目錄 |
-| `chooseModelDownloadDirectory(capability)` | 選取模型儲存根目錄；若直接選到支援的既有模型，會回傳其版本 |
-| `downloadPreferredModel(capability, variantID)` | 從 Hugging Face 下載所選圖生文模型；已存在時不重複下載 |
-| `createProject()`／`chooseSourceDirectory()` | 以來源目錄建立專案；既有目錄則切換並重掃 |
+| `choosePreferredModelDirectory(capability)` | 選取並驗證 `imageToText`、`imageToImage` 或 `superResolution` 模型目錄 |
+| `chooseModelDownloadDirectory(capability)` | 選取圖生文或超高解析度模型儲存根目錄；若直接選到支援的既有模型，會回傳其版本 |
+| `downloadPreferredModel(capability, variantID)` | 從 Hugging Face 下載所選圖生文或超高解析度模型；已存在時不重複下載 |
+| `createProject()`／`chooseSourceDirectory()` | 從圖片、資料夾、ZIP／CBZ、RAR／CBR 或 PDF 建立受管理專案 |
+| `appendPages()` | 將相同支援格式追加到目前專案；必要時先把外部來源轉成受管理專案 |
 | `switchProject(projectID)` | 切換目前專案 |
+| `deleteProject(projectID)` | 從專案索引移除專案，不刪除外部來源檔 |
 | `renameProject(name)` | 修改目前專案顯示名稱 |
 | `rescanSourceDirectory()` | 重新掃描目前來源 |
+| `resetPages(pageIDs)` | 清除指定頁面的處理狀態與衍生產物，保留來源頁 |
+| `renamePage(pageID, name)` | 修改頁面顯示名稱，不改寫來源檔名 |
+| `movePage(pageID, offset)` | 依 `offset` 調整頁序 |
+| `removePages(pageIDs)` | 從專案排除頁面，不刪來源；重掃時保持排除 |
 | `chooseOutputDirectory()` | 選取只存放最終 PNG 的輸出目錄；`.str` 不會隨之移動 |
+| `exportPSD(pageIDs)` | 選取輸出資料夾，以目前 HTML/CSS 合成圖與逐文字 Raster Layer 匯出 PSD |
 | `setPageSelection(pageIDs, activePageID)` | 同時設定批次選取與中央畫布頁面 |
 | `selectAllPages()`／`clearPageSelection()` | 全選或清除批次選取 |
-| `runBatch(operation, pageIDs, forceRecalculation)` | 將明確的頁面集合加入遮罩、翻譯、合成或完整處理佇列；重算翻譯時設為 `true`，會重新呼叫 VLM，不沿用既有原文／譯文 |
+| `runBatch(operation, pageIDs, forceRecalculation)` | 將明確頁面集合加入 `detectMasks`、`translate`、`superResolve`、`compose` 或完整處理佇列；重算翻譯時設為 `true`，會重新呼叫 VLM |
 | `detectMasks(scope)` | `selected` 或 `all` 的步驟二 |
 | `translate(scope)` | `selected` 或 `all` 的步驟三 |
+| `superResolve()` | 對選取頁面的乾淨背景執行已載入的原生 2× 或 4× 超高解析度模型 |
 | `compose(scope)` | `selected` 或 `all` 的步驟四；只儲存步驟三已完成的翻譯預覽 |
 | `runFullPage(scope)` | 保留的一鍵完整頁／全部頁面 |
 | `retryFailedBatchJob(jobID)` | 以原操作重新排入該工作的失敗頁面 |
@@ -239,12 +251,20 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `createMaskRegion(pageID, bounds)` | 新增區域，回傳 `{ regionID }` |
 | `appendMaskStroke(pageID, regionID, mode, diameter, points)` | 添加或擦除遮罩 |
 | `undoMaskStroke(pageID, regionID)` | 復原該區域最後一筆遮罩 |
+| `redoMaskStroke(pageID, regionID)` | 重做該區域最後一筆已復原遮罩 |
+| `undoRegionEdit(pageID)`／`redoRegionEdit(pageID)` | 復原或重做該頁文字區域編輯；每頁最多保留 50 份快照 |
 | `removeRegion(pageID, regionID)` | 移除區域 |
+| `moveRegion(pageID, regionID, offset)` | 調整閱讀順序及 PSD 文字圖層順序 |
 | `updateRegion(pageID, regionID, changes)` | 更新文字、`translationAnchor` 譯文中心點、字型、字級及排字設定 |
+| `updateSettings(changes)` | 更新專案處理設定；`translationQuality` 可控制整頁語境、校稿、QA、直譯稿、長度策略與風格指南 |
 
 命令 Promise 代表 Native 已接受命令。長工序的實際狀態、進度及結果由 `window.MangaKitchenNative.receiveState` 持續推送。
 
 `translationAnchor` 使用左上角原點的 0...1 正規化座標，只改變譯文 Layer 與最終排版位置，不會改動來源文字 `bounds`、對話框或遮罩。像素遮罩覆蓋檢查只提供警告；人工遮罩或目前自動遮罩仍可繼續翻譯與合成，不會作為硬性阻擋條件。
+
+`WebPage` 以 `pixelWidth`／`pixelHeight` 表示原圖尺寸；套用超高解析度後另回傳 `superResolutionApplied`、`superResolutionScale`、`superResolutionPixelWidth`、`superResolutionPixelHeight` 與 `superResolvedBackgroundPreviewURL`。中央畫布必須使用 SR 實際尺寸計算內容座標，但檢視倍率仍以目前可視畫布與顯示尺寸計算，不能把 SR 倍率直接乘入 UI zoom。尺寸旁的 `*` 只代表目前預覽來自 SR 產物。
+
+PSD 匯出以目前頁面順序產生 `序號_頁名.psd`。合併預覽、每個可見或隱藏文字圖層都由 `HTMLDialogueTypesetter` 使用同一份樣式渲染；尺寸相符時加入 `Clean Background` 與預設隱藏的 `Original Source`。PSD 文字目前是可分層的透明 Raster Layer，不宣稱為 Photoshop 原生可編輯文字圖層。
 
 介面語言與專案的 `targetLanguageCode` 是兩個獨立設定。改變介面語言只影響 WebUI、原生目錄選擇面板與 MCP menu bar，不會修改譯文語言或專有名詞的對照目標。
 
@@ -268,6 +288,7 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 
 | Tool | 對應功能 |
 |---|---|
+| `mangakitchen.contract.describe` | 讀取契約版本、座標系、限制、nullable 欄位與不變量 |
 | `mangakitchen.workspace.list` | 列出 MCP process 內已開啟的所有目錄工作區 |
 | `mangakitchen.workspace.open` | 開啟來源／輸出目錄並掃描，回傳明確的 `workspace_id` |
 | `mangakitchen.workspace.activate` | 切換 `workspace/current` resource；其他工具仍以明確 ID 操作 |
@@ -279,10 +300,15 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `mangakitchen.glossary.remove` | 移除指定詞條 |
 | `mangakitchen.model.load` | 載入本機模型 manifest 目錄 |
 | `mangakitchen.workspace.pages` | 查詢每頁產物狀態；`nextAction` 只是摘要，不會授權 Agent 自行執行 |
+| `mangakitchen.page.inspect` | 讀取完整頁面、產物、可用操作與 opaque `revision` |
+| `mangakitchen.page.update` | 帶入 `expected_revision` 更新頁名或頁序 |
 | `mangakitchen.page.prepare_agent_task` | 主要入口；一次回傳指定頁原圖與步驟二遮罩 JSON |
-| `mangakitchen.page.submit_agent_result` | 一次回寫指定頁全部區域的原文、譯文與排版，再直接執行步驟四 |
+| `mangakitchen.page.submit_agent_result` | 帶入工作包 revision，一次回寫全部區域並執行步驟四 |
+| `mangakitchen.page.render` | 依目前 HTML/CSS 區域資料重新合成頁面 |
+| `mangakitchen.region.batch_update` | 原子套用 1...64 個區域 partial patch |
+| `mangakitchen.region.reorder` | 以完整 ID 陣列更新閱讀與 PSD 圖層順序 |
 
-舊的 `page.detect_masks`、`page.supplement_regions`、`page.translate`、`page.compose`、`page.run_full` 與 `region.*` handler 只保留程式相容性，不再列入 MCP `tools/list`，避免 Agent 自行拆解流程或誤刪、重建區域。
+舊的 `page.detect_masks`、`page.supplement_regions`、`page.translate`、`page.compose`、`page.run_full` 與逐筆 `region.create/update/remove` handler 只保留程式相容性，不再列入 MCP `tools/list`，避免 Agent 自行拆解流程或誤刪、重建區域。契約化的 `region.batch_update` 與 `region.reorder` 仍是公開工具。
 
 ### 單頁工作包契約
 
@@ -299,17 +325,25 @@ MCP 初始化與工具清單只描述能力，不代表應立即操作資料。�
 
 `prepare_agent_task` 只在區域或遮罩不存在時自動建立步驟二；已有資料時直接沿用，不會覆蓋使用者修改。若已有抽取文字、翻譯或排版，這些資料會完整包含在 `regionData.entries` 中，交由 Agent 校稿與調整後回傳。所有 Agent 必要資料均包含於單次 tool result，Agent 不得搜尋、讀取或建立 `.str` 檔案，也不需額外讀取 page resource。
 
+`prepare_agent_task` 與 `page.inspect` 都會回傳 opaque `revision`。所有寫入工具必須原樣放入 `expected_revision`；如果 GUI 或另一個 Agent 已修改頁面，server 會整筆拒絕並回傳目前 revision，呼叫端必須重新 inspect，不能自行遞增或猜測 revision。
+
 `submit_agent_result.regions` 的格式如下，座標皆為左上原點的 0...1 正規化值：
 
 ```json
 {
   "workspace_id": "<uuid>",
   "page_id": "<uuid>",
+  "expected_revision": "page-<opaque-token>",
   "regions": [
     {
       "region_id": "<existing-region-uuid>",
       "source_text": "欲しいの？",
       "translated_text": "你想要嗎？",
+      "literal_translated_text": "你想要它嗎？",
+      "speaker_id": "speaker-1",
+      "tone": "試探、口語",
+      "translation_confidence": 0.92,
+      "translation_qa_flags": [],
       "translation_anchor": { "x": 0.82, "y": 0.305 },
       "translation_bounds": { "x": 0.76, "y": 0.285, "width": 0.17, "height": 0.19 },
       "automatic_font_size": true,
@@ -322,13 +356,19 @@ MCP 初始化與工具清單只描述能力，不代表應立即操作資料。�
 
 `regions` 必須完整包含工作包內所有 `region_id`，不可重複、缺少或多出項目。`source_text` 與 `translated_text` 必填；其餘排版欄位可省略以沿用 App 的既有或自動設定。Agent 回傳內容不接受 `bounds`、`bubble_bounds`、`mask_polygons` 或筆刷資料，因此不會改動步驟二。
 
+`region.batch_update` 是 partial patch：省略欄位代表沿用；只有 `translation_anchor`、`translation_bounds`、`bubble_bounds` 與 `font_size` 接受 `null` 清除。完整批次會先驗證 revision、ID、有限數值、顏色與範圍，任一 patch 無效時不會部分寫入。只有幾何欄位變更才重建遮罩；文字與樣式更新保留既有像素遮罩。
+
 ### Resources
 
 ```text
+mangakitchen://contract/current
 mangakitchen://workspace/list
 mangakitchen://workspace/current
+mangakitchen://workspace/current/pages
 mangakitchen://workspace/current/glossary
+mangakitchen://workspace/{workspace_id}/capabilities
 mangakitchen://page/{page_id}
+mangakitchen://page/{page_id}/regions
 mangakitchen://page/{page_id}/source
 mangakitchen://page/{page_id}/mask
 mangakitchen://page/{page_id}/output

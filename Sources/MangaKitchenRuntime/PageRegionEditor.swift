@@ -21,6 +21,8 @@ public enum FieldUpdate<Value> {
     }
 }
 
+extension FieldUpdate: Sendable where Value: Sendable {}
+
 /// 一次區域編輯要改的欄位。App 與 MCP 兩邊送進來的都是這個型別。
 public struct RegionEdit {
     public var sourceText: String?
@@ -33,6 +35,13 @@ public struct RegionEdit {
     public var fontSize: FieldUpdate<Double> = .unchanged
     public var useAutomaticFontSize: Bool?
     public var fontWeight: DialogueFontWeight?
+    public var textAlignment: DialogueTextAlignment?
+    public var textColorHex: String?
+    public var strokeColorHex: String?
+    public var strokeWidth: Double?
+    public var opacity: Double?
+    public var rotationDegrees: Double?
+    public var isVisible: Bool?
     public var writingDirection: WritingDirection?
     public var automaticMaskEnabled: Bool?
     /// MCP 步驟三只補文字時設為 false，保留步驟二已完成的像素遮罩。
@@ -79,7 +88,13 @@ public struct PageRegionEditor: Sendable {
                 region.translatedText = ""
             }
         }
-        if let translatedText = edit.translatedText { region.translatedText = translatedText }
+        if let translatedText = edit.translatedText {
+            if region.translatedText != translatedText {
+                region.translationConfidence = nil
+                region.translationQAFlags = []
+            }
+            region.translatedText = translatedText
+        }
         if edit.translationAnchor.isChange {
             region.translationAnchor = edit.translationAnchor
                 .applied(to: region.translationAnchor)?.clamped()
@@ -104,6 +119,29 @@ public struct PageRegionEditor: Sendable {
                 .map { min(max($0, 4), 512) }
         }
         if let fontWeight = edit.fontWeight { region.style.fontWeight = fontWeight }
+        if let textAlignment = edit.textAlignment { region.style.textAlignment = textAlignment }
+        if let textColorHex = edit.textColorHex {
+            region.style.textColorHex = DialogueStyle.normalizedHexColor(
+                textColorHex,
+                fallback: region.style.textColorHex
+            )
+        }
+        if let strokeColorHex = edit.strokeColorHex {
+            region.style.strokeColorHex = DialogueStyle.normalizedHexColor(
+                strokeColorHex,
+                fallback: region.style.strokeColorHex
+            )
+        }
+        if let strokeWidth = edit.strokeWidth, strokeWidth.isFinite {
+            region.style.strokeWidth = min(max(strokeWidth, 0), 20)
+        }
+        if let opacity = edit.opacity, opacity.isFinite {
+            region.style.opacity = min(max(opacity, 0), 1)
+        }
+        if let rotationDegrees = edit.rotationDegrees, rotationDegrees.isFinite {
+            region.style.rotationDegrees = min(max(rotationDegrees, -180), 180)
+        }
+        if let isVisible = edit.isVisible { region.style.isVisible = isVisible }
         if let writingDirection = edit.writingDirection {
             region.style.writingDirection = writingDirection
         }

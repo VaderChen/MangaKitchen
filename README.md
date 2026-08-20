@@ -27,7 +27,7 @@ GPLv3 本身允許商業使用及收費散布，但必須履行其原始碼與 c
 - macOS 14+ SwiftUI / WKWebView 應用程式殼。
 - HTML/JavaScript 與 Swift 的非同步 JSON Bridge。
 - WebUI 支援 `AUTO`、繁體中文、英文、日文與韓文；AUTO 跟隨 macOS 語言，手動選擇會跨啟動保存，原生目錄面板與 MCP menu bar 同步套用。
-- 全域設定 DLG 分為一般、進階、模型、MCP、關於；可設定介面語言、UI 色系、CPU／GPU 圖像合成、資料位置、兩類模型、MCP 連接埠與 IP／CIDR 白名單。
+- 全域設定 DLG 分為一般、進階、模型、MCP、關於；可設定介面語言、UI 色系、CPU／GPU 圖像合成、資料位置、圖生文／圖生圖／超高解析度模型、MCP 連接埠與 IP／CIDR 白名單。
 - 每個來源目錄建立為獨立專案，可保存多個專案並由工具列快速切換。
 - 選取來源目錄後遞迴掃描，保留子目錄相對路徑、自然排序並避免同名頁面衝突。
 - 頁面列表支援 Command／Shift 複選、搜尋與狀態篩選；遮罩、翻譯、合成都可針對選取頁面批次執行。
@@ -35,18 +35,24 @@ GPLv3 本身允許商業使用及收費散布，但必須履行其原始碼與 c
 - 每個專案擁有獨立的多語專有名詞表；一個原詞可保存多個 BCP-47 譯詞，翻譯時依目前目標語言自動套用。
 - 四階段工作流：掃描、文字／遮罩、翻譯／排版設定、背景修補／合成；同時保留一鍵完整頁與全部頁面。
 - 每張圖片對應版本化 `.str` JSON，保存文字、位置、字型、固定／自動字級與遮罩筆劃。
-- 遮罩以原圖像素層膨脹收進抗鋸齒邊緣，再由正規化畫筆支援添加、擦除與逐區復原，最後輸出二值 PNG；不再對逐條向量矩形描邊，避免灰階毛邊。步驟二完成後立即顯示已清除原文字的 CPU／GPU 遮罩校對圖，不提前啟動圖生圖模型。
+- 遮罩以原圖像素層膨脹收進抗鋸齒邊緣，再由正規化畫筆支援添加、擦除、復原與重做，最後輸出二值 PNG；不再對逐條向量矩形描邊，避免灰階毛邊。步驟二完成後立即顯示已清除原文字的 CPU／GPU 遮罩校對圖，不提前啟動圖生圖模型；Metal 修補會累積完整方向樣本並採亮度第 90 百分位背景色階，降低字緣或框線被填回遮罩的零碎殘留。
 - 內建由 [huyvux3005/manga109-segmentation-bubble](https://huggingface.co/huyvux3005/manga109-segmentation-bubble)（Apache-2.0）匯出的 manga109 氣泡分割 Core ML 模型，優先使用 Apple Neural Engine 在本機推論產生對話框 BBOX 與氣泡形狀；形狀會裁切遮罩搜尋範圍，並計算供 HTML 排版使用的氣泡內接矩形。之後才把每個候選交給圖生文模型分類與轉錄；不再使用系統 OCR 辨識或定位文字。主流程刻意排除擬聲字、頁碼、頁尾資訊、人物與空白區。
 - VLM 接受的對話框 BBOX 會以原圖像素連通元件收斂成字形遮罩，同步把文字定位框縮到未膨脹的實際字形外框；自動排版方向優先採用字形實際排列偵測結果。每個候選會獨立處理，單一候選的分類、轉錄或翻譯失敗時保留原區域並繼續其他區域；只有取消工作才會停止整體流程。
 - 圖生文模型的頁面語境翻譯 Prompt 與嚴格 JSON 回傳解析。
 - 可直接載入本機 Hugging Face MLX VLM 目錄，由 `mlx-swift-lm` 在 Apple Silicon／Metal 執行。
 - 以 model manifest 載入 `.mlmodelc`、`.mlmodel` 或 `.mlpackage`，Core ML 指定 Metal GPU。
+- 超高解析度提供兩個互不共用權重的模型：推薦的 `Real-ESRGAN x2plus` 原生 MLX 2×，以及可選的 `Real-ESRGAN Anime 512` 原生 Core ML 4×；2× 不會由 4× 結果降採樣冒充。完成後立即切換中央畫布、重繪既有翻譯預覽，尺寸旁以 `*` 標示 SR 產物，後續 HTML 合成與 PSD 也沿用實際 SR 尺寸。
 - 對話文字遮罩可由一個或多個像素級形狀覆蓋原字、裁切於對話框邊界，再疊加畫筆增刪；沒有圖生圖模型時可選 CPU 或 Metal GPU 修補。
-- HTML/CSS 是翻譯排版的唯一標準，支援橫排／直排、固定或自動字級、拖曳與尺寸調整；最終 PNG 由 WebKit 直接渲染同一套文字層，步驟三預覽不會在輸出時改成另一套排版。
+- HTML/CSS 是翻譯排版的唯一標準，支援橫排／直排、固定或自動字級、拖曳與八方向尺寸調整；最終 PNG 由 WebKit 直接渲染同一套文字層，步驟三預覽不會在輸出時改成另一套排版。
+- 編輯器支援區域新增、複製、移除、排序及每頁最多 50 份 undo／redo；畫布可水平與垂直平移，滾輪縮放以可視畫布中心為錨點，並提供適合視窗與 `1:1` 檢視。文字圖層支援顯示、透明度、旋轉、對齊、文字顏色、描邊及已安裝字型即時預覽。
+- PSD 的合併預覽、逐文字 Raster Layer、乾淨背景與隱藏原圖均由 HTML/CSS 渲染結果封裝，不另做一套排版；如果已套用超高解析度，所有可用圖層會保持相同放大後尺寸。
+- 專案可匯入或追加圖片、資料夾、ZIP／CBZ、RAR／CBR 與 PDF，並可重新命名、排序或從專案移除頁面；來源會複製、解包或點陣化到受管理目錄，移除不刪來源，重掃也不會自動加回。
 - 原圖／輸出圖安全地透過自訂 URL Scheme 提供給 WebUI，不直接暴露任意檔案。
 - 專案索引與各專案狀態自動儲存為版本化 JSON；寫入前保留上一版 `.bak`，重新啟動會驗證來源與輸出檔後復原。
 - 可選的 macOS 26 Swift/MLX Qwen Image Edit worker；mask 同時作為模型條件圖與最終合成限制。
 - 可選的標準 MCP Streamable HTTP server，提供四階段 tools、工作區／圖片 resources、取消與進度通知。
+- MCP 是外部 Provider 的主要擴充邊界；Agent 可使用自身支援的 Provider，再回寫完整文字與 HTML 圖層樣式，App 不維護重複的雲端 Provider 清單。
+- 本機翻譯支援整頁語境草稿、整頁二次校稿、直譯稿／顯示譯文分離、角色與語氣標記、信心分數及 deterministic QA；專案可獨立調整語境、校稿、QA、直譯稿、長度策略與風格指南。
 - MCP 啟用時常駐 macOS menu bar；主視窗關閉後可由 menu bar 重新開啟。
 
 ## 兩種使用方式，共用同一套專案與四步驟
@@ -75,6 +81,7 @@ MangaKitchen 有兩種操作方式。它們只改變「誰負責推論與編排�
 
 - `imageToText` 模型是 GUI 本機步驟三的必要條件，先在既有對話框 BBOX 中分類與轉錄原文，再依頁面語境翻譯。步驟二可在未載入模型時完成 Core ML BBOX 與像素遮罩；步驟三未載入模型時不會改走系統 OCR。擬聲字不進入目前的翻譯主流程，分類、轉錄與翻譯會逐區處理並隔離例外；單區失敗不會讓整頁失敗。
 - `imageToImage` 模型負責步驟四的背景修補，屬於選用；未設定時依「設定 → 進階」使用 Metal GPU 鄰域修補或 CPU 對話框主色修補，GPU 失敗時會自動退回 CPU。
+- `superResolution` 模型屬於選用；可在步驟二產生乾淨背景後手動執行，也可啟用完整流程自動放大。SR 改變實際像素尺寸，不改變畫布檢視倍率的標準計算。
 - GUI 可分步執行，也可使用「完整處理選取頁／全部頁面」。一鍵功能仍只是依序執行步驟二至四，不會跳過中間資料。
 - 所有結果都回寫專案與 `.str`，可在任何步驟人工修正後重新執行後續階段。
 
@@ -119,6 +126,7 @@ GUI 無論 MCP 開關都會啟動；省略 `--mcp` 時使用設定 DLG 中保存
 ~/Library/Application Support/MangaKitchen/
   Projects/library.json
   Projects/<project-uuid>/project.json
+  Imported/<import-uuid>/
   Artifacts/<page-uuid>/
 ```
 
@@ -139,6 +147,9 @@ manifest 的 feature 名稱必須與實際 Core ML 模型一致。現有 Core ML
 
 - 圖生文：圖片 feature、可選的字串 prompt feature、字串輸出 feature。
 - 圖生圖：圖片 feature、可選的 mask／prompt feature、圖片輸出 feature。
+- 超解析：`TheMurusTeam/coreml-upscaler-realesrganAnime512` 的原生 4× Core ML 輸出。
+
+原生 2× 超解析使用獨立的 [mlx-community/Real-ESRGAN-x2plus](https://huggingface.co/mlx-community/Real-ESRGAN-x2plus) FP16 Safetensors（BSD-3-Clause）。下載器會為它建立 `backend: mlxSwift`、`capability: superResolution`、`superResolutionScale: 2` 的 manifest，再由專用 RRDBNet runtime 執行；它與 4× Anime Core ML 模型沒有共用權重或降採樣路徑。
 
 Core ML manifest 是對「已封裝成單次 prediction 的模型」提供的通用 Adapter。Qwen-VL 這類需要 tokenizer 與逐 token 解碼的模型會改走專用 MLX Adapter；需要 sampler loop 的擴散模型也必須使用專用 `ImageToImageGenerating` Adapter，不能只更改 Core ML feature 名稱。核心 pipeline 不需要跟著修改。
 
@@ -207,7 +218,7 @@ MangaKitchenApp/MCP
 
 - 內建氣泡 BBOX Core ML 模型；圖生文與圖生圖模型權重仍需由使用者另行下載與設定。
 - 目前的自動候選偵測使用 `manga109-segmentation-bubble` Core ML 模型；暗色／彩色對話框、非封閉旁白框仍可能需要 Agent 提供精確區域。擬聲字目前刻意不納入翻譯主流程，未來若支援會採獨立偵測與排版策略。
-- Metal 鄰域修補是沒有圖生圖模型時的保底方案，複雜網點或跨越線稿的文字仍建議使用 inpainting 模型。
+- Metal 鄰域修補已避免以少量近距離深色樣本填回字緣，但仍是沒有圖生圖模型時的保底方案；複雜網點、漸層或跨越線稿的文字仍建議使用 inpainting 模型。
 - Qwen Image Edit INT4 仍需要約 25GB 級推論記憶體，且一次頁面修補要執行完整 diffusion；低記憶體 Mac 應停用圖生圖修補。
 - Swift Package 直接執行尚未加入 App Sandbox security-scoped bookmark、簽章、notarization 與正式 `.app` 封裝流程。
 - 尚未加入 App Sandbox security-scoped bookmark；移動原圖或模型資料夾後，復原流程會略過失效路徑並提示。

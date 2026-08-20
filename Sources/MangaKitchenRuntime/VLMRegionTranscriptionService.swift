@@ -20,6 +20,7 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
         pageURL: URL,
         regions: [DialogueRegion],
         sourceLanguageCodes: [String],
+        regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
         guard !regions.isEmpty else {
@@ -45,6 +46,7 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
             progress(1)
             return regions
         }
+        regionProgress(0, pendingRegions.count)
 
         var recognizedByID: [UUID: DialogueRegion] = [:]
         for region in regions where !region.sourceText.trimmingCharacters(
@@ -91,26 +93,24 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
                 }
                 let kind = item.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard Self.isAcceptedKind(kind), !text.isEmpty, !Self.isSoundEffectTranscript(text) else {
-                    progress(Double(offset + 1) / Double(regionCount))
-                    continue
+                if Self.isAcceptedKind(kind), !text.isEmpty, !Self.isSoundEffectTranscript(text) {
+                    var recognized = region
+                    recognized.rawSourceText = text
+                    recognized.sourceText = text
+                    recognized.ocrTextRefined = true
+                    recognized.detectedWritingDirection = item.direction
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                        .flatMap(WritingDirection.init(rawValue:))
+                        ?? recognized.detectedWritingDirection
+                    recognizedByID[recognized.id] = recognized
                 }
-                var recognized = region
-                recognized.rawSourceText = text
-                recognized.sourceText = text
-                recognized.ocrTextRefined = true
-                recognized.detectedWritingDirection = item.direction
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-                    .flatMap(WritingDirection.init(rawValue:))
-                    ?? recognized.detectedWritingDirection
-                recognizedByID[recognized.id] = recognized
-                progress(Double(offset + 1) / Double(regionCount))
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 // 單一區域無法裁切、辨識或解析時保留原區域，繼續處理下一區。
-                progress(Double(offset + 1) / Double(regionCount))
             }
+            regionProgress(offset + 1, pendingRegions.count)
+            progress(Double(offset + 1) / Double(regionCount))
         }
         return regions.map { recognizedByID[$0.id] ?? $0 }
     }

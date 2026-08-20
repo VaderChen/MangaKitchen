@@ -20,6 +20,9 @@ final class AssetSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendabl
             if let backgroundURL = page.backgroundURL {
                 values["\(id)/background"] = backgroundURL
             }
+            if let superResolvedBackgroundURL = page.superResolvedBackgroundURL {
+                values["\(id)/background-2x"] = superResolvedBackgroundURL
+            }
             if let translationPreviewURL = page.translationPreviewURL {
                 values["\(id)/translation-preview"] = translationPreviewURL
             }

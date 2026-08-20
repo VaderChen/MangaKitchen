@@ -51,7 +51,9 @@ private struct MangaKitchenApplication: App {
             dataDirectoryPath: settings.dataDirectoryPath,
             imageCompositingBackend: settings.resolvedImageCompositingBackend,
             imageToTextModelPath: settings.imageToTextModelPath,
-            imageToImageModelPath: settings.imageToImageModelPath
+            imageToImageModelPath: settings.imageToImageModelPath,
+            automaticSuperResolutionEnabled: settings.automaticSuperResolutionEnabled,
+            superResolutionModelPath: settings.superResolutionModelPath
         )
         let mcpController = MCPServiceController(
             enabled: settings.mcpEnabled,

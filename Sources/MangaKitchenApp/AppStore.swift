@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import ImageIO
 import MangaKitchenCore
 import MangaKitchenRuntime
 
@@ -25,6 +26,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var isSwitchingProject = false
     @Published private(set) var modelDownloadState: ModelDownloadState?
     @Published private(set) var modelLoadingState: ModelLoadingState?
+    @Published private(set) var automaticSuperResolutionEnabled = false
     @Published private(set) var processingActivities: [UUID: PageProcessingActivity] = [:]
     @Published private(set) var processingRegionProgress: [UUID: ProcessingRegionProgress] = [:]
     @Published var statusMessage: String?
@@ -40,6 +42,8 @@ final class AppStore: ObservableObject {
     private let stringTables = ComicStringTableRepository()
     private let pathResolver = WorkflowPathResolver()
     private let modelDownloader = HuggingFaceModelDownloader()
+    private let importService = ManagedImportService()
+    private let htmlTypesetter: HTMLDialogueTypesetter?
 
     private var projectSnapshots: [UUID: WorkspaceSnapshot] = [:]
     private var activeModelDirectories: [URL] = []
@@ -52,12 +56,17 @@ final class AppStore: ObservableObject {
     private var translationPreviewTasks: [UUID: Task<Void, Never>] = [:]
     private var undoneMaskStrokes: [UUID: [UUID: [MaskStroke]]] = [:]
     private var maskRevisions: [UUID: UInt64] = [:]
+    private var regionUndoHistory: [UUID: [[DialogueRegion]]] = [:]
+    private var regionRedoHistory: [UUID: [[DialogueRegion]]] = [:]
+    private var excludedSourceRelativePaths: Set<String> = []
 
     init(
         dataDirectoryPath: String? = nil,
         imageCompositingBackend: ImageCompositingBackend = .cpu,
         imageToTextModelPath: String? = nil,
-        imageToImageModelPath: String? = nil
+        imageToImageModelPath: String? = nil,
+        automaticSuperResolutionEnabled: Bool = false,
+        superResolutionModelPath: String? = nil
     ) {
         do {
             let metal = try MetalContext()
@@ -73,6 +82,7 @@ final class AppStore: ObservableObject {
                 compositingBackend: imageCompositingBackend
             )
             let bubbleSegmenter = Self.bundledBubbleSegmenter()
+            let htmlTypesetter = HTMLDialogueTypesetter()
             let pipeline = ComicTranslationPipeline(
                 regionDetector: MangaBubbleMaskRegionDetector(bubbleSegmenter: bubbleSegmenter),
                 textRecognizer: VLMRegionTranscriptionService(model: models),
@@ -80,12 +90,14 @@ final class AppStore: ObservableObject {
                 translator: VLMRegionTranslationService(model: models),
                 maskGenerator: DialogueMaskGenerator(),
                 backgroundRestorer: backgroundRestorer,
-                typesetter: HTMLDialogueTypesetter(),
-                outputRoot: artifactsRoot
+                typesetter: htmlTypesetter,
+                outputRoot: artifactsRoot,
+                superResolver: models
             )
             self.models = models
             self.pipeline = pipeline
             self.backgroundRestorer = backgroundRestorer
+            self.htmlTypesetter = htmlTypesetter
             applicationRoot = root
             self.projectsRoot = projectsRoot
             legacyRepository = WorkspaceRepository(
@@ -97,10 +109,12 @@ final class AppStore: ObservableObject {
                 fileURL: projectsRoot.appendingPathComponent("library.json")
             )
             statusMessage = "Metal 裝置已就緒，請建立或選取漫畫專案。"
+            self.automaticSuperResolutionEnabled = automaticSuperResolutionEnabled
         } catch {
             models = nil
             pipeline = nil
             backgroundRestorer = nil
+            htmlTypesetter = nil
             applicationRoot = nil
             projectsRoot = nil
             legacyRepository = nil
@@ -112,7 +126,8 @@ final class AppStore: ObservableObject {
             await self.restoreProjectLibrary()
             await self.applyPreferredModelsNow(
                 imageToTextPath: imageToTextModelPath,
-                imageToImagePath: imageToImageModelPath
+                imageToImagePath: imageToImageModelPath,
+                superResolutionPath: superResolutionModelPath
             )
         }
     }
@@ -201,7 +216,8 @@ final class AppStore: ObservableObject {
                 : selectedIncomingPageIDs,
             modelDirectories: existingSnapshot?.modelDirectories ?? [],
             sourceDirectoryURL: sourceDirectoryURL,
-            outputDirectoryURL: state.outputDirectoryURL?.standardizedFileURL
+            outputDirectoryURL: state.outputDirectoryURL?.standardizedFileURL,
+            excludedSourceRelativePaths: existingSnapshot?.excludedSourceRelativePaths ?? []
         )
         let restored = validated(snapshot)
         for page in restored.pages {
@@ -234,7 +250,7 @@ final class AppStore: ObservableObject {
     // MARK: - 專案管理與步驟一
 
     /// 每個來源目錄對應一個專案；重複選取既有目錄時改為切換並重掃。
-    func openProject(from directoryURL: URL) {
+    func openProject(from directoryURL: URL, displayName: String? = nil) {
         guard !isProcessing, !isSwitchingProject else {
             statusMessage = "工作或專案切換進行中，暫時無法開啟其他專案。"
             return
@@ -260,7 +276,10 @@ final class AppStore: ObservableObject {
             let projectID = UUID()
             let snapshot = WorkspaceSnapshot(
                 projectID: projectID,
-                name: sourceURL.lastPathComponent,
+                name: displayName.flatMap {
+                    let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return value.isEmpty ? nil : value
+                } ?? sourceURL.lastPathComponent,
                 options: ProcessingOptions(),
                 glossary: ProjectGlossary(),
                 pages: [],
@@ -449,14 +468,178 @@ final class AppStore: ObservableObject {
     }
 
     func importPages(from inputURLs: [URL]) {
-        guard let first = inputURLs.first else { return }
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: first.path, isDirectory: &isDirectory),
-           isDirectory.boolValue {
-            openProject(from: first)
-        } else {
-            openProject(from: first.deletingLastPathComponent())
+        guard !inputURLs.isEmpty, let applicationRoot else { return }
+        guard !isProcessing, !isSwitchingProject else {
+            statusMessage = "工作或專案切換進行中，暫時無法匯入。"
+            return
         }
+        statusMessage = "正在建立可攜式匯入專案…"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let managedRoot = applicationRoot.appendingPathComponent("Imported", isDirectory: true)
+                let directory = try self.importService.materialize(inputURLs, under: managedRoot)
+                let name = inputURLs.first?.deletingPathExtension().lastPathComponent
+                self.openProject(from: directory, displayName: name)
+            } catch {
+                self.statusMessage = "匯入失敗：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func appendPages(from inputURLs: [URL]) {
+        guard !inputURLs.isEmpty,
+              let applicationRoot,
+              let sourceDirectoryURL else { return }
+        guard !isProcessing, !isSwitchingProject else {
+            statusMessage = "工作或專案切換進行中，暫時無法追加頁面。"
+            return
+        }
+        statusMessage = "正在追加漫畫頁面…"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let importedRoot = applicationRoot.appendingPathComponent("Imported", isDirectory: true)
+                let source = sourceDirectoryURL.standardizedFileURL
+                let managedPrefix = importedRoot.standardizedFileURL.path + "/"
+                let projectRoot: URL
+                if source.path.hasPrefix(managedPrefix) {
+                    let destination = source
+                        .appendingPathComponent("Imported-\(UUID().uuidString)", isDirectory: true)
+                    try self.importService.append(inputURLs, to: destination)
+                    projectRoot = source
+                } else {
+                    projectRoot = try self.importService.materialize(
+                        [source] + inputURLs,
+                        under: importedRoot
+                    )
+                }
+                let scanned = try self.scanner.scan(projectRoot)
+                await self.mergeScannedPages(scanned, sourceDirectoryURL: projectRoot)
+                self.statusMessage = "已追加頁面，專案目前共 \(self.pages.count) 頁。"
+                self.schedulePersistence()
+            } catch {
+                self.statusMessage = "追加頁面失敗：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func exportPSD(pageIDs: [UUID], to directory: URL) {
+        let selected = pages.filter { pageIDs.contains($0.id) }
+        guard !selected.isEmpty else { statusMessage = "請先選取至少一張漫畫頁面。"; return }
+        guard let htmlTypesetter else {
+            statusMessage = "HTML 排版器尚未就緒。"
+            return
+        }
+        statusMessage = "正在以 HTML/CSS 建立 PSD 圖層…"
+        Task { [weak self] in
+            guard let self else { return }
+            let temporaryRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MangaKitchen-PSD-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+                var exportedCount = 0
+                for page in selected {
+                    try Task.checkCancellation()
+                    let pageTemporaryDirectory = temporaryRoot
+                        .appendingPathComponent(page.id.uuidString, isDirectory: true)
+                    try FileManager.default.createDirectory(
+                        at: pageTemporaryDirectory,
+                        withIntermediateDirectories: true
+                    )
+                    let backgroundURL = page.superResolvedBackgroundURL
+                        ?? page.backgroundURL
+                        ?? page.sourceURL
+                    let renderScale = Self.superResolutionRenderScale(for: page)
+                    let compositeURL = pageTemporaryDirectory.appendingPathComponent("html-composite.png")
+                    try await htmlTypesetter.typeset(
+                        backgroundURL: backgroundURL,
+                        regions: page.regions,
+                        outputURL: compositeURL,
+                        renderScale: renderScale
+                    )
+                    guard let composite = Self.loadImage(compositeURL) else { continue }
+                    let renderedLayers = try await htmlTypesetter.renderTextLayers(
+                        canvasURL: backgroundURL,
+                        regions: page.regions,
+                        outputDirectory: pageTemporaryDirectory,
+                        renderScale: renderScale
+                    )
+                    var layers = renderedLayers.reversed().compactMap { layer -> PSDLayer? in
+                        guard let image = Self.loadImage(layer.outputURL),
+                              image.width == composite.width,
+                              image.height == composite.height else { return nil }
+                        return PSDLayer(
+                            name: layer.name,
+                            image: image,
+                            opacity: 255,
+                            visible: layer.visible
+                        )
+                    }
+                    if let background = Self.loadImage(backgroundURL),
+                       background.width == composite.width,
+                       background.height == composite.height {
+                        layers.append(PSDLayer(
+                            name: "Clean Background",
+                            image: background,
+                            opacity: 255,
+                            visible: true
+                        ))
+                    }
+                    if let source = Self.loadImage(page.sourceURL),
+                       source.width == composite.width,
+                       source.height == composite.height {
+                        layers.append(PSDLayer(
+                            name: "Original Source",
+                            image: source,
+                            opacity: 255,
+                            visible: false
+                        ))
+                    }
+                    if layers.isEmpty {
+                        layers.append(PSDLayer(
+                            name: "HTML Composite",
+                            image: composite,
+                            opacity: 255,
+                            visible: true
+                        ))
+                    }
+                    let safeTitle = page.title.replacingOccurrences(of: ".", with: "_")
+                    let filename = String(format: "%04d_%@.psd", page.index, safeTitle)
+                    try PSDExporter().write(
+                        layers: layers,
+                        mergedImage: composite,
+                        to: directory.appendingPathComponent(filename)
+                    )
+                    exportedCount += 1
+                }
+                self.statusMessage = "已由 HTML/CSS 輸出 \(exportedCount) 個分層 PSD。"
+            } catch is CancellationError {
+                self.statusMessage = "PSD 輸出已取消。"
+            } catch {
+                self.statusMessage = "PSD 匯出失敗：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private static func loadImage(_ url: URL) -> CGImage? {
+        CGImageSourceCreateWithURL(url as CFURL, nil).flatMap {
+            CGImageSourceCreateImageAtIndex($0, 0, nil)
+        }
+    }
+
+    private static func superResolutionRenderScale(for page: ComicPage) -> Double {
+        guard let url = page.superResolvedBackgroundURL,
+              let image = loadImage(url) else { return 1 }
+        return max(
+            1,
+            min(
+                Double(image.width) / Double(max(1, page.pixelWidth)),
+                Double(image.height) / Double(max(1, page.pixelHeight))
+            )
+        )
     }
 
     func setOutputDirectory(_ directoryURL: URL) {
@@ -504,11 +687,70 @@ final class AppStore: ObservableObject {
         schedulePersistence()
     }
 
+    func renamePage(pageID: UUID, name: String) {
+        guard !isProcessing,
+              let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            statusMessage = "頁面名稱不可空白。"
+            return
+        }
+        pages[index].title = String(normalized.prefix(200))
+        statusMessage = "已重新命名頁面。"
+        schedulePersistence()
+    }
+
+    func movePage(pageID: UUID, offset: Int) {
+        guard !isProcessing,
+              offset != 0,
+              let sourceIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        let destinationIndex = min(max(sourceIndex + offset, 0), pages.count - 1)
+        guard destinationIndex != sourceIndex else { return }
+        let page = pages.remove(at: sourceIndex)
+        pages.insert(page, at: destinationIndex)
+        normalizePageIndexes()
+        schedulePersistence()
+    }
+
+    func removePages(_ pageIDs: [UUID]) {
+        guard !isProcessing, !isSwitchingProject else {
+            statusMessage = "請等待目前工作完成或先取消工作。"
+            return
+        }
+        let requested = Set(pageIDs)
+        let removed = pages.filter { requested.contains($0.id) }
+        guard !removed.isEmpty else { return }
+        for page in removed {
+            if let relativePath = page.relativeSourcePath {
+                excludedSourceRelativePaths.insert(relativePath)
+            }
+            maskRegenerationTasks[page.id]?.cancel()
+            translationPreviewTasks[page.id]?.cancel()
+            undoneMaskStrokes[page.id] = nil
+            regionUndoHistory[page.id] = nil
+            regionRedoHistory[page.id] = nil
+        }
+        pages.removeAll { requested.contains($0.id) }
+        normalizePageIndexes()
+        let validIDs = Set(pages.map(\.id))
+        selectedPageIDs.formIntersection(validIDs)
+        selectedPageID = selectedPageID.flatMap { validIDs.contains($0) ? $0 : nil }
+            ?? pages.first?.id
+        if selectedPageIDs.isEmpty, let selectedPageID { selectedPageIDs = [selectedPageID] }
+        statusMessage = "已從專案移除 \(removed.count) 頁；來源檔案保留。"
+        schedulePersistence()
+    }
+
+    private func normalizePageIndexes() {
+        for index in pages.indices { pages[index].index = index + 1 }
+    }
+
     func clearPages() {
         guard !isProcessing else { return }
         cancelMaskRegeneration()
         cancelTranslationPreviewRegeneration()
         undoneMaskStrokes = [:]
+        excludedSourceRelativePaths.formUnion(pages.compactMap(\.relativeSourcePath))
         pages = []
         selectedPageID = nil
         selectedPageIDs = []
@@ -542,6 +784,7 @@ final class AppStore: ObservableObject {
                 try removeGeneratedFiles(for: page)
                 pages[pageIndex].regions = []
                 pages[pageIndex].backgroundURL = nil
+                pages[pageIndex].superResolvedBackgroundURL = nil
                 pages[pageIndex].maskURL = nil
                 pages[pageIndex].stringTableURL = nil
                 pages[pageIndex].translationPreviewURL = nil
@@ -579,6 +822,7 @@ final class AppStore: ObservableObject {
         ])
         [
             page.backgroundURL,
+            page.superResolvedBackgroundURL,
             page.maskURL,
             page.stringTableURL,
             page.stringTableURL?.appendingPathExtension("bak"),
@@ -633,6 +877,10 @@ final class AppStore: ObservableObject {
         enqueueSelected(operation: .compose)
     }
 
+    func superResolveSelectedPage() {
+        enqueueSelected(operation: .superResolve)
+    }
+
     func processAllPages() {
         enqueueBatch(operation: .fullPage, pageIDs: pages.map(\.id))
     }
@@ -659,6 +907,11 @@ final class AppStore: ObservableObject {
         }
         guard pipeline != nil else {
             statusMessage = "漫畫處理 Runtime 尚未就緒。"
+            return nil
+        }
+        if operation == .superResolve,
+           !loadedModels.contains(where: { $0.capability == .superResolution }) {
+            statusMessage = "請先在設定中下載並載入超解析模型。"
             return nil
         }
         if operation.requiresTextModel,
@@ -846,6 +1099,7 @@ final class AppStore: ObservableObject {
             statusMessage = "找不到要新增遮罩的頁面。"
             return nil
         }
+        recordRegionHistory(pageID: pageID, regions: pages[pageIndex].regions)
         let region = DialogueRegion(
             bounds: bounds.clamped(),
             sourceText: sourceText,
@@ -873,6 +1127,7 @@ final class AppStore: ObservableObject {
             statusMessage = "找不到要複製的文字區域。"
             return nil
         }
+        recordRegionHistory(pageID: pageID, regions: pages[pageIndex].regions)
         let source = pages[pageIndex].regions[regionIndex]
         let offset = 0.025
         func shifted(_ rect: NormalizedRect) -> NormalizedRect {
@@ -991,6 +1246,7 @@ final class AppStore: ObservableObject {
             statusMessage = "找不到要移除的對話區域。"
             return
         }
+        recordRegionHistory(pageID: pageID, regions: pages[pageIndex].regions)
         let hadRenderedMask = pages[pageIndex].maskURL != nil
             || pages[pageIndex].backgroundURL != nil
         let removedRegion = pages[pageIndex].regions.remove(at: regionIndex)
@@ -1006,6 +1262,24 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func moveRegion(pageID: UUID, regionID: UUID, offset: Int) {
+        guard offset != 0,
+              let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
+              let sourceIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
+            return
+        }
+        let destinationIndex = min(
+            max(sourceIndex + offset, 0),
+            pages[pageIndex].regions.count - 1
+        )
+        guard destinationIndex != sourceIndex else { return }
+        recordRegionHistory(pageID: pageID, regions: pages[pageIndex].regions)
+        let region = pages[pageIndex].regions.remove(at: sourceIndex)
+        pages[pageIndex].regions.insert(region, at: destinationIndex)
+        markPageEdited(at: pageIndex)
+        persistEditedRegion(pageID: pageID)
+    }
+
     func updateRegion(
         pageID: UUID,
         regionID: UUID,
@@ -1019,6 +1293,13 @@ final class AppStore: ObservableObject {
         fontName: String?,
         fontSize: Double?,
         fontWeight: DialogueFontWeight?,
+        textAlignment: DialogueTextAlignment?,
+        textColorHex: String?,
+        strokeColorHex: String?,
+        strokeWidth: Double?,
+        opacity: Double?,
+        rotationDegrees: Double?,
+        isVisible: Bool?,
         useAutomaticFontSize: Bool?,
         writingDirection: WritingDirection?,
         automaticMaskEnabled: Bool?
@@ -1028,6 +1309,7 @@ final class AppStore: ObservableObject {
             statusMessage = "找不到要更新的對話區域。"
             return
         }
+        recordRegionHistory(pageID: pageID, regions: pages[pageIndex].regions)
         var edit = RegionEdit()
         edit.sourceText = sourceText
         edit.translatedText = translatedText
@@ -1039,6 +1321,13 @@ final class AppStore: ObservableObject {
         if let fontSize, fontSize.isFinite { edit.fontSize = .set(fontSize) }
         edit.useAutomaticFontSize = useAutomaticFontSize
         edit.fontWeight = fontWeight
+        edit.textAlignment = textAlignment
+        edit.textColorHex = textColorHex
+        edit.strokeColorHex = strokeColorHex
+        edit.strokeWidth = strokeWidth
+        edit.opacity = opacity
+        edit.rotationDegrees = rotationDegrees
+        edit.isVisible = isVisible
         edit.writingDirection = writingDirection
         edit.automaticMaskEnabled = automaticMaskEnabled
         var shouldRefineMask = PageRegionEditor.apply(
@@ -1068,6 +1357,42 @@ final class AppStore: ObservableObject {
         } else {
             persistEditedRegion(pageID: pageID)
         }
+    }
+
+    func undoRegionEdit(pageID: UUID) {
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
+              var history = regionUndoHistory[pageID], let previous = history.popLast() else {
+            statusMessage = "沒有可復原的文字區域修改。"
+            return
+        }
+        regionUndoHistory[pageID] = history.isEmpty ? nil : history
+        regionRedoHistory[pageID, default: []].append(pages[pageIndex].regions)
+        pages[pageIndex].regions = previous
+        markPageEdited(at: pageIndex)
+        scheduleMaskRegeneration(pageID: pageID)
+        scheduleTranslationPreviewRegeneration(pageID: pageID)
+    }
+
+    func redoRegionEdit(pageID: UUID) {
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
+              var history = regionRedoHistory[pageID], let next = history.popLast() else {
+            statusMessage = "沒有可重做的文字區域修改。"
+            return
+        }
+        regionRedoHistory[pageID] = history.isEmpty ? nil : history
+        regionUndoHistory[pageID, default: []].append(pages[pageIndex].regions)
+        pages[pageIndex].regions = next
+        markPageEdited(at: pageIndex)
+        scheduleMaskRegeneration(pageID: pageID)
+        scheduleTranslationPreviewRegeneration(pageID: pageID)
+    }
+
+    private func recordRegionHistory(pageID: UUID, regions: [DialogueRegion]) {
+        var history = regionUndoHistory[pageID] ?? []
+        if history.last != regions { history.append(regions) }
+        if history.count > 50 { history.removeFirst(history.count - 50) }
+        regionUndoHistory[pageID] = history
+        regionRedoHistory[pageID] = nil
     }
 
     // MARK: - 模型與設定
@@ -1163,20 +1488,63 @@ final class AppStore: ObservableObject {
         statusMessage = "已刪除模型：\(model.displayName)"
     }
 
-    func applyPreferredModels(imageToTextPath: String?, imageToImagePath: String?) {
+    func applyPreferredModels(
+        imageToTextPath: String?,
+        imageToImagePath: String?,
+        superResolutionPath: String? = nil
+    ) {
         Task {
             await applyPreferredModelsNow(
                 imageToTextPath: imageToTextPath,
-                imageToImagePath: imageToImagePath
+                imageToImagePath: imageToImagePath,
+                superResolutionPath: superResolutionPath
             )
         }
+    }
+
+    func setAutomaticSuperResolutionEnabled(_ enabled: Bool) {
+        automaticSuperResolutionEnabled = enabled
+        schedulePersistence()
     }
 
     func setOptions(_ value: ProcessingOptions) {
         var supportedValue = value
         supportedValue.useImageToImageRestoration = false
+        let previousDefaultFont = options.defaultStyle.fontName
+        let nextDefaultFont = supportedValue.defaultStyle.fontName
+        var fontUpdatedPageIDs: [UUID] = []
+        if previousDefaultFont != nextDefaultFont {
+            for pageIndex in pages.indices {
+                let matchingRegionIndexes = pages[pageIndex].regions.indices.filter {
+                    pages[pageIndex].regions[$0].style.fontName == previousDefaultFont
+                }
+                guard !matchingRegionIndexes.isEmpty else { continue }
+                let pageID = pages[pageIndex].id
+                recordRegionHistory(pageID: pageID, regions: pages[pageIndex].regions)
+                for regionIndex in matchingRegionIndexes {
+                    pages[pageIndex].regions[regionIndex].style.fontName = nextDefaultFont
+                }
+                markPageEdited(at: pageIndex)
+                fontUpdatedPageIDs.append(pageID)
+            }
+        }
         options = supportedValue
+        for pageID in fontUpdatedPageIDs {
+            scheduleTranslationPreviewRegeneration(pageID: pageID)
+        }
         schedulePersistence()
+        guard !fontUpdatedPageIDs.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                for pageID in fontUpdatedPageIDs {
+                    try await self.persistStringTableNow(pageID: pageID)
+                }
+                self.schedulePersistence()
+            } catch {
+                self.statusMessage = "更新預設字型失敗：\(error.localizedDescription)"
+            }
+        }
     }
 
     // MARK: - 專案專有名詞表
@@ -1239,6 +1607,8 @@ final class AppStore: ObservableObject {
                 pageID: pageID,
                 forceRecalculation: forceRecalculation
             )
+        case .superResolve:
+            try await runSuperResolution(pageID: pageID)
         case .compose:
             try await runComposition(pageID: pageID)
         case .fullPage:
@@ -1322,6 +1692,7 @@ final class AppStore: ObservableObject {
         pages[index].regions = result.regions
         pages[index].maskURL = result.maskURL
         pages[index].backgroundURL = previewURL
+        pages[index].superResolvedBackgroundURL = nil
         advanceMaskRevision(pageID: pageID)
         pages[index].translationPreviewURL = nil
         pages[index].outputURL = nil
@@ -1372,6 +1743,7 @@ final class AppStore: ObservableObject {
         undoneMaskStrokes[pageID] = nil
         pages[index].maskURL = maskURL
         pages[index].backgroundURL = previewURL
+        pages[index].superResolvedBackgroundURL = nil
         advanceMaskRevision(pageID: pageID)
         pages[index].translationPreviewURL = nil
         pages[index].outputURL = nil
@@ -1429,14 +1801,27 @@ final class AppStore: ObservableObject {
             regions: regions,
             options: options,
             existingMaskURL: page.maskURL,
+            existingSuperResolvedBackgroundURL: page.superResolvedBackgroundURL,
+            useSuperResolution: automaticSuperResolutionEnabled
+                && loadedModels.contains(where: { $0.capability == .superResolution }),
             activity: activityHandler(pageID: pageID),
-            progress: translationLayoutProgressHandler(pageID: pageID)
+            progress: translationLayoutProgressHandler(pageID: pageID),
+            superResolutionProgress: { [weak self] value in
+                Task { @MainActor [weak self] in
+                    self?.updateProgress(
+                        pageID: pageID,
+                        stage: .superResolving,
+                        fraction: value
+                    )
+                }
+            }
         )
         try Task.checkCancellation()
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         pages[index].regions = composition.regions
         pages[index].maskURL = composition.maskURL
         pages[index].backgroundURL = composition.backgroundURL
+        pages[index].superResolvedBackgroundURL = composition.superResolvedBackgroundURL
         advanceMaskRevision(pageID: pageID)
         pages[index].translationPreviewURL = composition.outputURL
         pages[index].outputURL = nil
@@ -1450,9 +1835,68 @@ final class AppStore: ObservableObject {
                 "有 \(untranslatedRegionCount) 個文字區域翻譯失敗，已保留原有譯文並繼續處理。"
             )
         }
+        let qualityWarningCount = regions.count {
+            $0.translationQAFlags.contains(where: { $0 != .reviewAdjusted })
+        }
+        if qualityWarningCount > 0 {
+            warnings.append("有 \(qualityWarningCount) 個文字區域需要翻譯 QA 確認，已在文字區域面板標示。")
+        }
         statusMessage = warnings.isEmpty
             ? "第 \(pages[index].index) 頁翻譯與自動排版完成，可逐區確認或調整。"
             : warnings.joined(separator: "\n")
+        schedulePersistence()
+    }
+
+    private func runSuperResolution(pageID: UUID) async throws {
+        try Task.checkCancellation()
+        guard let pipeline,
+              let page = pages.first(where: { $0.id == pageID }) else {
+            throw AppWorkflowError.pageNotFound
+        }
+        guard let backgroundURL = page.backgroundURL,
+              FileManager.default.fileExists(atPath: backgroundURL.path) else {
+            throw AppWorkflowError.maskRequired
+        }
+        guard loadedModels.contains(where: { $0.capability == .superResolution }) else {
+            throw ModelRuntimeError.capabilityNotLoaded(.superResolution)
+        }
+        if let index = pages.firstIndex(where: { $0.id == pageID }) {
+            pages[index].stage = .superResolving
+            pages[index].progress = Self.totalProgress(stage: .superResolving, fraction: 0)
+            pages[index].errorMessage = nil
+        }
+        processingActivities[pageID] = .superResolving
+        statusMessage = "第 \(page.index) 頁正在執行超解析…"
+        let resolvedURL = try await pipeline.superResolve(
+            page: page,
+            inputURL: backgroundURL,
+            progress: { [weak self] value in
+                Task { @MainActor [weak self] in
+                    self?.updateProgress(
+                        pageID: pageID,
+                        stage: .superResolving,
+                        fraction: value
+                    )
+                }
+            }
+        )
+        try Task.checkCancellation()
+        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[index].superResolvedBackgroundURL = resolvedURL
+        if let translationPreviewURL = pages[index].translationPreviewURL,
+           pages[index].regions.contains(where: { !$0.translatedText.isEmpty }) {
+            try await pipeline.rerender(
+                backgroundURL: resolvedURL,
+                regions: pages[index].regions,
+                outputURL: translationPreviewURL,
+                renderScale: Self.superResolutionRenderScale(for: pages[index])
+            )
+        }
+        pages[index].stage = .translationReady
+        pages[index].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
+        pages[index].errorMessage = nil
+        statusMessage = "第 \(pages[index].index) 頁已完成超解析與重新排版。"
+        try await persistStringTableNow(pageID: pageID)
         schedulePersistence()
     }
 
@@ -1553,6 +1997,9 @@ final class AppStore: ObservableObject {
         guard batchJobs.contains(where: {
             $0.status == .running && $0.currentPageID == pageID
         }) else { return }
+        if processingActivities[pageID] != activity {
+            processingRegionProgress[pageID] = nil
+        }
         processingActivities[pageID] = activity
     }
 
@@ -1619,6 +2066,7 @@ final class AppStore: ObservableObject {
         translationPreviewTasks[pageID] = nil
         if let index = pages.firstIndex(where: { $0.id == pageID }) {
             pages[index].translationPreviewURL = nil
+            pages[index].superResolvedBackgroundURL = nil
         }
         maskRegenerationTasks[pageID]?.cancel()
         maskRegenerationTasks[pageID] = Task { @MainActor [weak self] in
@@ -1654,6 +2102,7 @@ final class AppStore: ObservableObject {
                 }
                 self.pages[index].maskURL = maskURL
                 self.pages[index].backgroundURL = previewURL
+                self.pages[index].superResolvedBackgroundURL = nil
                 self.advanceMaskRevision(pageID: pageID)
                 try await self.persistStringTableNow(pageID: pageID)
                 self.schedulePersistence()
@@ -1694,14 +2143,15 @@ final class AppStore: ObservableObject {
             guard !Task.isCancelled,
                   let pipeline = self.pipeline,
                   let page = self.pages.first(where: { $0.id == pageID }),
-                  let backgroundURL = page.backgroundURL,
+                  let backgroundURL = page.superResolvedBackgroundURL ?? page.backgroundURL,
                   let previewURL = page.translationPreviewURL,
                   page.regions.contains(where: { !$0.translatedText.isEmpty }) else { return }
             do {
                 try await pipeline.rerender(
                     backgroundURL: backgroundURL,
                     regions: page.regions,
-                    outputURL: previewURL
+                    outputURL: previewURL,
+                    renderScale: Self.superResolutionRenderScale(for: page)
                 )
                 guard !Task.isCancelled,
                       let index = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
@@ -1742,14 +2192,24 @@ final class AppStore: ObservableObject {
         let known = Dictionary(
             uniqueKeysWithValues: previousPages.map { ($0.sourceURL.standardizedFileURL.path, $0) }
         )
+        let knownRelative = Dictionary(
+            uniqueKeysWithValues: previousPages.compactMap { page in
+                page.relativeSourcePath.map { ($0, page) }
+            }
+        )
         let relocationGroups = Dictionary(grouping: previousPages) {
             Self.pageFingerprint(title: $0.title, width: $0.pixelWidth, height: $0.pixelHeight)
         }
         let relocated = relocationGroups.compactMapValues { $0.count == 1 ? $0[0] : nil }
         var reusedPageIDs: Set<UUID> = []
         var merged: [ComicPage] = []
+        let previousOrder = Dictionary(
+            uniqueKeysWithValues: previousPages.enumerated().map { ($0.element.id, $0.offset) }
+        )
+        var discoveredOrder: [UUID: Int] = [:]
 
-        for (offset, item) in scanned.enumerated() {
+        let included = scanned.filter { !excludedSourceRelativePaths.contains($0.relativePath) }
+        for (offset, item) in included.enumerated() {
             let title = item.sourceURL.deletingPathExtension().lastPathComponent
             let fingerprint = Self.pageFingerprint(
                 title: title,
@@ -1759,7 +2219,10 @@ final class AppStore: ObservableObject {
             let movedPage = relocated[fingerprint].flatMap {
                 reusedPageIDs.contains($0.id) ? nil : $0
             }
-            var page = known[item.sourceURL.path] ?? movedPage ?? ComicPage(
+            var page = known[item.sourceURL.path]
+                ?? knownRelative[item.relativePath]
+                ?? movedPage
+                ?? ComicPage(
                 index: offset + 1,
                 title: title,
                 sourceURL: item.sourceURL,
@@ -1784,8 +2247,25 @@ final class AppStore: ObservableObject {
                     ? .translationReady
                     : .maskReady
             }
+            discoveredOrder[page.id] = offset
             merged.append(page)
         }
+
+        merged.sort { left, right in
+            let leftPrevious = previousOrder[left.id]
+            let rightPrevious = previousOrder[right.id]
+            switch (leftPrevious, rightPrevious) {
+            case let (.some(leftIndex), .some(rightIndex)):
+                return leftIndex < rightIndex
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                return (discoveredOrder[left.id] ?? .max) < (discoveredOrder[right.id] ?? .max)
+            }
+        }
+        for index in merged.indices { merged[index].index = index + 1 }
 
         let validIDs = Set(merged.map(\.id))
         let oldSelection = selectedPageID
@@ -1961,7 +2441,7 @@ final class AppStore: ObservableObject {
         guard let legacyRepository,
               var snapshot = try await legacyRepository.load(),
               snapshot.sourceDirectoryURL != nil else { return }
-        snapshot.schemaVersion = 3
+        snapshot.schemaVersion = 4
         snapshot.name = snapshot.sourceDirectoryURL?.lastPathComponent ?? snapshot.name
         snapshot.selectedPageIDs = snapshot.selectedPageIDs.isEmpty
             ? Set(snapshot.selectedPageID.map { [$0] } ?? [])
@@ -1988,6 +2468,10 @@ final class AppStore: ObservableObject {
             if let previewURL = page.translationPreviewURL,
                !fileManager.fileExists(atPath: previewURL.path) {
                 page.translationPreviewURL = nil
+            }
+            if let superResolvedURL = page.superResolvedBackgroundURL,
+               !fileManager.fileExists(atPath: superResolvedURL.path) {
+                page.superResolvedBackgroundURL = nil
             }
             if let outputURL = page.outputURL,
                !fileManager.fileExists(atPath: outputURL.path) {
@@ -2026,15 +2510,31 @@ final class AppStore: ObservableObject {
         undoneMaskStrokes = [:]
         activeProjectID = snapshot.projectID
         activeProjectCreatedAt = snapshot.createdAt
-        pages = snapshot.pages
         var restoredOptions = snapshot.options
         restoredOptions.useImageToImageRestoration = false
+        let previousDefaultFont = restoredOptions.defaultStyle.fontName
+        let normalizedDefaultFont = FontFamilyCatalog.normalizedFontName(
+            previousDefaultFont,
+            for: restoredOptions.resolvedTargetLanguageCode
+        )
+        restoredOptions.defaultStyle.fontName = normalizedDefaultFont
+        var restoredPages = snapshot.pages
+        if previousDefaultFont != normalizedDefaultFont {
+            for pageIndex in restoredPages.indices {
+                for regionIndex in restoredPages[pageIndex].regions.indices
+                where restoredPages[pageIndex].regions[regionIndex].style.fontName == previousDefaultFont {
+                    restoredPages[pageIndex].regions[regionIndex].style.fontName = normalizedDefaultFont
+                }
+            }
+        }
+        pages = restoredPages
         options = restoredOptions
         glossary = snapshot.glossary
         sourceDirectoryURL = snapshot.sourceDirectoryURL
         outputDirectoryURL = snapshot.outputDirectoryURL
         selectedPageID = snapshot.selectedPageID
         selectedPageIDs = snapshot.selectedPageIDs
+        excludedSourceRelativePaths = snapshot.excludedSourceRelativePaths
         activeModelDirectories = snapshot.modelDirectories
     }
 
@@ -2052,6 +2552,7 @@ final class AppStore: ObservableObject {
         options = ProcessingOptions()
         glossary = ProjectGlossary()
         activeModelDirectories = []
+        excludedSourceRelativePaths = []
     }
 
     private func makeActiveSnapshot() -> WorkspaceSnapshot? {
@@ -2069,7 +2570,8 @@ final class AppStore: ObservableObject {
             selectedPageIDs: selectedPageIDs,
             modelDirectories: activeModelDirectories,
             sourceDirectoryURL: sourceDirectoryURL,
-            outputDirectoryURL: outputDirectoryURL
+            outputDirectoryURL: outputDirectoryURL,
+            excludedSourceRelativePaths: excludedSourceRelativePaths
         )
     }
 
@@ -2169,21 +2671,25 @@ final class AppStore: ObservableObject {
 
     private func applyPreferredModelsNow(
         imageToTextPath: String?,
-        imageToImagePath: String?
+        imageToImagePath: String?,
+        superResolutionPath: String?
     ) async {
         guard let models else { return }
-        let imageToTextSucceeded = await replacePreferredModel(
+        _ = await replacePreferredModel(
             capability: .imageToText,
             path: imageToTextPath,
             models: models
         )
-        if imageToTextSucceeded {
-            _ = await replacePreferredModel(
-                capability: .imageToImage,
-                path: imageToImagePath,
-                models: models
-            )
-        }
+        _ = await replacePreferredModel(
+            capability: .imageToImage,
+            path: imageToImagePath,
+            models: models
+        )
+        _ = await replacePreferredModel(
+            capability: .superResolution,
+            path: superResolutionPath,
+            models: models
+        )
         loadedModels = await models.loadedModels()
     }
 
@@ -2334,6 +2840,7 @@ final class AppStore: ObservableObject {
         case .maskReady: 0.25
         case .translating: 0.25 + value * 0.4
         case .translationReady: 0.65
+        case .superResolving: 0.65 + value * 0.35
         case .composing: 0.65 + value * 0.35
         case .recognizing: value * 0.15
         case .masking: 0.55 + value * 0.05

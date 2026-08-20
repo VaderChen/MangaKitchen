@@ -33,6 +33,7 @@ DerivedData/
 /Artifacts/
 /Dist/
 /Projects/
+/Processed/
 /Workspace/
 *.bak
 *.str

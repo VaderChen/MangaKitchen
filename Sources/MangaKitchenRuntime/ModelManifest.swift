@@ -94,6 +94,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
     public var modelFile: String?
     public var inputs: Inputs?
     public var outputs: Outputs?
+    public var superResolutionScale: Int?
     public var generation: Generation?
     public var externalRuntime: ExternalRuntime?
 
@@ -106,6 +107,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         modelFile: String? = nil,
         inputs: Inputs? = nil,
         outputs: Outputs? = nil,
+        superResolutionScale: Int? = nil,
         generation: Generation? = nil,
         externalRuntime: ExternalRuntime? = nil
     ) {
@@ -117,6 +119,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         self.modelFile = modelFile
         self.inputs = inputs
         self.outputs = outputs
+        self.superResolutionScale = superResolutionScale
         self.generation = generation
         self.externalRuntime = externalRuntime
     }

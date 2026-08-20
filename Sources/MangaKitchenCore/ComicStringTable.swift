@@ -57,7 +57,12 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
     public var rawSourceText: String?
     public var sourceText: String
     public var ocrTextRefined: Bool
+    public var literalTranslatedText: String?
     public var translatedText: String
+    public var speakerID: String?
+    public var tone: String?
+    public var translationConfidence: Double?
+    public var translationQAFlags: [TranslationQAFlag]
     public var translationAnchor: NormalizedPoint?
     public var translationBounds: NormalizedRect?
     public var confidence: Double
@@ -82,7 +87,12 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         rawSourceText = region.rawSourceText
         sourceText = region.sourceText
         ocrTextRefined = region.ocrTextRefined
+        literalTranslatedText = region.literalTranslatedText
         translatedText = region.translatedText
+        speakerID = region.speakerID
+        tone = region.tone
+        translationConfidence = region.translationConfidence
+        translationQAFlags = region.translationQAFlags
         translationAnchor = region.translationAnchor
         translationBounds = region.translationBounds
         confidence = region.confidence
@@ -106,7 +116,12 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
             rawSourceText: rawSourceText,
             sourceText: sourceText,
             ocrTextRefined: ocrTextRefined,
+            literalTranslatedText: literalTranslatedText,
             translatedText: translatedText,
+            speakerID: speakerID,
+            tone: tone,
+            translationConfidence: translationConfidence,
+            translationQAFlags: translationQAFlags,
             translationAnchor: translationAnchor,
             translationBounds: translationBounds,
             confidence: confidence,
@@ -131,7 +146,12 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         case rawSourceText
         case sourceText
         case ocrTextRefined
+        case literalTranslatedText
         case translatedText
+        case speakerID
+        case tone
+        case translationConfidence
+        case translationQAFlags
         case translationAnchor
         case translationBounds
         case confidence
@@ -165,7 +185,18 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         rawSourceText = try values.decodeIfPresent(String.self, forKey: .rawSourceText)
         sourceText = try values.decode(String.self, forKey: .sourceText)
         ocrTextRefined = try values.decodeIfPresent(Bool.self, forKey: .ocrTextRefined) ?? false
+        literalTranslatedText = try values.decodeIfPresent(String.self, forKey: .literalTranslatedText)
         translatedText = try values.decode(String.self, forKey: .translatedText)
+        speakerID = try values.decodeIfPresent(String.self, forKey: .speakerID)
+        tone = try values.decodeIfPresent(String.self, forKey: .tone)
+        translationConfidence = try values.decodeIfPresent(
+            Double.self,
+            forKey: .translationConfidence
+        ).map { min(max($0, 0), 1) }
+        translationQAFlags = try values.decodeIfPresent(
+            [TranslationQAFlag].self,
+            forKey: .translationQAFlags
+        ) ?? []
         translationAnchor = try values.decodeIfPresent(
             NormalizedPoint.self,
             forKey: .translationAnchor

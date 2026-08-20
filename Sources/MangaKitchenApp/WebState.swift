@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 import MangaKitchenCore
 
 struct WebPage: Encodable {
@@ -12,6 +13,11 @@ struct WebPage: Encodable {
     var maskPreviewURL: String?
     var maskRevision: UInt64?
     var maskAppliedPreviewURL: String?
+    var superResolvedBackgroundPreviewURL: String?
+    var superResolutionApplied: Bool
+    var superResolutionScale: Double
+    var superResolutionPixelWidth: Int?
+    var superResolutionPixelHeight: Int?
     var translationPreviewURL: String?
     var outputPreviewURL: String?
     var relativeSourcePath: String?
@@ -34,6 +40,8 @@ struct WebPage: Encodable {
     ) {
         let maskURL = Self.existingFileURL(page.maskURL)
         let backgroundURL = Self.existingFileURL(page.backgroundURL)
+        let superResolvedBackgroundURL = Self.existingFileURL(page.superResolvedBackgroundURL)
+        let superResolvedDimensions = superResolvedBackgroundURL.flatMap(Self.pixelDimensions)
         let translationPreviewFileURL = Self.existingFileURL(page.translationPreviewURL)
         let outputURL = Self.existingFileURL(page.outputURL)
         id = page.id
@@ -49,6 +57,19 @@ struct WebPage: Encodable {
         maskAppliedPreviewURL = backgroundURL == nil
             ? nil
             : "mangakitchen-asset://\(page.id.uuidString.lowercased())/background"
+        superResolvedBackgroundPreviewURL = superResolvedBackgroundURL.map {
+            let revision = Self.modificationTimestamp(for: $0) ?? 0
+            return "mangakitchen-asset://\(page.id.uuidString.lowercased())/background-2x?updated=\(revision)"
+        }
+        superResolutionApplied = superResolvedBackgroundURL != nil
+        superResolutionScale = superResolvedDimensions.map { dimensions in
+            min(
+                Double(dimensions.width) / Double(max(1, page.pixelWidth)),
+                Double(dimensions.height) / Double(max(1, page.pixelHeight))
+            )
+        } ?? 1
+        superResolutionPixelWidth = superResolvedDimensions?.width
+        superResolutionPixelHeight = superResolvedDimensions?.height
         translationPreviewURL = translationPreviewFileURL.map {
             let revision = Self.modificationTimestamp(for: $0) ?? 0
             return "mangakitchen-asset://\(page.id.uuidString.lowercased())/translation-preview?updated=\(revision)"
@@ -84,6 +105,16 @@ struct WebPage: Encodable {
             return nil
         }
         return date.timeIntervalSince1970
+    }
+
+    private static func pixelDimensions(for url: URL) -> (width: Int, height: Int)? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+            return nil
+        }
+        return (width, height)
     }
 }
 
@@ -190,6 +221,12 @@ struct WebGlobalSettings: Encodable {
     var imageToTextModelInstalled: Bool
     var modelDownloadState: ModelDownloadState?
     var imageToImageModelPath: String?
+    var automaticSuperResolutionEnabled: Bool
+    var superResolutionModelPath: String?
+    var superResolutionModelDownloadDirectoryPath: String?
+    var superResolutionModelVariant: String
+    var superResolutionModelOptions: [ModelOption]
+    var superResolutionModelInstalled: Bool
     var mcpEnabled: Bool
     var mcpPort: Int
     var mcpEndpointURL: String?
@@ -239,6 +276,30 @@ struct WebGlobalSettings: Encodable {
         }?.installed ?? false
         modelDownloadState = store.modelDownloadState
         imageToImageModelPath = preferences.imageToImageModelPath
+        automaticSuperResolutionEnabled = preferences.automaticSuperResolutionEnabled
+        superResolutionModelPath = preferences.superResolutionModelPath
+        superResolutionModelDownloadDirectoryPath = preferences.superResolutionModelDownloadDirectoryPath
+        let selectedSuperResolutionModelVariant = preferences.resolvedSuperResolutionModelVariant
+        superResolutionModelVariant = selectedSuperResolutionModelVariant
+        let superResolutionStorageURL = preferences.superResolutionModelDownloadDirectoryPath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        }
+        superResolutionModelOptions = DownloadableModelCatalog.superResolutionModels.map { model in
+            ModelOption(
+                id: model.id,
+                displayName: model.displayName,
+                recommended: model.recommended,
+                installed: superResolutionStorageURL.flatMap {
+                    DownloadableModelCatalog.installedModelDirectory(
+                        storageDirectoryURL: $0,
+                        model: model
+                    )
+                } != nil
+            )
+        }
+        superResolutionModelInstalled = superResolutionModelOptions.first {
+            $0.id == selectedSuperResolutionModelVariant
+        }?.installed ?? false
         mcpEnabled = preferences.mcpEnabled
         mcpPort = preferences.mcpPort
         mcpEndpointURL = mcpController.enabled
@@ -255,7 +316,7 @@ struct WebGlobalSettings: Encodable {
 }
 
 struct WebAppState: Encodable {
-    var schemaVersion = 5
+    var schemaVersion = 6
     var globalSettings: WebGlobalSettings
     var projects: [WebProject]
     var activeProjectID: UUID?
@@ -301,9 +362,9 @@ struct WebAppState: Encodable {
         selectedPageID = store.selectedPageID
         selectedPageIDs = store.pages.lazy.map(\.id).filter(store.selectedPageIDs.contains)
         options = store.options
-        availableFontFamilies = NSFontManager.shared.availableFontFamilies
-            .filter { !$0.hasPrefix(".") }
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        availableFontFamilies = FontFamilyCatalog.compatibleFamilies(
+            for: store.options.resolvedTargetLanguageCode
+        )
         loadedModels = store.loadedModels
         modelLoadingState = store.modelLoadingState
         glossary = store.glossary.entries.map {

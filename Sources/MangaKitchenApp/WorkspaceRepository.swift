@@ -43,7 +43,7 @@ actor WorkspaceRepository {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let value = try decoder.decode(WorkspaceSnapshot.self, from: Data(contentsOf: url))
-        guard (1...3).contains(value.schemaVersion) else {
+        guard (1...4).contains(value.schemaVersion) else {
             throw WorkspaceRepositoryError.unsupportedSchema(value.schemaVersion)
         }
         return value

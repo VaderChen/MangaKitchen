@@ -1,12 +1,20 @@
 import Foundation
 import MangaKitchenCore
+import MangaKitchenRuntime
 
 struct DownloadableModelDescriptor: Hashable, Sendable {
+    enum Format: String, Hashable, Sendable {
+        case mlxDirectory
+        case coreMLZip
+    }
+
     var id: String
     var displayName: String
     var repositoryID: String
     var capability: ModelCapability
     var recommended: Bool = false
+    var format: Format = .mlxDirectory
+    var outputScale: Int? = nil
 
     var directoryName: String {
         repositoryID.split(separator: "/").last.map(String.init) ?? id
@@ -48,16 +56,44 @@ enum DownloadableModelCatalog {
         )
     ]
 
+    static let superResolutionModels = [
+        DownloadableModelDescriptor(
+            id: "realesrgan-anime-512-coreml",
+            displayName: "Real-ESRGAN Anime 512（Core ML／4×）",
+            repositoryID: "TheMurusTeam/coreml-upscaler-realesrganAnime512",
+            capability: .superResolution,
+            format: .coreMLZip,
+            outputScale: 4
+        ),
+        DownloadableModelDescriptor(
+            id: "realesrgan-x2plus-mlx",
+            displayName: "Real-ESRGAN x2plus（MLX／2×）",
+            repositoryID: "mlx-community/Real-ESRGAN-x2plus",
+            capability: .superResolution,
+            recommended: true,
+            format: .mlxDirectory,
+            outputScale: 2
+        )
+    ]
+
     static var defaultImageToTextModel: DownloadableModelDescriptor {
         imageToTextModels[0]
     }
 
+    static var defaultSuperResolutionModel: DownloadableModelDescriptor {
+        superResolutionModels.first(where: \.recommended) ?? superResolutionModels[0]
+    }
+
+    static var allModels: [DownloadableModelDescriptor] {
+        imageToTextModels + superResolutionModels
+    }
+
     static func model(id: String, capability: ModelCapability) -> DownloadableModelDescriptor? {
-        imageToTextModels.first { $0.id == id && $0.capability == capability }
+        allModels.first { $0.id == id && $0.capability == capability }
     }
 
     static func model(matching directoryURL: URL, capability: ModelCapability) -> DownloadableModelDescriptor? {
-        imageToTextModels.first {
+        allModels.first {
             $0.capability == capability
                 && $0.directoryName.caseInsensitiveCompare(directoryURL.lastPathComponent) == .orderedSame
         }
@@ -77,11 +113,20 @@ enum DownloadableModelCatalog {
         model: DownloadableModelDescriptor
     ) -> URL? {
         let directoryURL = modelDirectory(storageDirectoryURL: storageDirectoryURL, model: model)
-        return isCompleteModelDirectory(directoryURL) ? directoryURL : nil
+        return isCompleteModelDirectory(directoryURL, model: model) ? directoryURL : nil
     }
 
-    static func isCompleteModelDirectory(_ directoryURL: URL) -> Bool {
+    static func isCompleteModelDirectory(
+        _ directoryURL: URL,
+        model: DownloadableModelDescriptor? = nil
+    ) -> Bool {
         let fileManager = FileManager.default
+        if model?.format == .coreMLZip {
+            guard let manifest = try? ModelManifest.load(from: directoryURL),
+                  manifest.capability == .superResolution,
+                  let modelFile = manifest.modelFile else { return false }
+            return fileManager.fileExists(atPath: directoryURL.appendingPathComponent(modelFile).path)
+        }
         let configURL = directoryURL.appendingPathComponent("config.json")
         guard fileManager.fileExists(atPath: configURL.path),
               let enumerator = fileManager.enumerator(

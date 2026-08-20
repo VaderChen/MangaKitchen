@@ -18,6 +18,10 @@ let package = Package(
             exact: "2.30.6"
         ),
         .package(
+            url: "https://github.com/ml-explore/mlx-swift.git",
+            exact: "0.30.6"
+        ),
+        .package(
             url: "https://github.com/huggingface/swift-transformers",
             exact: "1.1.9"
         ),
@@ -36,6 +40,8 @@ let package = Package(
             name: "MangaKitchenRuntime",
             dependencies: [
                 "MangaKitchenCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm")
             ]
