@@ -219,7 +219,7 @@ MangaKitchenApp/MCP
 
 詳細決策與資料流請見 [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md)。
 四階段 Swift／JavaScript／MCP 契約請見 [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md)。
-本次工作樹變更請見 [目前開發版更新紀錄](Documentation/RELEASE_NOTES_UNRELEASED.md)。
+已封裝版本的英文更新紀錄請見 [MangaKitchen 1.26.0822 build 2139 Release Notes](Documentation/RELEASE_NOTES_1.26.0822-build-2139.md)；封裝後的新變更請見 [Development Release Notes](Documentation/RELEASE_NOTES_UNRELEASED.md)。
 
 ## 已知邊界
 

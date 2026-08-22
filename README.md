@@ -212,8 +212,8 @@ MangaKitchenApp/MCP
 
 See [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md) for architectural decisions and data flow.
 See [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md) for the four-stage Swift/JavaScript/MCP contract.
-See [the current development release notes](Documentation/RELEASE_NOTES_UNRELEASED.md) for the changes in this working tree.
-See [the build 2347 release notes](Documentation/RELEASE_NOTES_1.26.0820-build-2347.md) for the latest packaged changes and verified download checksum.
+See [the build 2139 release notes](Documentation/RELEASE_NOTES_1.26.0822-build-2139.md) for the latest packaged changes, Developer ID signature, notarization status, and verified download checksum.
+See [the current development release notes](Documentation/RELEASE_NOTES_UNRELEASED.md) for changes after the latest package.
 
 ## Known Boundaries
 
