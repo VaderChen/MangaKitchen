@@ -42,7 +42,14 @@ public actor CPUBubbleCleaner {
         var source = try rgbaPixels(from: sourceImage)
         let mask = try rgbaPixels(from: maskImage)
         let originalMask = stride(from: 0, to: mask.count, by: 4).map { mask[$0] > 0 }
-        let configuredFill = fillColorHex.flatMap(Self.color(from:))
+        let configuredFill: RGBAColor? = fillColorHex.flatMap { value in
+            // `AUTO` 是專案設定的明確模式，不是 HEX 顏色；讓它走既有的邊界主色估算。
+            guard value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                    != ProcessingOptions.automaticEraseColor else {
+                return nil
+            }
+            return Self.color(from: value)
+        }
         let masked = configuredFill.map {
             fixedFillMask(
                 originalMask,

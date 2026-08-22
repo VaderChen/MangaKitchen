@@ -115,6 +115,8 @@
             <button id="super-resolution" type="button" class="secondary" data-i18n="superResolutionShort" data-i18n-title="superResolution" data-i18n-aria-label="superResolution" title="超高解析度" aria-label="超高解析度" hidden disabled><i class="fa-solid fa-expand" aria-hidden="true"></i> <span>超高解析度</span></button>
             <button id="export-psd" class="secondary" data-i18n="exportPSD" disabled>輸出 PSD</button>
             <button id="reveal-output" class="secondary" disabled>清除重來</button>
+            <button id="reextract-text" class="secondary" data-i18n="reextractText" hidden disabled>重新抽字</button>
+            <button id="retranslate" class="secondary" data-i18n="retranslate" hidden disabled>重新翻譯</button>
             <button id="workflow-next" type="button" class="primary icon-button" data-i18n-title="nextWorkflowStep" data-i18n-aria-label="nextWorkflowStep" title="下一步" aria-label="下一步" disabled><i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
           </header>
 
@@ -192,13 +194,14 @@
             <span data-i18n="eraseBackgroundColor">抹除底色</span>
             <div class="erase-color-controls">
               <div class="erase-color-picker">
-                <input id="erase-color" type="hidden" value="#FFFFFF">
+                <input id="erase-color" type="hidden" value="AUTO">
                 <button id="erase-color-trigger" type="button" class="erase-color-trigger" aria-haspopup="listbox" aria-expanded="false">
                   <span id="erase-color-swatch" class="erase-color-swatch" aria-hidden="true"></span>
-                  <output id="erase-color-value">#FFFFFF</output>
+                  <output id="erase-color-value">自動</output>
                   <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
                 </button>
                 <div id="erase-color-presets" class="erase-color-presets" role="listbox" hidden>
+                  <button type="button" data-erase-color="AUTO" role="option"><span class="erase-color-auto-swatch" aria-hidden="true"></span><span data-i18n="automaticEraseColor">自動</span></button>
                   <button type="button" data-erase-color="#FFFFFF" role="option"><span style="--paper-color:#FFFFFF"></span><span data-i18n="paperPureWhite">純白</span></button>
                   <button type="button" data-erase-color="#F8F8F6" role="option"><span style="--paper-color:#F8F8F6"></span><span data-i18n="paperCoolWhite">冷白</span></button>
                   <button type="button" data-erase-color="#FAF5E8" role="option"><span style="--paper-color:#FAF5E8"></span><span data-i18n="paperWarmWhite">暖白</span></button>
@@ -208,7 +211,7 @@
               </div>
               <button id="erase-color-eyedropper" type="button" class="icon-button erase-color-eyedropper" data-i18n-title="pickEraseBackgroundColor" data-i18n-aria-label="pickEraseBackgroundColor" title="從左側原圖吸取抹除底色" aria-label="從左側原圖吸取抹除底色"><i class="fa-solid fa-eye-dropper" aria-hidden="true"></i></button>
             </div>
-            <small data-i18n="eraseBackgroundColorHelp">預設使用白色；啟用滴管後點選左側原圖取色。</small>
+            <small data-i18n="eraseBackgroundColorHelp">預設自動計算；也可選擇固定底紙顏色或啟用滴管取色。</small>
           </div>
           <div class="font-picker-field">
             <span data-i18n="defaultFont">預設字型</span>
@@ -227,7 +230,7 @@
             <legend data-i18n="translationQuality">翻譯品質</legend>
             <label class="checkbox-label"><input id="translation-page-context" type="checkbox"> <span data-i18n="translationPageContext">使用整頁語境</span></label>
             <label class="checkbox-label"><input id="translation-review-pass" type="checkbox"> <span data-i18n="translationReviewPass">執行二次校稿</span></label>
-            <label class="checkbox-label"><input id="translation-quality-check" type="checkbox"> <span data-i18n="translationQualityCheck">執行翻譯 QA</span></label>
+            <label class="checkbox-label"><input id="translation-quality-check" type="checkbox"> <span data-i18n="translationQualityCheck">執行翻譯品質檢查</span></label>
             <label class="checkbox-label"><input id="translation-preserve-literal" type="checkbox"> <span data-i18n="translationPreserveLiteral">保留直譯稿</span></label>
             <label><span data-i18n="translationLengthMode">顯示譯文長度</span>
               <select id="translation-length-mode">
@@ -336,13 +339,19 @@
 
             <section class="settings-page" data-settings-page="advanced" hidden>
               <h3 data-i18n="settingsAdvanced">進階</h3>
-              <label class="settings-field">
-                <span data-i18n="imageCompositingBackend">圖像合成方式</span>
-                <select id="settings-image-compositing-backend">
-                  <option value="gpu" data-i18n="gpuCompositing">GPU（Metal）</option>
-                  <option value="cpu" data-i18n="cpuCompositing">CPU</option>
-                </select>
-              </label>
+              <div class="settings-inline-row">
+                <label class="settings-field">
+                  <span data-i18n="imageCompositingBackend">圖像合成方式</span>
+                  <select id="settings-image-compositing-backend">
+                    <option value="gpu" data-i18n="gpuCompositing">GPU（Metal）</option>
+                    <option value="cpu" data-i18n="cpuCompositing">CPU</option>
+                  </select>
+                </label>
+                <label class="settings-field settings-color-field">
+                  <span data-i18n="selectionColor">框選顏色</span>
+                  <input id="settings-selection-color" type="color" value="#5B5FEF">
+                </label>
+              </div>
               <p class="section-help" data-i18n="imageCompositingHelp">GPU 使用 Metal 鄰域修補；CPU 使用對話框外圍主色修補，適合線稿漫畫。</p>
               <label class="settings-field">
                 <span data-i18n="dataStorageLocation">資料儲存位置</span>
@@ -353,10 +362,40 @@
                 <button id="reset-data-directory" type="button" class="quiet" data-i18n="restoreDefault">恢復預設</button>
               </div>
               <p id="data-directory-restart-note" class="settings-notice" data-i18n="restartRequired" hidden>重新啟動後生效。</p>
+              <label class="settings-field">
+                <span data-i18n="defaultOutputDirectory">預設輸出位置</span>
+                <input id="settings-default-output-directory" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+              </label>
+              <div class="settings-actions">
+                <button id="choose-default-output-directory" type="button" class="secondary" data-i18n="chooseFolder">選取目錄</button>
+                <button id="reset-default-output-directory" type="button" class="quiet" data-i18n="restoreDefault">恢復預設</button>
+              </div>
+              <p class="section-help" data-i18n="defaultOutputDirectoryHelp">新建專案且尚未指定輸出目錄時，會在這個位置下建立專案名稱子目錄；既有專案的明確設定不會被覆寫。</p>
             </section>
 
             <section class="settings-page" data-settings-page="models" hidden>
               <h3 data-i18n="settingsModels">模型</h3>
+              <nav class="model-tabs" data-i18n-aria-label="modelTabs" aria-label="模型分類" role="tablist">
+                <button type="button" class="model-tab active" data-model-tab="ocr" role="tab" aria-selected="true" aria-controls="model-page-ocr" data-i18n="modelTabOCR">OCR</button>
+                <button type="button" class="model-tab" data-model-tab="superResolution" role="tab" aria-selected="false" aria-controls="model-page-super-resolution" data-i18n="modelTabSuperResolution">超高解析度</button>
+                <button type="button" class="model-tab" data-model-tab="imageToText" role="tab" aria-selected="false" aria-controls="model-page-image-to-text" data-i18n="modelTabImageToText">圖生文</button>
+                <button type="button" class="model-tab" data-model-tab="imageToImage" role="tab" aria-selected="false" aria-controls="model-page-image-to-image" data-i18n="modelTabImageToImage">圖生圖</button>
+              </nav>
+              <div class="model-pages">
+              <section id="model-page-ocr" class="model-page active" data-model-page="ocr" role="tabpanel">
+                <div class="settings-path-group">
+                  <div class="settings-card-heading">
+                    <strong data-i18n="ocrModel">OCR 模型</strong>
+                    <span data-i18n="modelBuiltIn">內建</span>
+                  </div>
+                  <div class="settings-field">
+                    <label for="settings-ocr-model" data-i18n="ocrModel">OCR 模型</label>
+                    <input id="settings-ocr-model" readonly value="PP-OCRv6 Small · Core ML">
+                  </div>
+                  <p class="section-help" data-i18n="ocrModelDescription">VLM 負責文字定位；OCR 只在逐區／整頁翻譯前保存獨立候選，不會覆寫原文或遮罩。</p>
+                </div>
+              </section>
+              <section id="model-page-image-to-text" class="model-page" data-model-page="imageToText" role="tabpanel" hidden>
               <div class="settings-path-group">
                 <div class="settings-field">
                   <label for="settings-image-to-text-model" data-i18n="imageToTextModel">圖生文模型</label>
@@ -381,6 +420,8 @@
                   <small id="image-to-text-model-download-status"></small>
                 </div>
               </div>
+              </section>
+              <section id="model-page-super-resolution" class="model-page" data-model-page="superResolution" role="tabpanel" hidden>
               <div class="settings-path-group">
                 <div class="settings-card-heading">
                   <strong data-i18n="superResolutionModel">超解析模型</strong>
@@ -414,6 +455,8 @@
                   <small id="super-resolution-model-download-status"></small>
                 </div>
               </div>
+              </section>
+              <section id="model-page-image-to-image" class="model-page" data-model-page="imageToImage" role="tabpanel" hidden>
               <div class="settings-path-group settings-card-disabled" aria-disabled="true">
                 <div class="settings-card-heading">
                   <strong data-i18n="imageToImageModel">圖生圖模型</strong>
@@ -436,6 +479,8 @@
                   <button id="download-image-to-image-model" type="button" class="primary" disabled data-i18n="downloadModel">下載</button>
                   <button id="clear-image-to-image-model" type="button" class="quiet" disabled data-i18n="clear">清除</button>
                 </div>
+              </div>
+              </section>
               </div>
               <p class="section-help" data-i18n="modelSettingsHelp">選取儲存目錄與模型版本後即可下載；已存在的模型會直接載入。</p>
             </section>

@@ -1,0 +1,15 @@
+[project]
+name = "mangakitchen-ocr-poc"
+version = "0.1.0"
+description = "Independent PP-OCRv6 and Core ML feasibility validation for MangaKitchen"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "coremltools==9.0",
+    "numpy==2.3.5",
+    "paddleocr==3.7.0",
+    "paddlepaddle==3.3.1",
+    "pillow==12.3.0",
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "transformers==5.15.1",
+]

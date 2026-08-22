@@ -49,6 +49,7 @@ private struct MangaKitchenApplication: App {
         let settings = preferences.settings
         let store = AppStore(
             dataDirectoryPath: settings.dataDirectoryPath,
+            defaultOutputDirectoryPath: settings.defaultOutputDirectoryPath,
             imageCompositingBackend: settings.resolvedImageCompositingBackend,
             imageToTextModelPath: settings.imageToTextModelPath,
             imageToImageModelPath: settings.imageToImageModelPath,

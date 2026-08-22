@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 public typealias InferenceProgress = @Sendable (Double) -> Void
@@ -66,6 +67,19 @@ public protocol RegionTextRecognizing: Sendable {
         regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion]
+}
+
+/// 以原生本機模型辨識一個已由 VLM 定位的文字裁切。
+///
+/// 實作只回傳該模型自己的候選結果；呼叫端不得把結果直接寫入
+/// `DialogueRegion.sourceText`，也不得藉此改動區域或遮罩。
+public protocol LocalOCRRecognizing: Sendable {
+    var modelID: String { get }
+
+    func recognize(
+        crop: CGImage,
+        bounds: NormalizedRect
+    ) async throws -> OCRModelResult
 }
 
 /// 將封閉區域或 Agent 粗框收斂成實際文字筆畫附近的多邊形集合。

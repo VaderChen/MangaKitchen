@@ -8,7 +8,9 @@ struct AppPreferences: Codable, Equatable, Sendable {
 
     var interfaceLanguage = "auto"
     var colorScheme = "auto"
+    var selectionColorHex = "#5B5FEF"
     var dataDirectoryPath: String?
+    var defaultOutputDirectoryPath: String?
     var imageCompositingBackend: ImageCompositingBackend? = .cpu
     var imageToTextModelPath: String?
     var imageToTextModelDownloadDirectoryPath: String?
@@ -25,7 +27,9 @@ struct AppPreferences: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case interfaceLanguage
         case colorScheme
+        case selectionColorHex
         case dataDirectoryPath
+        case defaultOutputDirectoryPath
         case imageCompositingBackend
         case imageToTextModelPath
         case imageToTextModelDownloadDirectoryPath
@@ -46,7 +50,12 @@ struct AppPreferences: Codable, Equatable, Sendable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         interfaceLanguage = try values.decodeIfPresent(String.self, forKey: .interfaceLanguage) ?? "auto"
         colorScheme = try values.decodeIfPresent(String.self, forKey: .colorScheme) ?? "auto"
+        selectionColorHex = try values.decodeIfPresent(String.self, forKey: .selectionColorHex) ?? "#5B5FEF"
         dataDirectoryPath = try values.decodeIfPresent(String.self, forKey: .dataDirectoryPath)
+        defaultOutputDirectoryPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .defaultOutputDirectoryPath
+        )
         imageCompositingBackend = try values.decodeIfPresent(
             ImageCompositingBackend.self,
             forKey: .imageCompositingBackend
@@ -84,7 +93,9 @@ struct AppPreferences: Codable, Equatable, Sendable {
         if !Self.supportedColorSchemes.contains(colorScheme) {
             colorScheme = "auto"
         }
+        selectionColorHex = DialogueStyle.normalizedHexColor(selectionColorHex, fallback: "#5B5FEF")
         dataDirectoryPath = Self.normalizedOptionalPath(dataDirectoryPath)
+        defaultOutputDirectoryPath = Self.normalizedOptionalPath(defaultOutputDirectoryPath)
         imageCompositingBackend = imageCompositingBackend ?? .cpu
         imageToTextModelPath = Self.normalizedOptionalPath(imageToTextModelPath)
         imageToTextModelDownloadDirectoryPath = Self.normalizedOptionalPath(

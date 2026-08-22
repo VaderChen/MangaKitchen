@@ -45,11 +45,13 @@ final class AppStore: ObservableObject {
     private let importService = ManagedImportService()
     private let htmlTypesetter: HTMLDialogueTypesetter?
 
+    private var defaultOutputDirectoryURL: URL?
     private var projectSnapshots: [UUID: WorkspaceSnapshot] = [:]
     private var activeModelDirectories: [URL] = []
     private var preferredModelPaths: [ModelCapability: String] = [:]
     private var activeProjectCreatedAt = Date()
     private var processingTask: Task<Void, Never>?
+    private var regionRecognitionTask: Task<Void, Never>?
     private var modelDownloadTask: Task<Void, Never>?
     private var persistenceTask: Task<Void, Never>?
     private var maskRegenerationTasks: [UUID: Task<Void, Never>] = [:]
@@ -62,12 +64,15 @@ final class AppStore: ObservableObject {
 
     init(
         dataDirectoryPath: String? = nil,
+        defaultOutputDirectoryPath: String? = nil,
         imageCompositingBackend: ImageCompositingBackend = .cpu,
         imageToTextModelPath: String? = nil,
         imageToImageModelPath: String? = nil,
         automaticSuperResolutionEnabled: Bool = false,
         superResolutionModelPath: String? = nil
     ) {
+        defaultOutputDirectoryURL = defaultOutputDirectoryPath
+            .map { URL(fileURLWithPath: $0).standardizedFileURL }
         do {
             let metal = try MetalContext()
             let models = ModelRuntimeHub(metal: metal)
@@ -83,9 +88,19 @@ final class AppStore: ObservableObject {
             )
             let bubbleSegmenter = Self.bundledBubbleSegmenter()
             let htmlTypesetter = HTMLDialogueTypesetter()
+            let vlmTextRecognizer = VLMRegionTranscriptionService(model: models)
+            let textRecognizer: any RegionTextRecognizing
+            if let ocrRuntime = Self.bundledOCRRuntime() {
+                textRecognizer = OCRRegionTextRecognitionService(
+                    locator: vlmTextRecognizer,
+                    ocr: ocrRuntime
+                )
+            } else {
+                textRecognizer = vlmTextRecognizer
+            }
             let pipeline = ComicTranslationPipeline(
                 regionDetector: MangaBubbleMaskRegionDetector(bubbleSegmenter: bubbleSegmenter),
-                textRecognizer: VLMRegionTranscriptionService(model: models),
+                textRecognizer: textRecognizer,
                 maskRefiner: MangaTextMaskRefiner(),
                 translator: VLMRegionTranslationService(model: models),
                 maskGenerator: DialogueMaskGenerator(),
@@ -148,6 +163,28 @@ final class AppStore: ObservableObject {
             return nil
         }
         return try? MangaBubbleSegmentationCoreMLRuntime(modelURL: modelURL)
+    }
+
+    /// OCR 模型是可選的：沒有隨 App 提供模型與字典時，翻譯仍使用原本的 VLM。
+    /// 一旦放入 `Resources/Models/OCR/`，App 便會在步驟三以原生 Core ML OCR
+    /// 保存該模型的獨立候選，不會改動 VLM 定位、sourceText 或遮罩。
+    private static func bundledOCRRuntime() -> PPOCRRecognitionRuntime? {
+        guard let modelURL = Bundle.module.url(
+            forResource: "ppocrv6-small-rec-macos14",
+            withExtension: "mlpackage",
+            subdirectory: "Models/OCR"
+        ), let characterURL = Bundle.module.url(
+            forResource: "ppocrv6-small-rec-characters",
+            withExtension: "json",
+            subdirectory: "Models/OCR"
+        ), let characters = try? PPOCRCharacterList.load(from: characterURL) else {
+            return nil
+        }
+        return try? PPOCRRecognitionRuntime(
+            modelURL: modelURL,
+            modelID: "ppocrv6-small-rec",
+            characters: characters
+        )
     }
 
     func setImageCompositingBackend(_ backend: ImageCompositingBackend) {
@@ -274,19 +311,24 @@ final class AppStore: ObservableObject {
             await self.persistActiveProjectNow()
 
             let projectID = UUID()
+            let projectName = displayName.flatMap {
+                let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : value
+            } ?? sourceURL.lastPathComponent
             let snapshot = WorkspaceSnapshot(
                 projectID: projectID,
-                name: displayName.flatMap {
-                    let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return value.isEmpty ? nil : value
-                } ?? sourceURL.lastPathComponent,
+                name: projectName,
                 options: ProcessingOptions(),
                 glossary: ProjectGlossary(),
                 pages: [],
                 selectedPageID: nil,
                 selectedPageIDs: [],
                 modelDirectories: [],
-                sourceDirectoryURL: sourceURL
+                sourceDirectoryURL: sourceURL,
+                outputDirectoryURL: self.defaultOutputDirectoryURL(
+                    for: sourceURL,
+                    projectName: projectName
+                )
             )
             self.projectSnapshots[projectID] = snapshot
             self.projects.append(Self.summary(from: snapshot))
@@ -658,6 +700,35 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// 設定全域預設輸出目錄。只會套用到尚未指定輸出目錄的目前／新專案，
+    /// 不覆寫使用者已明確選取的專案輸出位置。
+    func setDefaultOutputDirectory(_ directoryURL: URL?) {
+        guard let directoryURL else {
+            defaultOutputDirectoryURL = nil
+            return
+        }
+        let normalized = directoryURL.standardizedFileURL
+        do {
+            try validateOutputDirectory(normalized)
+            defaultOutputDirectoryURL = normalized
+            if outputDirectoryURL == nil, let sourceDirectoryURL {
+                let projectOutputURL = defaultOutputDirectoryURL(
+                    for: sourceDirectoryURL,
+                    projectName: activeProjectName
+                ) ?? normalized
+                try FileManager.default.createDirectory(
+                    at: projectOutputURL,
+                    withIntermediateDirectories: true
+                )
+                outputDirectoryURL = projectOutputURL
+                schedulePersistence()
+            }
+            statusMessage = "預設輸出目錄已設定。"
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
     // MARK: - 頁面選取
 
     func selectPage(_ id: UUID) {
@@ -869,6 +940,14 @@ final class AppStore: ObservableObject {
         enqueueSelected(operation: .translate)
     }
 
+    func extractTextSelectedPage() {
+        enqueueSelected(operation: .extractText, forceRecalculation: true)
+    }
+
+    func retranslateSelectedPage() {
+        enqueueSelected(operation: .retranslate, forceRecalculation: true)
+    }
+
     func composeAllPages() {
         enqueueBatch(operation: .compose, pageIDs: pages.map(\.id))
     }
@@ -939,6 +1018,7 @@ final class AppStore: ObservableObject {
     }
 
     func cancelProcessing() {
+        regionRecognitionTask?.cancel()
         let cancelledPageIDs = batchJobs.compactMap { job in
             job.status == .running ? job.currentPageID : nil
         }
@@ -976,11 +1056,18 @@ final class AppStore: ObservableObject {
         schedulePersistence()
     }
 
-    private func enqueueSelected(operation: BatchOperation) {
+    private func enqueueSelected(
+        operation: BatchOperation,
+        forceRecalculation: Bool = false
+    ) {
         let ids = selectedPageIDs.isEmpty
             ? selectedPageID.map { [$0] } ?? []
             : pages.lazy.map(\.id).filter(selectedPageIDs.contains)
-        enqueueBatch(operation: operation, pageIDs: Array(ids))
+        enqueueBatch(
+            operation: operation,
+            pageIDs: Array(ids),
+            forceRecalculation: forceRecalculation
+        )
     }
 
     private func startBatchQueueIfNeeded() {
@@ -1359,6 +1446,161 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// 重新抽取並翻譯單一文字區域；不重建遮罩、不翻譯其他區域。
+    @discardableResult
+    func reextractRegion(pageID: UUID, regionID: UUID) -> Bool {
+        guard !isProcessing else {
+            statusMessage = "目前已有工作進行中，請稍候再重新抽取。"
+            return false
+        }
+        guard loadedModels.contains(where: { $0.capability == .imageToText }) else {
+            statusMessage = "請先載入圖生文模型，才能重新抽取文字。"
+            return false
+        }
+        guard let pipeline,
+              let page = pages.first(where: { $0.id == pageID }),
+              let region = page.regions.first(where: { $0.id == regionID }) else {
+            statusMessage = "找不到要重新抽取的文字區域。"
+            return false
+        }
+        guard let backgroundURL = page.backgroundURL,
+              FileManager.default.fileExists(atPath: backgroundURL.path),
+              let maskURL = page.maskURL,
+              FileManager.default.fileExists(atPath: maskURL.path) else {
+            statusMessage = "請先完成步驟二的遮罩與去字背景，再重新抽取並翻譯此區域。"
+            return false
+        }
+
+        isProcessing = true
+        processingActivities[pageID] = .preparingPage
+        processingRegionProgress[pageID] = ProcessingRegionProgress(current: 0, total: 1)
+        statusMessage = "正在重新抽取並翻譯第 \(page.index) 頁的單一文字區域…"
+        regionRecognitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.regionRecognitionTask = nil
+                self.processingActivities[pageID] = nil
+                self.processingRegionProgress[pageID] = nil
+                self.isProcessing = false
+            }
+            do {
+                let recognized = try await pipeline.recognizeRegion(
+                    page: page,
+                    region: region,
+                    options: self.options,
+                    regionProgress: { current, total in
+                        Task { @MainActor [weak self] in
+                            self?.processingRegionProgress[pageID] = ProcessingRegionProgress(
+                                current: current,
+                                total: total
+                            )
+                        }
+                    },
+                    progress: { value in
+                        Task { @MainActor [weak self] in
+                            guard let self,
+                                  let index = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
+                            self.pages[index].progress = Self.totalProgress(
+                                stage: .translating,
+                                fraction: min(max(value, 0), 0.45)
+                            )
+                            self.processingActivities[pageID] = .detectingRegions
+                        }
+                    }
+                )
+                try Task.checkCancellation()
+                guard let pageIndex = self.pages.firstIndex(where: { $0.id == pageID }),
+                      let regionIndex = self.pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }) else {
+                    return
+                }
+                guard !recognized.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    self.statusMessage = "這個區域沒有重新抽取到可用原文；已保留原結果。"
+                    return
+                }
+
+                self.processingActivities[pageID] = .translatingRegions
+                self.processingRegionProgress[pageID] = ProcessingRegionProgress(current: 0, total: 1)
+                let translated = try await pipeline.translate(
+                    page: page,
+                    regions: [recognized],
+                    options: self.options,
+                    glossary: self.glossary,
+                    recognizeText: false,
+                    activity: { activity in
+                        Task { @MainActor [weak self] in
+                            self?.processingActivities[pageID] = activity
+                        }
+                    },
+                    regionProgress: { current, total in
+                        Task { @MainActor [weak self] in
+                            self?.processingRegionProgress[pageID] = ProcessingRegionProgress(
+                                current: current,
+                                total: total
+                            )
+                        }
+                    },
+                    progress: { stage, fraction in
+                        Task { @MainActor [weak self] in
+                            guard let self,
+                                  let index = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
+                            self.pages[index].stage = stage
+                            self.pages[index].progress = Self.totalProgress(
+                                stage: stage,
+                                fraction: min(max(fraction, 0), 1)
+                            )
+                        }
+                    }
+                ).first ?? recognized
+                try Task.checkCancellation()
+
+                var updated = self.pages[pageIndex].regions[regionIndex]
+                updated.rawSourceText = recognized.rawSourceText
+                updated.sourceText = recognized.sourceText
+                updated.ocrResults = recognized.ocrResults
+                updated.ocrTextRefined = recognized.ocrTextRefined
+                updated.detectedWritingDirection = recognized.detectedWritingDirection
+                updated.mcpExtractedSourceText = nil
+                updated.translatedText = translated.translatedText
+                updated.literalTranslatedText = translated.literalTranslatedText
+                updated.speakerID = translated.speakerID
+                updated.tone = translated.tone
+                updated.translationConfidence = translated.translationConfidence
+                updated.translationQAFlags = translated.translationQAFlags
+                self.recordRegionHistory(pageID: pageID, regions: self.pages[pageIndex].regions)
+                self.pages[pageIndex].regions[regionIndex] = updated
+                self.markPageEdited(at: pageIndex)
+                self.pages[pageIndex].translationPreviewURL = nil
+                self.pages[pageIndex].outputURL = nil
+                self.pages[pageIndex].stage = .typesetting
+                self.pages[pageIndex].progress = Self.totalProgress(stage: .typesetting, fraction: 0)
+                self.processingActivities[pageID] = .preparingTranslationPreview
+                let previewPage = self.pages[pageIndex]
+                let allRegions = previewPage.regions
+                let previewBackgroundURL = previewPage.superResolvedBackgroundURL.flatMap {
+                    FileManager.default.fileExists(atPath: $0.path) ? $0 : nil
+                } ?? backgroundURL
+                let previewURL = try await pipeline.renderTranslationPreview(
+                    page: previewPage,
+                    backgroundURL: previewBackgroundURL,
+                    regions: allRegions
+                )
+                try Task.checkCancellation()
+                guard let updatedPageIndex = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
+                self.pages[updatedPageIndex].translationPreviewURL = previewURL
+                self.pages[updatedPageIndex].stage = .translationReady
+                self.pages[updatedPageIndex].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
+                try await self.persistStringTableNow(pageID: pageID)
+                self.schedulePersistence()
+                self.statusMessage = "已重新抽取並翻譯單一文字區域。"
+            } catch is CancellationError {
+                self.statusMessage = "已取消單一文字區域重新抽取與翻譯。"
+            } catch {
+                self.statusMessage = "單一文字區域重新抽取與翻譯失敗：\(error.localizedDescription)"
+            }
+        }
+        return true
+    }
+
     func undoRegionEdit(pageID: UUID) {
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
               var history = regionUndoHistory[pageID], let previous = history.popLast() else {
@@ -1623,6 +1865,14 @@ final class AppStore: ObservableObject {
                 pageID: pageID,
                 forceRecalculation: forceRecalculation
             )
+        case .extractText:
+            try await runTextExtraction(pageID: pageID)
+        case .retranslate:
+            try await runTranslation(
+                pageID: pageID,
+                forceRecalculation: true,
+                recognizeText: false
+            )
         case .superResolve:
             try await runSuperResolution(pageID: pageID)
         case .compose:
@@ -1696,6 +1946,12 @@ final class AppStore: ObservableObject {
         guard let pipeline,
               let page = pages.first(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
+        }
+        // 沒有可用的圖生文模型時，步驟二仍可進入手動模式；不要呼叫
+        // 氣泡／文字自動偵測，直接建立同尺寸全黑遮罩供畫筆編輯。
+        guard loadedModels.contains(where: { $0.capability == .imageToText }) else {
+            try await prepareEmptyMask(pageID: pageID, page: page, pipeline: pipeline)
+            return
         }
         let result = try await pipeline.detectMasks(
             page: page,
@@ -1772,9 +2028,89 @@ final class AppStore: ObservableObject {
         schedulePersistence()
     }
 
+    private func runTextExtraction(pageID: UUID) async throws {
+        await stopTranslationPreviewRegeneration(pageID: pageID)
+        try Task.checkCancellation()
+        guard let pipeline,
+              let page = pages.first(where: { $0.id == pageID }) else {
+            throw AppWorkflowError.pageNotFound
+        }
+        guard let backgroundURL = page.backgroundURL,
+              FileManager.default.fileExists(atPath: backgroundURL.path),
+              let maskURL = page.maskURL,
+              FileManager.default.fileExists(atPath: maskURL.path) else {
+            throw AppWorkflowError.maskRequired
+        }
+        guard !page.regions.isEmpty else {
+            statusMessage = "本頁沒有可重新抽取的文字區域。"
+            return
+        }
+        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[index].translationPreviewURL = nil
+        pages[index].outputURL = nil
+        pages[index].stage = .translating
+        pages[index].progress = Self.totalProgress(stage: .translating, fraction: 0)
+        pages[index].errorMessage = nil
+        processingActivities[pageID] = .detectingRegions
+        statusMessage = "第 \(page.index) 頁正在重新抽取文字…"
+        schedulePersistence()
+
+        let recognized = try await pipeline.recognizeRegions(
+            page: page,
+            regions: page.regions,
+            options: options,
+            force: true,
+            activity: activityHandler(pageID: pageID),
+            regionProgress: regionProgressHandler(pageID: pageID),
+            progress: { [weak self] value in
+                Task { @MainActor [weak self] in
+                    self?.updateProgress(
+                        pageID: pageID,
+                        stage: .translating,
+                        fraction: value
+                    )
+                }
+            }
+        )
+        try Task.checkCancellation()
+        guard let updatedIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        let recognizedByID = Dictionary(uniqueKeysWithValues: recognized.map { ($0.id, $0) })
+        pages[updatedIndex].regions = pages[updatedIndex].regions.map { original in
+            guard let extracted = recognizedByID[original.id],
+                  !extracted.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return original
+            }
+            var updated = original
+            updated.rawSourceText = extracted.rawSourceText
+            updated.sourceText = extracted.sourceText
+            updated.ocrResults = extracted.ocrResults
+            updated.ocrTextRefined = extracted.ocrTextRefined
+            updated.detectedWritingDirection = extracted.detectedWritingDirection
+            updated.translatedText = ""
+            updated.literalTranslatedText = nil
+            updated.mcpExtractedSourceText = nil
+            updated.speakerID = nil
+            updated.tone = nil
+            updated.translationConfidence = nil
+            updated.translationQAFlags = []
+            return updated
+        }
+        pages[updatedIndex].translationPreviewURL = nil
+        pages[updatedIndex].outputURL = nil
+        pages[updatedIndex].stage = .translating
+        pages[updatedIndex].progress = Self.totalProgress(stage: .translating, fraction: 1)
+        pages[updatedIndex].errorMessage = nil
+        processingActivities[pageID] = nil
+        processingRegionProgress[pageID] = nil
+        try await persistStringTableNow(pageID: pageID)
+        schedulePersistence()
+        statusMessage = "第 \(page.index) 頁已重新抽取文字；請按「重新翻譯」。"
+    }
+
     private func runTranslation(
         pageID: UUID,
-        forceRecalculation: Bool = false
+        forceRecalculation: Bool = false,
+        recognizeText: Bool = true
     ) async throws {
         await stopTranslationPreviewRegeneration(pageID: pageID)
         try Task.checkCancellation()
@@ -1807,6 +2143,7 @@ final class AppStore: ObservableObject {
                 regions: page.regions,
                 options: options,
                 glossary: glossary,
+                recognizeText: recognizeText,
                 activity: activityHandler(pageID: pageID),
                 regionProgress: regionProgressHandler(pageID: pageID),
                 progress: progressHandler(pageID: pageID)
@@ -1871,7 +2208,7 @@ final class AppStore: ObservableObject {
             $0.translationQAFlags.contains(where: { $0 != .reviewAdjusted })
         }
         if qualityWarningCount > 0 {
-            warnings.append("有 \(qualityWarningCount) 個文字區域需要翻譯 QA 確認，已在文字區域面板標示。")
+            warnings.append("有 \(qualityWarningCount) 個文字區域需要翻譯品質檢查，已在文字區域面板標示。")
         }
         statusMessage = warnings.isEmpty
             ? "第 \(pages[index].index) 頁翻譯與自動排版完成，可逐區確認或調整。"
@@ -2373,6 +2710,42 @@ final class AppStore: ObservableObject {
         if outputPath == sourcePath || outputPath.hasPrefix(sourcePath + "/") {
             throw AppWorkflowError.outputInsideSource
         }
+    }
+
+    private func defaultOutputDirectoryURL(
+        for sourceURL: URL,
+        projectName: String? = nil
+    ) -> URL? {
+        guard let defaultOutputDirectoryURL else { return nil }
+        let sourcePath = sourceURL.standardizedFileURL.path
+        let baseURL = defaultOutputDirectoryURL.standardizedFileURL
+        let outputPath = baseURL.path
+        guard outputPath != sourcePath,
+              !outputPath.hasPrefix(sourcePath + "/") else { return nil }
+        guard let component = Self.safeOutputDirectoryComponent(
+            projectName ?? sourceURL.lastPathComponent
+        ) else {
+            return baseURL
+        }
+        let projectURL = baseURL.appendingPathComponent(component, isDirectory: true).standardizedFileURL
+        let projectPath = projectURL.path
+        guard projectPath != sourcePath,
+              !projectPath.hasPrefix(sourcePath + "/") else { return nil }
+        return projectURL
+    }
+
+    /// 預設輸出子目錄只接受單一路徑元件，避免專案顯示名稱改變輸出根目錄或穿越目錄。
+    private static func safeOutputDirectoryComponent(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != ".", trimmed != ".." else { return nil }
+        let separators = CharacterSet(charactersIn: "/\\:")
+        let sanitized = trimmed
+            .components(separatedBy: separators)
+            .filter { !$0.isEmpty }
+            .joined(separator: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sanitized.isEmpty, sanitized != ".", sanitized != ".." else { return nil }
+        return sanitized
     }
 
     // MARK: - 專案復原與持久化
@@ -2938,7 +3311,7 @@ private enum ModelDeletionError: LocalizedError {
 
 private extension BatchOperation {
     var requiresTextModel: Bool {
-        self == .translate || self == .fullPage
+        self == .translate || self == .extractText || self == .retranslate || self == .fullPage
     }
 
     var requiresOutputDirectory: Bool {

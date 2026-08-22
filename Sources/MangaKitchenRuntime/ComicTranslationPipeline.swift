@@ -161,11 +161,13 @@ public actor ComicTranslationPipeline {
     }
 
     /// 步驟三：只翻譯既有區域，保留 bounds、style 與人工遮罩筆劃。
+    /// `recognizeText` 為 false 時，沿用目前已確認的 sourceText，只重新翻譯。
     public func translate(
         page: ComicPage,
         regions: [DialogueRegion],
         options: ProcessingOptions,
         glossary: ProjectGlossary = ProjectGlossary(),
+        recognizeText: Bool = true,
         activity: @escaping PagePipelineActivity = { _ in },
         regionProgress: @escaping PageRegionProgress = { _, _ in },
         progress: @escaping PagePipelineProgress
@@ -175,22 +177,19 @@ public actor ComicTranslationPipeline {
             progress(.translationReady, 1)
             return []
         }
-        let recognizedRegions: [DialogueRegion]
-        if let textRecognizer {
-            activity(.preparingTextModel)
-            progress(.translating, 0)
-            activity(.detectingRegions)
-            recognizedRegions = try await textRecognizer.recognizeRegions(
-                pageURL: page.sourceURL,
+        let recognizedRegions = recognizeText
+            ? try await recognizeRegions(
+                page: page,
                 regions: regions,
-                sourceLanguageCodes: options.sourceLanguageCodes,
-                regionProgress: regionProgress
-            ) { value in
-                progress(.translating, min(max(value, 0), 1) * 0.4)
-            }
-        } else {
-            recognizedRegions = regions
-        }
+                options: options,
+                force: false,
+                activity: activity,
+                regionProgress: regionProgress,
+                progress: { value in
+                    progress(.translating, min(max(value, 0), 1) * 0.4)
+                }
+            )
+            : regions
         let translatableRegions = recognizedRegions.filter {
             !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
@@ -223,6 +222,111 @@ public actor ComicTranslationPipeline {
             result[region.id] = region
         }
         return recognizedRegions.map { translatedByID[$0.id] ?? $0 }
+    }
+
+    /// 在既有區域內重新抽取文字；`force` 會清空辨識器看到的 sourceText，
+    /// 因此即使原區域已有原文也會重新送入 VLM／OCR。
+    public func recognizeRegions(
+        page: ComicPage,
+        regions: [DialogueRegion],
+        options: ProcessingOptions,
+        force: Bool = false,
+        activity: @escaping PagePipelineActivity = { _ in },
+        regionProgress: @escaping PageRegionProgress = { _, _ in },
+        progress: @escaping InferenceProgress = { _ in }
+    ) async throws -> [DialogueRegion] {
+        try Task.checkCancellation()
+        guard !regions.isEmpty else {
+            progress(1)
+            return []
+        }
+        guard let textRecognizer else { return regions }
+        activity(.preparingTextModel)
+        progress(0)
+        activity(.detectingRegions)
+        let inputRegions: [DialogueRegion]
+        if force {
+            inputRegions = regions.map { region in
+                var value = region
+                value.rawSourceText = nil
+                value.sourceText = ""
+                value.ocrTextRefined = false
+                return value
+            }
+        } else {
+            inputRegions = regions
+        }
+        let recognized = try await textRecognizer.recognizeRegions(
+            pageURL: page.sourceURL,
+            regions: inputRegions,
+            sourceLanguageCodes: options.sourceLanguageCodes,
+            regionProgress: regionProgress,
+            progress: progress
+        )
+        // 辨識器只負責回傳文字與 OCR 候選。即使某個 VLM／OCR 實作建立了新的
+        // DialogueRegion，也不能把步驟二的座標、氣泡形狀、像素遮罩或人工筆劃
+        // 帶回覆蓋掉；步驟三必須是「在既有區域內抽字」。
+        return Self.mergeRecognitionResults(
+            originals: regions,
+            recognized: recognized
+        )
+    }
+
+    /// 只重新抽取單一既有區域的原文，不翻譯、不重建遮罩，也不改動區域座標。
+    /// 先清空傳給辨識器的 sourceText，讓 VLM 重新讀取目前裁切；若辨識失敗，
+    /// 回傳原區域，避免一次失敗把既有原文清掉。
+    public func recognizeRegion(
+        page: ComicPage,
+        region: DialogueRegion,
+        options: ProcessingOptions,
+        regionProgress: @escaping PageRegionProgress = { _, _ in },
+        progress: @escaping InferenceProgress = { _ in }
+    ) async throws -> DialogueRegion {
+        try Task.checkCancellation()
+        guard let textRecognizer else { return region }
+        var candidate = region
+        candidate.rawSourceText = nil
+        candidate.sourceText = ""
+        candidate.ocrTextRefined = false
+        let recognized = try await textRecognizer.recognizeRegions(
+            pageURL: page.sourceURL,
+            regions: [candidate],
+            sourceLanguageCodes: options.sourceLanguageCodes,
+            regionProgress: regionProgress,
+            progress: progress
+        )
+        guard let result = recognized.first(where: { $0.id == region.id }),
+              !result.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return region
+        }
+        return Self.mergeRecognitionResults(
+            originals: [region],
+            recognized: [result]
+        ).first ?? region
+    }
+
+    static func mergeRecognitionResults(
+        originals: [DialogueRegion],
+        recognized: [DialogueRegion]
+    ) -> [DialogueRegion] {
+        let recognizedByID = Dictionary(uniqueKeysWithValues: recognized.map { ($0.id, $0) })
+        return originals.map { original in
+            guard let candidate = recognizedByID[original.id],
+                  !candidate.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return original
+            }
+            var merged = original
+            merged.rawSourceText = candidate.rawSourceText
+            merged.sourceText = candidate.sourceText
+            merged.ocrResults = original.ocrResults.merging(candidate.ocrResults) {
+                _, latest in latest
+            }
+            merged.ocrTextRefined = candidate.ocrTextRefined
+            merged.detectedWritingDirection = candidate.detectedWritingDirection
+            // MCP 抽取結果屬於另一個來源；本機重新抽字不應沿用舊的 MCP 文字。
+            merged.mcpExtractedSourceText = candidate.mcpExtractedSourceText
+            return merged
+        }
     }
 
     public func rerender(

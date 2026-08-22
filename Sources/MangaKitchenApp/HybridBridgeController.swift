@@ -115,6 +115,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
                 title: localized("dataDirectoryPanelTitle"),
                 prompt: localized("choose")
             )
+        case "chooseDefaultOutputDirectory":
+            return chooseDirectory(
+                title: localized("outputPanelTitle"),
+                prompt: localized("choose")
+            )
         case "choosePreferredModelDirectory":
             return try choosePreferredModelDirectory(params)
         case "chooseModelDownloadDirectory":
@@ -316,6 +321,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "updateRegion":
             try updateRegion(params)
             return nil
+        case "reextractRegion":
+            guard let pageID = uuid(params["pageID"]),
+                  let regionID = uuid(params["regionID"]) else {
+                throw BridgeError.invalidParameters
+            }
+            return ["started": store.reextractRegion(pageID: pageID, regionID: regionID)]
         case "revealOutput":
             try revealOutput(params)
             return nil
@@ -557,7 +568,14 @@ final class HybridBridgeController: NSObject, ObservableObject {
         var updated = previous
         updated.interfaceLanguage = interfaceLanguage
         updated.colorScheme = colorScheme
+        if let selectionColorHex = params["selectionColorHex"] as? String {
+            updated.selectionColorHex = DialogueStyle.normalizedHexColor(
+                selectionColorHex,
+                fallback: previous.selectionColorHex
+            )
+        }
         updated.dataDirectoryPath = params["dataDirectoryPath"] as? String
+        updated.defaultOutputDirectoryPath = params["defaultOutputDirectoryPath"] as? String
         updated.imageCompositingBackend = imageCompositingBackend
         updated.imageToTextModelPath = params["imageToTextModelPath"] as? String
         updated.imageToTextModelDownloadDirectoryPath = params[
@@ -595,6 +613,12 @@ final class HybridBridgeController: NSObject, ObservableObject {
         if previous.dataDirectoryPath != current.dataDirectoryPath {
             store.statusMessage = localized("dataDirectoryRestartRequired")
         }
+        if previous.defaultOutputDirectoryPath != current.defaultOutputDirectoryPath {
+            let outputURL = current.defaultOutputDirectoryPath.map {
+                URL(fileURLWithPath: $0).standardizedFileURL
+            }
+            store.setDefaultOutputDirectory(outputURL)
+        }
     }
 
     private func updateSettings(_ params: [String: Any]) throws {
@@ -629,7 +653,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
             value.maskExpansion = min(max(amount, 0), 0.75)
         }
         if let eraseColorHex = params["eraseColorHex"] as? String {
-            value.eraseColorHex = DialogueStyle.normalizedHexColor(
+            value.eraseColorHex = ProcessingOptions.normalizedEraseColor(
                 eraseColorHex,
                 fallback: value.eraseColorHex
             )

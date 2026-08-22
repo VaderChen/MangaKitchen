@@ -40,6 +40,7 @@ const canvasViewport = { pageID: null, scale: 1, x: 0, y: 0, drag: null };
 const canvasBaseSizes = new WeakMap();
 const colorSchemeStorageKey = "mangakitchen.color-scheme";
 const inspectorTabStorageKey = "mangakitchen.inspector-tab";
+const modelTabStorageKey = "mangakitchen.model-tab";
 
 const elements = {
   projectSelector: document.querySelector("#project-selector"),
@@ -79,6 +80,8 @@ const elements = {
   resultPreviewCaption: document.querySelector("#result-preview-caption"),
   outputPlaceholder: document.querySelector("#output-placeholder"),
   exportPSD: document.querySelector("#export-psd"),
+  reextractText: document.querySelector("#reextract-text"),
+  retranslate: document.querySelector("#retranslate"),
   regionList: document.querySelector("#region-list"),
   regionCount: document.querySelector("#region-count"),
   regionAdd: document.querySelector("#add-text-region"),
@@ -130,9 +133,11 @@ const elements = {
   modelLoadingClose: document.querySelector("#model-loading-close"),
   settingsLanguage: document.querySelector("#settings-language"),
   settingsColorScheme: document.querySelector("#settings-color-scheme"),
+  settingsSelectionColor: document.querySelector("#settings-selection-color"),
   settingsImageCompositingBackend: document.querySelector("#settings-image-compositing-backend"),
   settingsDataDirectory: document.querySelector("#settings-data-directory"),
   dataDirectoryRestartNote: document.querySelector("#data-directory-restart-note"),
+  settingsDefaultOutputDirectory: document.querySelector("#settings-default-output-directory"),
   settingsImageToTextModel: document.querySelector("#settings-image-to-text-model"),
   settingsImageToTextModelVariant: document.querySelector("#settings-image-to-text-model-variant"),
   settingsImageToTextModelDownload: document.querySelector("#download-image-to-text-model"),
@@ -248,6 +253,9 @@ const operationLabelKeys = {
   rescan: "operationRescan",
   detectMasks: "operationDetectMasks",
   translate: "operationTranslate",
+  extractText: "operationExtractText",
+  retranslate: "operationRetranslate",
+  extractRegion: "operationExtractRegion",
   superResolve: "operationSuperResolve",
   compose: "operationCompose",
   fullPage: "operationFullPage",
@@ -297,6 +305,7 @@ function syncWorkflowStep(page) {
     workflowStepPinned = false;
     activeWorkflowStep = workflowStepForPage(page);
     selectedMaskRegionID = null;
+    selectedTranslationRegionID = null;
   } else if (!workflowStepPinned) {
     activeWorkflowStep = workflowStepForPage(page);
   }
@@ -321,6 +330,12 @@ function selectedWorkflowPages() {
   if (selected.size) return state.pages.filter((page) => selected.has(page.id));
   const page = activePage();
   return page ? [page] : [];
+}
+
+function nextPageAfter(page) {
+  if (!page || !state?.pages?.length) return null;
+  const index = state.pages.findIndex((candidate) => candidate.id === page.id);
+  return index >= 0 ? state.pages[index + 1] ?? null : null;
 }
 
 function hasWorkflowStepData(page, step) {
@@ -457,6 +472,29 @@ function renderCalculationDialog() {
   updateCalculationElapsed();
   const step = calculationStepLabel(calculationDialogState.operation);
   elements.calculationTitle.textContent = t("calculatingStep", { step });
+  if (calculationDialogState.operation === "extractRegion") {
+    if (state.isProcessing) {
+      calculationDialogState.started = true;
+      elements.calculationProgress.removeAttribute("value");
+      const page = state.pages.find((item) => item.id === calculationDialogState.pageIDs[0]);
+      const activityKey = page?.processingActivity
+        ? processingActivityLabelKeys[page.processingActivity]
+        : null;
+      if (activityKey) {
+        const parameters = { title: page.title };
+        if (page.processingRegionCount > 0) {
+          parameters.current = page.processingRegionIndex ?? 0;
+          parameters.total = page.processingRegionCount;
+        }
+        elements.calculationMessage.textContent = t(activityKey, parameters);
+      } else {
+        elements.calculationMessage.textContent = t("preparingCalculation");
+      }
+    } else if (calculationDialogState.started) {
+      closeCalculationDialog();
+    }
+    return;
+  }
   if (calculationDialogState.operation === "rescan") {
     if (state.isProcessing) {
       calculationDialogState.started = true;
@@ -522,7 +560,7 @@ function renderCalculationDialog() {
 }
 
 function calculationPageFraction(operation, page) {
-  if (operation === "translate") {
+  if (["translate", "extractText", "retranslate"].includes(operation)) {
     return Math.min(Math.max((page.progress - 0.25) / 0.4, 0), 1);
   }
   if (operation === "superResolve") {
@@ -600,7 +638,7 @@ async function runBatchWithCalculationDialog(
   const hasImageToTextModel = state.loadedModels.some(
     (model) => model.capability === "imageToText"
   );
-  if (operation === "fullPage" && !hasImageToTextModel) {
+  if (["fullPage", "extractText", "retranslate"].includes(operation) && !hasImageToTextModel) {
     showError(new Error(t("vlmRequiredForDetection")));
     return null;
   }
@@ -614,6 +652,33 @@ async function runBatchWithCalculationDialog(
   calculationDialogState.jobID = result.jobID;
   renderCalculationDialog();
   return result;
+}
+
+async function runRegionExtractionWithCalculationDialog(pageID, regionID) {
+  if (!pageID || !regionID) return null;
+  if (state.isProcessing) return null;
+  await flushPendingRegionUpdates();
+  if (state.isProcessing) return null;
+  const hasImageToTextModel = state.loadedModels.some(
+    (model) => model.capability === "imageToText"
+  );
+  if (!hasImageToTextModel) {
+    showError(new Error(t("vlmRequiredForDetection")));
+    return null;
+  }
+  openCalculationDialog("extractRegion", [pageID]);
+  try {
+    const result = await invoke("reextractRegion", { pageID, regionID });
+    if (!result?.started) {
+      closeCalculationDialog();
+      return null;
+    }
+    return true;
+  } catch (error) {
+    closeCalculationDialog();
+    showError(error);
+    return null;
+  }
 }
 
 function selectedIDSet() {
@@ -1236,6 +1301,10 @@ function renderRegions(page) {
     const source = document.createElement("p");
     source.className = "source-text";
     source.textContent = region.sourceText || t("noSourceText");
+    source.addEventListener("click", () => {
+      if (activeWorkflowStep === "mask") selectMaskRegion(page, region.id);
+      else selectTranslationRegion(page, region.id);
+    });
 
     const editor = document.createElement("textarea");
     editor.value = region.translatedText;
@@ -1258,21 +1327,22 @@ function renderRegions(page) {
         region.translationQAFlags.some((flag) => flag !== "reviewAdjusted"),
       );
     }
-    if (region.literalTranslatedText) {
-      const literal = document.createElement("details");
+    const mcpExtractedSourceText = String(region.mcpExtractedSourceText ?? "").trim();
+    if (mcpExtractedSourceText) {
+      const extracted = document.createElement("details");
       const summary = document.createElement("summary");
-      summary.textContent = t("literalTranslation");
+      summary.textContent = t("mcpExtractedSourceText");
       const text = document.createElement("p");
-      text.textContent = region.literalTranslatedText;
-      literal.append(summary, text);
-      translationMetadata.append(literal);
+      text.textContent = mcpExtractedSourceText;
+      extracted.append(summary, text);
+      translationMetadata.append(extracted);
     }
     if (metadataItems.length) {
       const summary = document.createElement("small");
       summary.textContent = metadataItems.join(" · ");
       translationMetadata.prepend(summary);
     }
-    translationMetadata.hidden = !metadataItems.length && !region.literalTranslatedText;
+    translationMetadata.hidden = !metadataItems.length && !mcpExtractedSourceText;
 
     const direction = document.createElement("select");
     direction.disabled = state.isProcessing || regionUpdatesSuspended;
@@ -1328,6 +1398,22 @@ function renderRegions(page) {
     const textColor = document.createElement("input");
     textColor.type = "color";
     textColor.value = region.style.textColorHex ?? "#111111";
+    const reextractButton = makeIconButton(
+      "fa-arrows-rotate",
+      t("reextractRegionText"),
+      "quiet region-reextract-button",
+      (event) => {
+        event.stopPropagation();
+        if (state.isProcessing || activeWorkflowStep !== "translate") return;
+        runRegionExtractionWithCalculationDialog(page.id, region.id).catch(showError);
+      }
+    );
+    // 長文 title 會在窄版側欄外溢成原生提示框；aria-label 已足夠提供輔助技術描述。
+    reextractButton.removeAttribute("title");
+    reextractButton.disabled = state.isProcessing || activeWorkflowStep !== "translate";
+    const textColorControl = document.createElement("div");
+    textColorControl.className = "region-color-control";
+    textColorControl.append(textColor, reextractButton);
     const strokeColor = document.createElement("input");
     strokeColor.type = "color";
     strokeColor.value = region.style.strokeColorHex ?? "#FFFFFF";
@@ -1369,7 +1455,7 @@ function renderRegions(page) {
     rotationOutput.value = `${rotation.value}°`;
     styleControls.append(
       makeStyleField("textAlignment", alignment),
-      makeStyleField("textColor", textColor),
+      makeStyleField("textColor", textColorControl),
       makeStyleField("strokeColor", strokeColor),
       makeStyleField("strokeWidth", strokeWidth, strokeOutput),
       makeStyleField("layerOpacity", opacity, opacityOutput),
@@ -1427,7 +1513,10 @@ function renderRegions(page) {
     const controls = document.createElement("div");
     controls.className = "region-controls";
     controls.append(direction, boldToggle);
-    row.append(heading, source, editor, translationMetadata, controls, styleControls);
+    const collapsible = document.createElement("div");
+    collapsible.className = "region-collapsible";
+    collapsible.append(editor, translationMetadata, controls, styleControls);
+    row.append(heading, source, collapsible);
     elements.regionList.append(row);
   }
 
@@ -2384,6 +2473,7 @@ function renderPage() {
         : "recalculate"
   );
   elements.reveal.hidden = !page
+    || activeWorkflowStep === "translate"
     || (activeWorkflowStep === "pages" && !hasCalculatedOutput);
   elements.reveal.disabled = outputStepActive
     ? !page?.outputPreviewURL
@@ -2391,6 +2481,13 @@ function renderPage() {
   elements.exportPSD.hidden = !outputStepActive;
   elements.exportPSD.disabled = !outputStepActive || !page || state.isProcessing
     || !Boolean(page.outputPreviewURL || page.translationPreviewURL || page.maskAppliedPreviewURL);
+  const canRecalculateTranslation = Boolean(
+    page && activeWorkflowStep === "translate" && hasImageToTextModel
+  );
+  elements.reextractText.hidden = !page || activeWorkflowStep !== "translate";
+  elements.reextractText.disabled = !canRecalculateTranslation || state.isProcessing;
+  elements.retranslate.hidden = !page || activeWorkflowStep !== "translate";
+  elements.retranslate.disabled = !canRecalculateTranslation || state.isProcessing;
   const hasSuperResolutionModel = state.loadedModels.some(
     (model) => model.capability === "superResolution"
   );
@@ -2405,8 +2502,15 @@ function renderPage() {
       : t("superResolutionModelRequired");
   elements.superResolution.setAttribute("aria-label", elements.superResolution.title);
   elements.canvasPixelPreview.disabled = !page || state.isProcessing;
-  elements.workflowNext.hidden = !page || outputStepActive;
-  elements.workflowNext.disabled = !page || state.isProcessing;
+  const nextPage = outputStepActive ? nextPageAfter(page) : null;
+  elements.workflowNext.hidden = !page;
+  elements.workflowNext.disabled = !page || state.isProcessing
+    || (outputStepActive && !nextPage);
+  const workflowNextLabel = outputStepActive
+    ? (nextPage ? t("nextPage") : t("lastPage"))
+    : t("nextWorkflowStep");
+  elements.workflowNext.title = workflowNextLabel;
+  elements.workflowNext.setAttribute("aria-label", workflowNextLabel);
   elements.progress.value = page?.progress ?? 0;
   elements.projectPath.textContent = state.sourceDirectoryPath ?? "";
   renderCanvasInfo(page);
@@ -2487,7 +2591,7 @@ function renderSettings() {
   if (document.activeElement !== elements.targetLanguage) elements.targetLanguage.value = options.targetLanguageCode;
   elements.readingDirection.value = options.readingDirection;
   elements.writingDirection.value = options.defaultStyle.writingDirection;
-  renderEraseColor(options.eraseColorHex ?? "#FFFFFF");
+  renderEraseColor(options.eraseColorHex ?? "AUTO");
   const selectedFont = options.defaultStyle.fontName;
   const availableFonts = [...new Set([
     selectedFont,
@@ -2569,14 +2673,19 @@ function renderSettings() {
 
 function normalizedEraseColor(value) {
   const normalized = String(value ?? "").trim().toUpperCase();
-  return /^#[0-9A-F]{6}$/.test(normalized) ? normalized : "#FFFFFF";
+  if (normalized === "AUTO") return "AUTO";
+  return /^#[0-9A-F]{6}$/.test(normalized) ? normalized : "AUTO";
 }
 
 function renderEraseColor(value) {
   const color = normalizedEraseColor(value);
+  const automatic = color === "AUTO";
   elements.eraseColor.value = color;
-  elements.eraseColorSwatch.style.setProperty("--paper-color", color);
-  elements.eraseColorValue.value = color;
+  elements.eraseColorSwatch.classList.toggle("is-automatic", automatic);
+  if (automatic) elements.eraseColorSwatch.style.removeProperty("--paper-color");
+  else elements.eraseColorSwatch.style.setProperty("--paper-color", color);
+  elements.eraseColorValue.value = automatic ? t("automaticEraseColor") : color;
+  elements.eraseColorValue.textContent = automatic ? t("automaticEraseColor") : color;
   for (const option of elements.eraseColorPresets.querySelectorAll("[data-erase-color]")) {
     option.setAttribute("aria-selected", String(option.dataset.eraseColor === color));
   }
@@ -2629,8 +2738,10 @@ function globalSettingsPayload(overrides = {}) {
   return {
     interfaceLanguage: current.interfaceLanguage,
     colorScheme: current.colorScheme,
+    selectionColorHex: current.selectionColorHex,
     imageCompositingBackend: current.imageCompositingBackend,
     dataDirectoryPath: current.dataDirectoryPath,
+    defaultOutputDirectoryPath: current.defaultOutputDirectoryPath,
     imageToTextModelPath: current.imageToTextModelPath,
     imageToTextModelDownloadDirectoryPath: current.imageToTextModelDownloadDirectoryPath,
     imageToTextModelVariant: current.imageToTextModelVariant,
@@ -2692,8 +2803,14 @@ function renderGlobalSettings() {
   }
   elements.settingsLanguage.value = settings.interfaceLanguage;
   elements.settingsColorScheme.value = settings.colorScheme;
+  const selectionColor = /^#[0-9A-F]{6}$/i.test(settings.selectionColorHex ?? "")
+    ? settings.selectionColorHex.toUpperCase()
+    : "#5B5FEF";
+  elements.settingsSelectionColor.value = selectionColor;
+  document.documentElement.style.setProperty("--selection-color", selectionColor);
   elements.settingsImageCompositingBackend.value = settings.imageCompositingBackend;
   elements.settingsDataDirectory.value = settings.configuredDataDirectoryPath ?? "";
+  elements.settingsDefaultOutputDirectory.value = settings.defaultOutputDirectoryPath ?? "";
   elements.dataDirectoryRestartNote.hidden = !settings.dataDirectoryRestartRequired;
   elements.settingsImageToTextModel.value = settings.imageToTextModelDownloadDirectoryPath ?? "";
   const modelOptions = settings.imageToTextModelOptions ?? [];
@@ -3064,6 +3181,23 @@ function showSettingsPage(name) {
   }
 }
 
+function showModelTab(name) {
+  const tabs = [...document.querySelectorAll("[data-model-tab]")];
+  const pages = [...document.querySelectorAll("[data-model-page]")];
+  const selected = tabs.some((tab) => tab.dataset.modelTab === name) ? name : "ocr";
+  for (const tab of tabs) {
+    const active = tab.dataset.modelTab === selected;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  }
+  for (const page of pages) {
+    const active = page.dataset.modelPage === selected;
+    page.classList.toggle("active", active);
+    page.hidden = !active;
+  }
+  localStorage.setItem(modelTabStorageKey, selected);
+}
+
 async function choosePreferenceDirectory(method, overrides) {
   const result = await invoke(method, overrides?.request ?? {}).catch(showError);
   if (!result?.path) return;
@@ -3270,6 +3404,27 @@ elements.calculationCancel.addEventListener("click", () => {
 for (const tab of document.querySelectorAll("[data-settings-tab]")) {
   tab.addEventListener("click", () => showSettingsPage(tab.dataset.settingsTab));
 }
+const modelTabs = [...document.querySelectorAll("[data-model-tab]")];
+for (const [index, tab] of modelTabs.entries()) {
+  tab.addEventListener("click", () => showModelTab(tab.dataset.modelTab));
+  tab.addEventListener("keydown", (event) => {
+    const nextIndex = event.key === "ArrowRight"
+      ? (index + 1) % modelTabs.length
+      : event.key === "ArrowLeft"
+        ? (index - 1 + modelTabs.length) % modelTabs.length
+        : event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? modelTabs.length - 1
+            : null;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const nextTab = modelTabs[nextIndex];
+    showModelTab(nextTab.dataset.modelTab);
+    nextTab.focus();
+  });
+}
+showModelTab(localStorage.getItem(modelTabStorageKey) ?? "ocr");
 const inspectorTabs = [...document.querySelectorAll("[data-inspector-tab]")];
 for (const [index, tab] of inspectorTabs.entries()) {
   tab.addEventListener("click", () => showInspectorTab(tab.dataset.inspectorTab));
@@ -3312,6 +3467,16 @@ document.querySelector("#detect-selected").addEventListener("click", () => {
 });
 document.querySelector("#translate-selected").addEventListener("click", () => {
   selectOrCalculateWorkflowStep("translate", "translate").catch(showError);
+});
+elements.reextractText.addEventListener("click", () => {
+  const page = activePage();
+  if (!page || activeWorkflowStep !== "translate") return;
+  runBatchWithCalculationDialog("extractText", [page.id], true).catch(showError);
+});
+elements.retranslate.addEventListener("click", () => {
+  const page = activePage();
+  if (!page || activeWorkflowStep !== "translate") return;
+  runBatchWithCalculationDialog("retranslate", [page.id], true).catch(showError);
 });
 document.querySelector("#compose-selected").addEventListener("click", () => {
   selectOrCalculateWorkflowStep("compose", "compose").catch(showError);
@@ -3362,6 +3527,11 @@ document.querySelector("#reveal-output").addEventListener("click", () => {
   }
 });
 elements.workflowNext.addEventListener("click", () => {
+  if (activeWorkflowStep === "compose") {
+    const nextPage = nextPageAfter(activePage());
+    if (nextPage) setSelection([nextPage.id], nextPage.id);
+    return;
+  }
   advanceWorkflowStep().catch(showError);
 });
 elements.superResolution.addEventListener("click", () => {
@@ -3480,6 +3650,11 @@ elements.settingsColorScheme.addEventListener("change", () => {
   applyColorScheme(elements.settingsColorScheme.value);
   updateGlobalSettings({ colorScheme: elements.settingsColorScheme.value });
 });
+elements.settingsSelectionColor.addEventListener("input", () => {
+  const value = elements.settingsSelectionColor.value.toUpperCase();
+  document.documentElement.style.setProperty("--selection-color", value);
+  updateGlobalSettings({ selectionColorHex: value });
+});
 elements.settingsImageCompositingBackend.addEventListener("change", () => {
   updateGlobalSettings({
     imageCompositingBackend: elements.settingsImageCompositingBackend.value,
@@ -3509,6 +3684,17 @@ document.querySelector("#choose-data-directory").addEventListener("click", () =>
 });
 document.querySelector("#reset-data-directory").addEventListener("click", () => {
   updateGlobalSettings({ dataDirectoryPath: null });
+});
+document.querySelector("#choose-default-output-directory").addEventListener("click", () => {
+  invoke("chooseDefaultOutputDirectory")
+    .then((result) => {
+      if (!result?.path) return;
+      updateGlobalSettings({ defaultOutputDirectoryPath: result.path });
+    })
+    .catch(showError);
+});
+document.querySelector("#reset-default-output-directory").addEventListener("click", () => {
+  updateGlobalSettings({ defaultOutputDirectoryPath: null });
 });
 document.querySelector("#choose-image-to-text-model").addEventListener("click", () => {
   invoke("chooseModelDownloadDirectory", { capability: "imageToText" })
@@ -3642,6 +3828,7 @@ window.addEventListener("mangakitchen-language-change", () => {
   elements.settingsLanguage.value = interfaceLanguageSetting();
   if (state) {
     renderPage();
+    renderSettings();
     renderModelLoadingDialog();
   }
   syncNativeInterfaceLanguage().catch(showError);

@@ -151,6 +151,13 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
 
         Rules:
         - Transcribe accepted text exactly in its original language and never translate it.
+        - Inspect the entire crop before answering. Include every visible line and every
+          vertical column belonging to this crop; never stop after the first column or
+          summarize the crop. For Japanese vertical text, concatenate columns from right
+          to left, and characters from top to bottom, preserving punctuation and ellipses.
+        - If a glyph is uncertain, keep it as a best-effort character rather than dropping
+          the rest of the line. Returning partial text is worse than returning an uncertain
+          character because this text is used to decide what the user will review.
         - Combine all lines or vertical columns belonging to this crop in source reading order.
         - direction is vertical for top-to-bottom columns, otherwise horizontal.
         - Stylised onomatopoeia and action sounds are always ignore, even when legible.

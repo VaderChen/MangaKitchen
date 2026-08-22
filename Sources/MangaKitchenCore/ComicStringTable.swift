@@ -56,8 +56,10 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
     public var detectedWritingDirection: WritingDirection?
     public var rawSourceText: String?
     public var sourceText: String
+    public var ocrResults: [String: OCRModelResult]
     public var ocrTextRefined: Bool
     public var literalTranslatedText: String?
+    public var mcpExtractedSourceText: String?
     public var translatedText: String
     public var speakerID: String?
     public var tone: String?
@@ -86,8 +88,10 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
             : region.detectedWritingDirection
         rawSourceText = region.rawSourceText
         sourceText = region.sourceText
+        ocrResults = region.ocrResults
         ocrTextRefined = region.ocrTextRefined
         literalTranslatedText = region.literalTranslatedText
+        mcpExtractedSourceText = region.mcpExtractedSourceText
         translatedText = region.translatedText
         speakerID = region.speakerID
         tone = region.tone
@@ -115,8 +119,10 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
             detectedWritingDirection: detectedWritingDirection ?? .automatic,
             rawSourceText: rawSourceText,
             sourceText: sourceText,
+            ocrResults: ocrResults,
             ocrTextRefined: ocrTextRefined,
             literalTranslatedText: literalTranslatedText,
+            mcpExtractedSourceText: mcpExtractedSourceText,
             translatedText: translatedText,
             speakerID: speakerID,
             tone: tone,
@@ -145,8 +151,10 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         case detectedWritingDirection
         case rawSourceText
         case sourceText
+        case ocrResults
         case ocrTextRefined
         case literalTranslatedText
+        case mcpExtractedSourceText
         case translatedText
         case speakerID
         case tone
@@ -184,8 +192,13 @@ public struct ComicStringEntry: Identifiable, Codable, Hashable, Sendable {
         )
         rawSourceText = try values.decodeIfPresent(String.self, forKey: .rawSourceText)
         sourceText = try values.decode(String.self, forKey: .sourceText)
+        ocrResults = try values.decodeIfPresent(
+            [String: OCRModelResult].self,
+            forKey: .ocrResults
+        ) ?? [:]
         ocrTextRefined = try values.decodeIfPresent(Bool.self, forKey: .ocrTextRefined) ?? false
         literalTranslatedText = try values.decodeIfPresent(String.self, forKey: .literalTranslatedText)
+        mcpExtractedSourceText = try values.decodeIfPresent(String.self, forKey: .mcpExtractedSourceText)
         translatedText = try values.decode(String.self, forKey: .translatedText)
         speakerID = try values.decodeIfPresent(String.self, forKey: .speakerID)
         tone = try values.decodeIfPresent(String.self, forKey: .tone)

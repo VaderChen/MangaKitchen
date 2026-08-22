@@ -66,6 +66,30 @@ final class RegionDetectionSafetyTests: XCTestCase {
         XCTAssertEqual(Set(try grayscalePixels(from: mask)), Set([UInt8(0), UInt8(255)]))
     }
 
+    func testEmptyRegionListProducesAllBlackMaskForManualMode() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MangaKitchen-ManualMask-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.png")
+        let maskURL = directory.appendingPathComponent("mask.png")
+        let source = try makeImage(width: 32, height: 24) { context in
+            context.setFillColor(gray: 1, alpha: 1)
+            context.fill(CGRect(x: 0, y: 0, width: 32, height: 24))
+        }
+        try CGImageIO.writePNG(source, to: sourceURL)
+
+        try await DialogueMaskGenerator().generateMask(
+            sourceURL: sourceURL,
+            regions: [],
+            expansion: 0.035,
+            outputURL: maskURL
+        )
+
+        XCTAssertEqual(Set(try grayscalePixels(from: CGImageIO.load(from: maskURL))), Set([UInt8(0)]))
+    }
+
     func testBoundaryDiagnosticDoesNotDisablePlausibleMask() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MangaKitchen-MaskBoundary-\(UUID().uuidString)", isDirectory: true)
@@ -272,6 +296,58 @@ final class RegionDetectionSafetyTests: XCTestCase {
 
     func testDefaultWritingDirectionIsAutomatic() {
         XCTAssertEqual(ProcessingOptions().defaultStyle.writingDirection, .automatic)
+    }
+
+    func testTextRecognitionCannotReplaceExistingMaskGeometry() {
+        let polygon = [
+            NormalizedPoint(x: 0.2, y: 0.2),
+            NormalizedPoint(x: 0.3, y: 0.2),
+            NormalizedPoint(x: 0.3, y: 0.3),
+            NormalizedPoint(x: 0.2, y: 0.3),
+        ]
+        let stroke = MaskStroke(
+            mode: .add,
+            points: [
+                NormalizedPoint(x: 0.22, y: 0.22),
+                NormalizedPoint(x: 0.28, y: 0.28),
+            ],
+            diameter: 0.02
+        )
+        let original = DialogueRegion(
+            bounds: NormalizedRect(x: 0.2, y: 0.2, width: 0.1, height: 0.1),
+            bubbleBounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.4, height: 0.4),
+            sourceText: "原文",
+            confidence: 1,
+            maskPolygons: [polygon],
+            maskRefinementApplied: true,
+            maskCoverageRatio: 0.98,
+            maskCoverageComplete: true,
+            maskStrokes: [stroke]
+        )
+        var recognized = original
+        recognized.bounds = NormalizedRect(x: 0, y: 0, width: 1, height: 1)
+        recognized.bubbleBounds = nil
+        recognized.sourceText = "重新抽取的原文"
+        recognized.rawSourceText = recognized.sourceText
+        recognized.maskPolygons = []
+        recognized.maskRefinementApplied = false
+        recognized.maskCoverageRatio = nil
+        recognized.maskCoverageComplete = false
+        recognized.maskStrokes = []
+
+        let merged = ComicTranslationPipeline.mergeRecognitionResults(
+            originals: [original],
+            recognized: [recognized]
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].sourceText, "重新抽取的原文")
+        XCTAssertEqual(merged[0].bounds, original.bounds)
+        XCTAssertEqual(merged[0].bubbleBounds, original.bubbleBounds)
+        XCTAssertEqual(merged[0].maskPolygons, original.maskPolygons)
+        XCTAssertEqual(merged[0].maskStrokes, original.maskStrokes)
+        XCTAssertEqual(merged[0].maskCoverageRatio, original.maskCoverageRatio)
+        XCTAssertEqual(merged[0].maskCoverageComplete, original.maskCoverageComplete)
     }
 
     private func makeImage(

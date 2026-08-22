@@ -209,8 +209,10 @@ struct WebGlobalSettings: Encodable {
 
     var interfaceLanguage: String
     var colorScheme: String
+    var selectionColorHex: String
     var dataDirectoryPath: String?
     var configuredDataDirectoryPath: String?
+    var defaultOutputDirectoryPath: String?
     var activeDataDirectoryPath: String?
     var dataDirectoryRestartRequired: Bool
     var imageCompositingBackend: ImageCompositingBackend
@@ -241,6 +243,7 @@ struct WebGlobalSettings: Encodable {
     ) {
         interfaceLanguage = preferences.interfaceLanguage
         colorScheme = preferences.colorScheme
+        selectionColorHex = preferences.selectionColorHex
         dataDirectoryPath = preferences.dataDirectoryPath
         activeDataDirectoryPath = store.applicationDataDirectoryPath
         configuredDataDirectoryPath = preferences.dataDirectoryPath.map {
@@ -250,6 +253,7 @@ struct WebGlobalSettings: Encodable {
             .appendingPathComponent(ApplicationDirectories.currentName, isDirectory: true)
             .standardizedFileURL.path
         dataDirectoryRestartRequired = configuredDataDirectoryPath != store.applicationDataDirectoryPath
+        defaultOutputDirectoryPath = preferences.defaultOutputDirectoryPath
         imageCompositingBackend = preferences.resolvedImageCompositingBackend
         imageToTextModelPath = preferences.imageToTextModelPath
         imageToTextModelDownloadDirectoryPath = preferences.imageToTextModelDownloadDirectoryPath

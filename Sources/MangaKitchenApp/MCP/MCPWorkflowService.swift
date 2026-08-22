@@ -823,7 +823,15 @@ actor MCPWorkflowService {
             edit.isVisible = result.isVisible
             edit.sourceTextChangesMaskGeometry = false
             _ = PageRegionEditor.apply(edit, to: &updatedRegions[regionIndex])
+            let mcpSourceText = result.literalTranslatedText?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
             updatedRegions[regionIndex].literalTranslatedText = result.literalTranslatedText
+            // MCP 的 literal_translated_text 在目前契約中代表 Agent 抽取的原文；
+            // 另存來源標記，讓 UI 不會把本機 VLM 直譯稿誤顯示成 MCP 結果。
+            updatedRegions[regionIndex].mcpExtractedSourceText = mcpSourceText?.isEmpty == false
+                ? mcpSourceText
+                : nil
             updatedRegions[regionIndex].speakerID = result.speakerID
             updatedRegions[regionIndex].tone = result.tone
             updatedRegions[regionIndex].translationConfidence = result.translationConfidence.map {

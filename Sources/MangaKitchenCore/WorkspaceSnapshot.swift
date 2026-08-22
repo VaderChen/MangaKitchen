@@ -127,6 +127,8 @@ public struct ComicProjectSummary: Identifiable, Codable, Hashable, Sendable {
 public enum BatchOperation: String, Codable, CaseIterable, Hashable, Sendable {
     case detectMasks
     case translate
+    case extractText
+    case retranslate
     case superResolve
     case compose
     case fullPage

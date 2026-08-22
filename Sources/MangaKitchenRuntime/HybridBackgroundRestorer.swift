@@ -50,14 +50,17 @@ public actor HybridBackgroundRestorer: PageBackgroundRestoring {
             warnings.append("未載入圖生圖模型。")
         }
 
-        let fixedFillColor = DialogueStyle.normalizedHexColor(fillColorHex, fallback: "")
-        if !fixedFillColor.isEmpty {
+        let configuredFillColor = ProcessingOptions.normalizedEraseColor(
+            fillColorHex,
+            fallback: ProcessingOptions.automaticEraseColor
+        )
+        if configuredFillColor != ProcessingOptions.automaticEraseColor {
             // 專案已指定底紙顏色時直接精確填色，不再讓 CPU／Metal 猜測紙面亮度。
             try await cpuFallback.clean(
                 sourceURL: sourceURL,
                 maskURL: maskURL,
                 regions: regions,
-                fillColorHex: fixedFillColor,
+                fillColorHex: configuredFillColor,
                 outputURL: outputURL,
                 progress: progress
             )

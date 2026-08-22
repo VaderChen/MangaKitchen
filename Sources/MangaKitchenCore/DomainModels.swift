@@ -271,6 +271,51 @@ public struct TranslationQualityOptions: Codable, Hashable, Sendable {
     }
 }
 
+/// 單一 OCR 模型在一個對話區域產生的候選結果。
+///
+/// OCR 只在步驟三翻譯前被用來產生候選，不會覆寫 `DialogueRegion.sourceText`、
+/// `bounds` 或任何遮罩。不同模型的結果以 `DialogueRegion.ocrResults` 的模型 ID
+/// 分開保存，之後的複合 OCR／二次校稿才能回看每個模型的原始候選。
+public struct OCRTextLineResult: Codable, Hashable, Sendable {
+    public var text: String
+    public var confidence: Double?
+    public var bounds: NormalizedRect
+
+    public init(
+        text: String,
+        confidence: Double? = nil,
+        bounds: NormalizedRect
+    ) {
+        self.text = text
+        self.confidence = confidence.map { min(max($0, 0), 1) }
+        self.bounds = bounds.clamped()
+    }
+}
+
+public struct OCRModelResult: Codable, Hashable, Sendable {
+    public var modelID: String
+    public var text: String
+    public var confidence: Double?
+    public var lines: [OCRTextLineResult]
+    public var writingDirection: WritingDirection
+
+    public init(
+        modelID: String,
+        text: String,
+        confidence: Double? = nil,
+        lines: [OCRTextLineResult] = [],
+        writingDirection: WritingDirection = .automatic
+    ) {
+        self.modelID = modelID
+        self.text = text
+        self.confidence = confidence.map { min(max($0, 0), 1) }
+        self.lines = lines.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        self.writingDirection = writingDirection
+    }
+}
+
 public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     /// VLM／Agent 找到的來源文字區域，也是譯文的預設排版錨點。
@@ -293,10 +338,15 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     public var rawSourceText: String?
     /// 供詞表比對與翻譯使用的來源文字。
     public var sourceText: String
+    /// 各 OCR 模型獨立產生的候選結果。只供後續複合 OCR／二次校稿使用，
+    /// 不代表目前已確認的 `sourceText`。
+    public var ocrResults: [String: OCRModelResult]
     /// 相容舊 `.str` 的完成標記；新流程代表來源文字已由 VLM、Agent 或人工確認。
     public var ocrTextRefined: Bool
     /// 忠實保留語意的直譯稿；最終排版仍使用 translatedText。
     public var literalTranslatedText: String?
+    /// MCP Agent 回傳的原文抽取結果；本機 VLM 直譯稿不會填入此欄位。
+    public var mcpExtractedSourceText: String?
     public var translatedText: String
     public var speakerID: String?
     public var tone: String?
@@ -326,8 +376,10 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         detectedWritingDirection: WritingDirection = .automatic,
         rawSourceText: String? = nil,
         sourceText: String,
+        ocrResults: [String: OCRModelResult] = [:],
         ocrTextRefined: Bool = false,
         literalTranslatedText: String? = nil,
+        mcpExtractedSourceText: String? = nil,
         translatedText: String = "",
         speakerID: String? = nil,
         tone: String? = nil,
@@ -352,8 +404,10 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         self.detectedWritingDirection = detectedWritingDirection
         self.rawSourceText = rawSourceText
         self.sourceText = sourceText
+        self.ocrResults = ocrResults
         self.ocrTextRefined = ocrTextRefined
         self.literalTranslatedText = literalTranslatedText
+        self.mcpExtractedSourceText = mcpExtractedSourceText
         self.translatedText = translatedText
         self.speakerID = speakerID
         self.tone = tone
@@ -382,8 +436,10 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         case detectedWritingDirection
         case rawSourceText
         case sourceText
+        case ocrResults
         case ocrTextRefined
         case literalTranslatedText
+        case mcpExtractedSourceText
         case translatedText
         case speakerID
         case tone
@@ -417,8 +473,13 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
         ) ?? .automatic
         rawSourceText = try values.decodeIfPresent(String.self, forKey: .rawSourceText)
         sourceText = try values.decode(String.self, forKey: .sourceText)
+        ocrResults = try values.decodeIfPresent(
+            [String: OCRModelResult].self,
+            forKey: .ocrResults
+        ) ?? [:]
         ocrTextRefined = try values.decodeIfPresent(Bool.self, forKey: .ocrTextRefined) ?? false
         literalTranslatedText = try values.decodeIfPresent(String.self, forKey: .literalTranslatedText)
+        mcpExtractedSourceText = try values.decodeIfPresent(String.self, forKey: .mcpExtractedSourceText)
         translatedText = try values.decode(String.self, forKey: .translatedText)
         speakerID = try values.decodeIfPresent(String.self, forKey: .speakerID)
         tone = try values.decodeIfPresent(String.self, forKey: .tone)
@@ -515,12 +576,16 @@ public struct ComicPage: Identifiable, Codable, Hashable, Sendable {
 }
 
 public struct ProcessingOptions: Codable, Hashable, Sendable {
+    /// 交給背景修補器自行從遮罩外圍取樣估算底紙顏色。
+    /// 使用明確 sentinel，才能和使用者指定的純白（#FFFFFF）區分。
+    public static let automaticEraseColor = "AUTO"
+
     public var sourceLanguageCodes: [String]
     public var targetLanguageCode: String
     public var readingDirection: ReadingDirection
     public var defaultStyle: DialogueStyle
     public var maskExpansion: Double
-    /// 傳統去字修補使用的固定底紙顏色；可由專案設定或滴管更新。
+    /// 去字修補使用的底紙顏色；`AUTO` 代表由修補器自動估算，也可指定 HEX 或由滴管更新。
     public var eraseColorHex: String
     public var useImageToImageRestoration: Bool
     public var preserveUntranslatedRegions: Bool
@@ -535,7 +600,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         readingDirection: ReadingDirection = .rightToLeft,
         defaultStyle: DialogueStyle = DialogueStyle(),
         maskExpansion: Double = 0.035,
-        eraseColorHex: String = "#FFFFFF",
+        eraseColorHex: String = ProcessingOptions.automaticEraseColor,
         useImageToImageRestoration: Bool = false,
         preserveUntranslatedRegions: Bool = false,
         fineScanEnabled: Bool = false,
@@ -546,9 +611,9 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.readingDirection = readingDirection
         self.defaultStyle = defaultStyle
         self.maskExpansion = maskExpansion
-        self.eraseColorHex = DialogueStyle.normalizedHexColor(
+        self.eraseColorHex = Self.normalizedEraseColor(
             eraseColorHex,
-            fallback: "#FFFFFF"
+            fallback: Self.automaticEraseColor
         )
         self.useImageToImageRestoration = useImageToImageRestoration
         self.preserveUntranslatedRegions = preserveUntranslatedRegions
@@ -559,6 +624,15 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
     /// 實際交給翻譯器、詞表與 Agent 的目標語言；手動選擇時維持原值。
     public var resolvedTargetLanguageCode: String {
         TargetLanguageResolver.resolve(targetLanguageCode)
+    }
+
+    /// 正規化專案抹除底色設定；保留 `AUTO`，不讓通用 HEX 正規化把它誤轉成白色。
+    public static func normalizedEraseColor(_ value: String, fallback: String = automaticEraseColor) -> String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if normalized == automaticEraseColor {
+            return automaticEraseColor
+        }
+        return DialogueStyle.normalizedHexColor(normalized, fallback: fallback)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -592,7 +666,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         maskExpansion = try values.decodeIfPresent(
             Double.self, forKey: .maskExpansion
         ) ?? defaults.maskExpansion
-        eraseColorHex = DialogueStyle.normalizedHexColor(
+        eraseColorHex = Self.normalizedEraseColor(
             try values.decodeIfPresent(String.self, forKey: .eraseColorHex)
                 ?? defaults.eraseColorHex,
             fallback: defaults.eraseColorHex
