@@ -87,7 +87,7 @@ ANE 模型初次載入約 0.49–0.53 秒；表格中的 warm latency 不含載�
 
 ## 工作樹整合狀態（2026-08-22）
 
-本報告原本驗證的是獨立 PoC；目前工作樹已將 recognizer 以 `PPOCRRecognitionRuntime` 接入 MangaKitchenRuntime。整合採保守的候選保存策略：VLM 先決定區域，OCR 只追加 `ocrResults`，不自動取代 `sourceText`、座標或遮罩。編譯後的 `.mlpackage` 仍不納入 repository，App 在找不到模型資源時會回到原本的 VLM 路徑。
+本報告原本驗證的是獨立 PoC；目前工作樹已將 recognizer 以 `PPOCRRecognitionRuntime` 接入 MangaKitchenRuntime。整合採保守的候選保存策略：VLM 先決定區域，OCR 只追加 `ocrResults`，不自動取代 `sourceText`、座標或遮罩。轉換後的 `.mlpackage` 已納入 repository；App 在找不到模型資源時仍會回到原本的 VLM 路徑。
 
 PoC 腳本本身仍不連結 MangaKitchen target；正式 App 的整合程式與回歸測試則位於 `Sources/MangaKitchenRuntime/` 與 `Tests/MangaKitchenRuntimeTests/`。
 

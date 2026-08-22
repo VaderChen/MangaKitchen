@@ -51,6 +51,9 @@ DerivedData/
 !Sources/MangaKitchenApp/Resources/Models/
 !Sources/MangaKitchenApp/Resources/Models/MangaBubbleSegmentation.mlpackage/
 !Sources/MangaKitchenApp/Resources/Models/MangaBubbleSegmentation.mlpackage/**
+!Sources/MangaKitchenApp/Resources/Models/OCR/
+!Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-small-rec-macos14.mlpackage/
+!Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-small-rec-macos14.mlpackage/**
 
 # Runtime worker binaries
 /RuntimeSupport/QwenImageEditWorker/MangaKitchenQwenImageEditWorker

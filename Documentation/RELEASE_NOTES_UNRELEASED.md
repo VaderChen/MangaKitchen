@@ -15,8 +15,8 @@
 
 ## OCR 模型與 PoC
 
-- `Tests/Experiments/OCRPoC/` 保存 PP-OCRv6 Small 的品質、Core ML 轉換與 ANE／GPU／CPU 基準驗證腳本；`.artifacts/`、模型權重與 Python 快取不納入版本控制。
-- OCR 字元表 `Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-small-rec-characters.json` 隨原始碼保存。編譯後的 `ppocrv6-small-rec-macos14.mlpackage` 因模型大小與散布授權政策不納入 Git；若要啟用 App 內建 OCR，請在本機建置資源中放入相同檔名與目錄。
+- `Tests/Experiments/OCRPoC/` 保存 PP-OCRv6 Small 的品質、Core ML 轉換與 ANE／GPU／CPU 基準驗證腳本；`.artifacts/`、原始模型權重與 Python 快取不納入版本控制。
+- OCR 字元表與轉換後的 `Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-small-rec-macos14.mlpackage` 已隨原始碼保存；模型目錄內附 Apache-2.0 授權副本與轉換說明。
 
 ## 相容性與建置
 
