@@ -41,6 +41,7 @@ struct AgentDrivenTranslator: RegionTranslating {
         glossaryTerms: [ResolvedGlossaryTerm],
         readingDirection: ReadingDirection,
         qualityOptions: TranslationQualityOptions,
+        activity: @escaping PagePipelineActivity,
         regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {

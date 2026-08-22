@@ -29,7 +29,7 @@ GPLv3 itself permits commercial use and paid distribution, subject to its source
 - macOS 14+ SwiftUI / WKWebView application shell.
 - Asynchronous JSON bridge between HTML/JavaScript and Swift.
 - Web UI in `AUTO`, Traditional Chinese, English, Japanese, and Korean. AUTO follows macOS; manual choices persist across launches and also apply to native panels and the MCP menu bar item.
-- Global Settings dialog with General, Advanced, Models, MCP, and About tabs for language, color scheme, CPU/GPU image compositing, data location, model paths, MCP port, and IP/CIDR allowlist.
+- Global Settings dialog with General, Advanced, Models, MCP, and About tabs for language, color scheme, CPU/GPU image compositing, data location, multimodal/text/OCR/localization/SR model roles, MCP port, and IP/CIDR allowlist.
 - Global Settings also persists the canvas selection color and a default output root. New projects use a sanitized project-name subfolder under that root; an existing project's explicit output folder is never replaced.
 - Each source directory is an independent project. Multiple projects can be saved and switched from the toolbar.
 - Recursive image scanning with relative subdirectory paths, natural sorting, and collision-safe handling of duplicate filenames.
@@ -40,13 +40,16 @@ GPLv3 itself permits commercial use and paid distribution, subject to its source
 - One versioned `.str` JSON file per image, storing text, position, font, fixed/automatic size, and mask strokes.
 - Pixel-layer dilation first absorbs anti-aliased edges, then normalized brush strokes add, erase, and undo masks before generating a binary PNG. Failed pixel refinement retains the coarse dialogue mask instead of silently dropping the region. After stage two, a CPU/GPU mask-cleanup preview with the original text removed appears immediately.
 - Project-level erase-paper colors include `AUTO` estimation plus common white, cool-white, warm-white, ivory, and newsprint presets. A stage-one eyedropper samples the source page, while fixed-color cleanup removes pale JPEG/scanner halos without consuming dark speech-balloon outlines.
-- A bundled manga109 bubble-segmentation Core ML model, preferring Apple Neural Engine execution, produces dialogue BBOX candidates and bubble shapes for black-and-white manga. The shape clips mask search and provides an inscribed layout rectangle for HTML typesetting; the image-to-text model then classifies and transcribes each candidate. System OCR is no longer used for text recognition or positioning. Sound effects, page numbers, footer credits, people, and empty regions are deliberately excluded from the primary workflow.
-- If no `imageToText` model is loaded when stage two is entered, the app explains that it is switching to manual mode, creates a same-size all-black mask, and leaves the page ready for brush-based mask editing. Detection and translation controls that require the model remain disabled until one is loaded.
-- Bundled native Swift/Core ML PP-OCRv6 Small OCR can run during stage-three per-region or full-page translation. VLM remains responsible for text localization and region classification; OCR only stores per-model source-text candidates, confidence, line boxes, and reading order without replacing VLM text, bounds, or masks. Composite OCR and review fusion are intentionally deferred to a later VLM proofreading flow.
+- A bundled manga109 bubble-segmentation Core ML model, preferring Apple Neural Engine execution, produces dialogue BBOX candidates and bubble shapes for black-and-white manga. Stage two always refines those confirmed bubbles into pixel-level glyph masks from the original image; changing an OCR/VLM text-localization preference cannot replace or alter this mask path. Apple Vision OCR is not used. Sound effects, page numbers, footer credits, people, and empty regions are deliberately excluded from the primary workflow.
+- Stage two requires neither PP-OCR text detection nor an `imageToText` VLM. The Medium Det and VLM localization runtimes remain isolated from mask generation so model changes cannot regress existing bubble and pixel-mask behavior.
+- Bundled native Swift/Core ML PP-OCRv6 Medium OCR is the default source-text recognizer during stage-three per-region or full-page translation, with the verified Small recognizer as fallback. Every OCR result remains separated by model ID with confidence, line boxes, and reading order; when `sourceText` is empty, the default OCR result becomes the translation source without changing bounds or masks. Existing VLM, Agent, or manually confirmed source text is never overwritten, and an OCR-only result does not claim the legacy `ocrTextRefined` confirmation flag.
+- Translation can use a downloaded text-to-text model or a multimodal model. Text-to-text is the default and consumes the source text produced by OCR/VLM without reading the page image; multimodal translation can also use page context and can be selected for source localization and transcription. A multimodal VLM is therefore optional rather than a global workflow prerequisite.
 - Stage-three controls can explicitly re-extract all region source text, retranslate using the existing source text, or re-extract and translate one selected region; these operations keep stage-two masks and clean backgrounds intact. Calculation dialogs show an elapsed `MM:SS` timer while work is waiting or running.
-- Accepted VLM regions use the dialogue BBOX as their search boundary, then are refined into pixel glyph masks from original-image pixels and shrink to the unexpanded glyph extents. Automatic layout direction prefers the measured glyph arrangement. Each candidate is isolated: if classification, transcription, or translation fails for one region, that region is preserved and the remaining regions continue; only cancellation stops the whole job.
-- Page-context prompts and strict JSON response parsing for image-to-text translation models.
-- Direct loading of local Hugging Face MLX VLM directories through `mlx-swift-lm` on Apple Silicon/Metal.
+- Accepted dialogue regions use the dialogue BBOX as their search boundary, then are refined into pixel glyph masks from original-image pixels and shrink to the unexpanded glyph extents. Automatic layout direction prefers the measured glyph arrangement. Each candidate is isolated: if OCR or translation fails for one region, that region is preserved and the remaining regions continue; only cancellation stops the whole job.
+- Page-context or text-only prompts and strict JSON response parsing for local translation models.
+- Direct loading of local Hugging Face MLX text and multimodal model directories through `mlx-swift-lm` on Apple Silicon/Metal.
+- Text and multimodal models are registered at startup but loaded only when first used. Canonical model identity prevents duplicate loads, concurrent requests for one capability are serialized, and high unified-memory pressure releases other runtimes before a large model is loaded.
+- **Think Mode (Beta)** is optional and off by default. It streams a short reasoning pass into a safe Markdown view, keeps reasoning out of persistent logs, and uses the same loaded model for a deterministic non-thinking JSON finalization pass if reasoning did not produce a complete final value.
 - Model-manifest loading for `.mlmodelc`, `.mlmodel`, and `.mlpackage`, with Core ML configured for Metal GPU execution.
 - Dialogue masks use one or more pixel-level shapes to cover the original letters, clip to speech-area boundaries, and accept additive/eraser brush strokes; CPU or Metal GPU repair is available without an image model.
 - HTML/CSS is the single source of truth for translation layout, including horizontal/vertical writing, fixed or automatic font sizing, per-region bold toggles, dragging, and resizing. WebKit renders the stage-three preview at the real SR pixel size, and stage four saves that exact preview without rebuilding it.
@@ -57,7 +60,8 @@ GPLv3 itself permits commercial use and paid distribution, subject to its source
 - Optional macOS 26 Swift/MLX Qwen Image Edit worker, using the mask both as model conditioning and as the final composition boundary.
 - Optional standard MCP Streamable HTTP server with four-stage tools, workspace/image resources, cancellation, and progress notifications.
 - When MCP is enabled, the app remains in the macOS menu bar and can reopen the main window after it is closed.
-- Startup model loading is shown in a progress dialog. A separate launch-time check reports newer stable GitHub Releases and opens the official release page only when requested; MangaKitchen never downloads or installs an update automatically.
+- An in-memory application log can be opened from the toolbar and cleared at any time. The bottom status bar shows live GPU/unified-memory use, image resolution, and canvas zoom through a transient update path that does not rebuild or interrupt editor controls.
+- On-demand model loading is shown in a progress dialog. A separate launch-time check reports newer stable GitHub Releases, while Settings → About visibly lists the official repository and Releases URLs and provides a manual **Check for Updates** action. External navigation is restricted to those official GitHub paths; MangaKitchen never downloads or installs an update automatically.
 
 ## Two Usage Modes, One Project and Four-Step Workflow
 
@@ -67,7 +71,7 @@ Both modes follow these four steps:
 
 1. **Project and pages**: choose a source directory, scan images recursively, and build a multi-selectable, batch-processable page list.
 2. **Text, masks, and clean background**: locate dialogue BBOX candidates and bubble shapes with the bundled Core ML segmentation model, refine the original-image pixels into glyph masks, apply manual strokes, and produce the confirmed text-free background.
-3. **Transcription, translation, and typesetting preview**: the GUI uses its VLM, while MCP gives an Agent an App-generated page bundle. The App preserves stage-two artifacts, optionally applies SR, and renders the complete HTML/CSS translation preview.
+3. **OCR, translation, and typesetting preview**: the GUI extracts source text with bundled OCR or the selected VLM path, then translates with the selected text-to-text or multimodal model. Optional second-pass review and semantic QA use that same translation path. MCP instead gives an Agent an App-generated page bundle. The App preserves stage-two artifacts, optionally applies SR, and renders the complete HTML/CSS translation preview.
 4. **Output**: copy the confirmed stage-three preview to the project's output directory. This stage does not rerun detection, masking, cleanup, transcription, translation, SR, or typesetting.
 
 The four steps define resumable states, artifacts, and dependencies; they are not a mandatory checklist that restarts at step 1 every time. Both the GUI and MCP should inspect the App-provided page state and work package first, then begin at any step whose prerequisites already exist. Existing masks can go directly to translation, existing translations can go directly to typesetting or composition, and a single region can be edited without reprocessing the page. Completed region detection, masks, translations, and manual edits are not overwritten unless a user or Agent explicitly requests that stage again.
@@ -75,15 +79,15 @@ The four steps define resumable states, artifacts, and dependencies; they are no
 Before starting at any stage, each page must be validated against its actual artifacts rather than trusting the state label alone. If the requested stage lacks a prerequisite, walk backward one stage at a time until reaching the nearest work that must be regenerated:
 
 - Before step 4, validate that the stage-three translation preview exists and is newer than any prior output. A missing or stale preview falls back to step 3; missing regions, mask, or clean background falls back again to step 2.
-- Before step 3, validate the source page, text regions, source text confirmed by the VLM, Agent, or user, and the mask. Incomplete data falls back to step 2.
+- Before step 3, validate the source page, text regions, source text supplied by OCR, VLM, Agent, or the user, and the mask. Incomplete data falls back to step 2.
 - Before step 2, validate that the source image still exists and the project's page index is valid. Missing data falls back to step 1 and a rescan.
 - Fallback regenerates only missing or invalid artifacts. Valid prerequisites remain untouched, and different pages may resume from different stages.
 
 ### Mode A: Download Models and Work Fully Offline
 
-Set an image-to-text model under Settings → Models. Region detection, translation, background restoration, and composition run locally on the Mac. Once model files have been downloaded, comic content does not need to be sent to an external AI service.
+Download a text-to-text or multimodal translation model under Settings → Models. Region detection, source extraction, translation, background restoration, and composition run locally on the Mac. Once model files have been downloaded, comic content does not need to be sent to an external AI service.
 
-- The `imageToText` model is required for local GUI step 3 and for automatic stage-two detection. If it is not loaded, entering stage two creates an all-black mask and switches to manual brush mode; model-dependent recalculation, extraction, and translation actions stay disabled. Once loaded, the model classifies and transcribes existing candidates before page-context translation. The app never falls back to system OCR; an MCP Agent can also provide regions and source text. Classification, transcription, and translation run region by region with isolated error handling, so one failed region does not fail the page; sound effects remain outside the current workflow.
+- Text-to-text translation uses OCR/VLM source text without reading the image. The `imageToText` VLM is required only when the project explicitly selects VLM source extraction or multimodal translation. Stage-two masks, PP-OCR **Re-extract text**, text-only translation, re-typesetting, and output work without it. The app never falls back to Apple Vision OCR; an MCP Agent can provide source text and translations instead. Sound effects remain outside the current workflow.
 - In the translation step, “Re-extract text” refreshes source text and clears dependent translations, while “Re-translate” reuses the current source text. A region-level refresh updates only the selected region and then rerenders the page preview.
 - Background restoration belongs to step 2 and uses the configured Metal GPU neighborhood repair or CPU dominant-color speech-area repair; GPU failures automatically fall back to CPU. Later steps consume this clean background and never regenerate it.
 - The GUI can run each step separately or use “Process Selected/All.” One-click processing still executes steps 2–4 in order and preserves their intermediate data.
@@ -153,11 +157,11 @@ Manifest feature names must match the actual Core ML model. The current Core ML 
 
 The Core ML manifest is a generic adapter for models packaged as one prediction. Models such as Qwen-VL that require tokenizers and autoregressive decoding use a dedicated MLX adapter. Diffusion models with sampler loops likewise require a dedicated `ImageToImageGenerating` adapter; changing only the Core ML feature names is insufficient. The core pipeline does not need to change.
 
-`MLXVLMRuntime` can load local VLMs whose `model_type` is supported by `mlx-swift-lm`. A suggested starting point is the approximately 3 GB `lmstudio-community/Qwen3-VL-4B-Instruct-MLX-4bit`:
+`MLXTextRuntime` and `MLXVLMRuntime` load local text-only or multimodal models whose `model_type` is supported by `mlx-swift-lm`. The managed catalog recommends `mlx-community/Qwen3-4B-4bit` for text-only translation and the approximately 3 GB `lmstudio-community/Qwen3.5-4B-MLX-4bit` for multimodal work:
 
 1. Download the complete Hugging Face model into a local directory.
 2. Copy `Examples/Models/MLXVLMModel/mangakitchen-model.json` into the model directory root.
-3. Select that directory in the app. The first load keeps the model container in memory for reuse across pages.
+3. Select that directory in the app. The path is registered immediately; the model container loads on first use and is then reused across pages until memory pressure requires release.
 
 The `mlx-swift-lm` factory selects architecture from `config.json`, so a single safetensors file is not enough. Keep the tokenizer, processor, chat template, and config files together.
 
@@ -212,12 +216,12 @@ MangaKitchenApp/MCP
 
 See [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md) for architectural decisions and data flow.
 See [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md) for the four-stage Swift/JavaScript/MCP contract.
-See [the build 2139 release notes](Documentation/RELEASE_NOTES_1.26.0822-build-2139.md) for the latest packaged changes, Developer ID signature, notarization status, and verified download checksum.
+See [the build 0323 release notes](Documentation/RELEASE_NOTES_1.26.0823-build-0323.md) for the latest packaged changes, Developer ID signature, notarization status, and verified download checksum.
 See [the current development release notes](Documentation/RELEASE_NOTES_UNRELEASED.md) for changes after the latest package.
 
 ## Known Boundaries
 
-- The bundled `manga109-segmentation-bubble` and PP-OCRv6 Small Core ML models are derived from Apache-2.0 source models. Original image-to-text weights, super-resolution weights, and experimental image-edit model weights are not bundled; their size, licensing, and distribution policy remain separate concerns. The converted OCR `.mlpackage`, character list, and adjacent Apache-2.0 notice are included in this repository.
+- The bundled `manga109-segmentation-bubble`, PP-OCRv6 Medium Core ML default, and PP-OCRv6 Small fallback models are derived from Apache-2.0 source models. Original image-to-text weights, super-resolution weights, and experimental image-edit model weights are not bundled; their size, licensing, and distribution policy remain separate concerns. The converted OCR `.mlpackage` packages, character lists, and adjacent Apache-2.0 notices are included in this repository.
 - Dialogue BBOX or Agent boxes are refined with luminance and connected components from original-image pixels; segmentation shapes clip the search area and the mask uses pixel-layer dilation. Dark/color artwork and non-dialogue text still require precise Agent polygons without changing `DialogueRegion` output.
 - Fixed-paper-color and Metal neighborhood cleanup work best in dialogue areas with a stable paper tone. Complex screen tones or text crossing line art may still need mask correction and manual retouching.
 - The optional Qwen Image Edit worker remains experimental, needs roughly 25 GB of inference memory, and is not part of the default four-stage cleanup path.

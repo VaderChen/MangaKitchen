@@ -22,36 +22,40 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
 }
 
 enum DownloadableModelCatalog {
+    static let textToTextModels = [
+        DownloadableModelDescriptor(
+            id: "qwen3-4b-4bit",
+            displayName: "Qwen3-4B 4-bit",
+            repositoryID: "mlx-community/Qwen3-4B-4bit",
+            capability: .textToText,
+            recommended: true
+        ),
+        DownloadableModelDescriptor(
+            id: "qwen3-8b-4bit",
+            displayName: "Qwen3-8B 4-bit",
+            repositoryID: "mlx-community/Qwen3-8B-4bit",
+            capability: .textToText
+        )
+    ]
+
     static let imageToTextModels = [
         DownloadableModelDescriptor(
-            id: "qwen3-vl-4b-4bit",
-            displayName: "Qwen3-VL-4B 4-bit",
-            repositoryID: "lmstudio-community/Qwen3-VL-4B-Instruct-MLX-4bit",
+            id: "qwen3.5-4b-4bit",
+            displayName: "Qwen3.5-4B 4-bit",
+            repositoryID: "lmstudio-community/Qwen3.5-4B-MLX-4bit",
             capability: .imageToText,
             recommended: true
         ),
         DownloadableModelDescriptor(
-            id: "qwen3-vl-4b-8bit",
-            displayName: "Qwen3-VL-4B 8-bit",
-            repositoryID: "lmstudio-community/Qwen3-VL-4B-Instruct-MLX-8bit",
+            id: "qwen3.5-9b-4bit",
+            displayName: "Qwen3.5-9B 4-bit",
+            repositoryID: "lmstudio-community/Qwen3.5-9B-MLX-4bit",
             capability: .imageToText
         ),
         DownloadableModelDescriptor(
-            id: "qwen3-vl-2b-4bit",
-            displayName: "Qwen3-VL-2B 4-bit",
-            repositoryID: "mlx-community/Qwen3-VL-2B-Instruct-4bit",
-            capability: .imageToText
-        ),
-        DownloadableModelDescriptor(
-            id: "qwen3-vl-8b-4bit",
-            displayName: "Qwen3-VL-8B 4-bit",
-            repositoryID: "mlx-community/Qwen3-VL-8B-Instruct-4bit",
-            capability: .imageToText
-        ),
-        DownloadableModelDescriptor(
-            id: "qwen3-vl-8b-8bit",
-            displayName: "Qwen3-VL-8B 8-bit",
-            repositoryID: "mlx-community/Qwen3-VL-8B-Instruct-8bit",
+            id: "qwen3-vl-4b-4bit",
+            displayName: "Qwen3-VL-4B 4-bit",
+            repositoryID: "lmstudio-community/Qwen3-VL-4B-Instruct-MLX-4bit",
             capability: .imageToText
         )
     ]
@@ -77,7 +81,11 @@ enum DownloadableModelCatalog {
     ]
 
     static var defaultImageToTextModel: DownloadableModelDescriptor {
-        imageToTextModels[0]
+        imageToTextModels.first(where: \.recommended) ?? imageToTextModels[0]
+    }
+
+    static var defaultTextToTextModel: DownloadableModelDescriptor {
+        textToTextModels.first(where: \.recommended) ?? textToTextModels[0]
     }
 
     static var defaultSuperResolutionModel: DownloadableModelDescriptor {
@@ -85,7 +93,7 @@ enum DownloadableModelCatalog {
     }
 
     static var allModels: [DownloadableModelDescriptor] {
-        imageToTextModels + superResolutionModels
+        textToTextModels + imageToTextModels + superResolutionModels
     }
 
     static func model(id: String, capability: ModelCapability) -> DownloadableModelDescriptor? {

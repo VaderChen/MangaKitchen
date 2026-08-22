@@ -2,6 +2,7 @@ import { t } from "./i18n.js";
 
 const pending = new Map();
 const stateListeners = new Set();
+const transientStateListeners = new Set();
 let sequence = 0;
 
 export function invoke(method, params = {}) {
@@ -20,6 +21,11 @@ export function onState(listener) {
   return () => stateListeners.delete(listener);
 }
 
+export function onTransientState(listener) {
+  transientStateListeners.add(listener);
+  return () => transientStateListeners.delete(listener);
+}
+
 window.MangaKitchenNative = {
   receive(message) {
     if (message?.kind !== "response" || !message.id) return;
@@ -32,5 +38,9 @@ window.MangaKitchenNative = {
 
   receiveState(state) {
     stateListeners.forEach((listener) => listener(state));
+  },
+
+  receiveTransientState(state) {
+    transientStateListeners.forEach((listener) => listener(state));
   },
 };

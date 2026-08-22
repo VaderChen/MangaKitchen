@@ -6,8 +6,10 @@ import MangaKitchenCore
 public actor ComicTranslationPipeline {
     private let regionDetector: any SemanticRegionDetecting
     private let textRecognizer: (any RegionTextRecognizing)?
+    private let textRecognizers: [TextLocalizationMethod: any RegionTextRecognizing]
     private let maskRefiner: any DialogueMaskRefining
     private let translator: any RegionTranslating
+    private let translators: [TranslationModelMethod: any RegionTranslating]
     private let maskGenerator: any DialogueMaskGenerating
     private let backgroundRestorer: any PageBackgroundRestoring
     private let typesetter: any DialogueTypesetting
@@ -17,8 +19,10 @@ public actor ComicTranslationPipeline {
     public init(
         regionDetector: any SemanticRegionDetecting,
         textRecognizer: (any RegionTextRecognizing)? = nil,
+        textRecognizers: [TextLocalizationMethod: any RegionTextRecognizing] = [:],
         maskRefiner: any DialogueMaskRefining,
         translator: any RegionTranslating,
+        translators: [TranslationModelMethod: any RegionTranslating] = [:],
         maskGenerator: any DialogueMaskGenerating,
         backgroundRestorer: any PageBackgroundRestoring,
         typesetter: any DialogueTypesetting,
@@ -27,8 +31,10 @@ public actor ComicTranslationPipeline {
     ) {
         self.regionDetector = regionDetector
         self.textRecognizer = textRecognizer
+        self.textRecognizers = textRecognizers
         self.maskRefiner = maskRefiner
         self.translator = translator
+        self.translators = translators
         self.maskGenerator = maskGenerator
         self.backgroundRestorer = backgroundRestorer
         self.typesetter = typesetter
@@ -36,7 +42,10 @@ public actor ComicTranslationPipeline {
         self.outputRoot = outputRoot
     }
 
-    /// 步驟二：辨識文字區域並建立可供人工修訂的初始遮罩。
+    /// 步驟二：先找對話氣泡，再以原圖像素將氣泡內縮為文字遮罩。
+    ///
+    /// 這一步不使用專案的 OCR／VLM 文字定位選項。它們屬於後續原文抽取，
+    /// 不得改變氣泡區域、像素遮罩或人工筆劃。
     public func detectMasks(
         page: ComicPage,
         options: ProcessingOptions,
@@ -48,6 +57,8 @@ public actor ComicTranslationPipeline {
         var warnings: [String] = []
         activity(.detectingEnclosures)
         progress(.detectingText, 0)
+        // 固定使用氣泡 detector。文字定位模型不能成為步驟二的可變輸入，
+        // 否則切換模型就會改變遮罩幾何，破壞流程的單一責任。
         let detectedRegions = try await regionDetector.detectRegions(
             pageURL: page.sourceURL,
             sourceLanguageCodes: options.sourceLanguageCodes,
@@ -204,15 +215,20 @@ public actor ComicTranslationPipeline {
             sourceTexts: translatableRegions.map(\.sourceText)
         )
         activity(.preparingTextModel)
-        progress(.translating, textRecognizer == nil ? 0 : 0.4)
+        let hasTextRecognizer = textRecognizers[options.textLocalizationMethod] != nil
+            || textRecognizer != nil
+        progress(.translating, hasTextRecognizer ? 0.4 : 0)
         activity(.translatingRegions)
-        let translatedCandidates = try await translator.translate(
+        let selectedTranslator = translators[options.translationModelMethod]
+            ?? translator
+        let translatedCandidates = try await selectedTranslator.translate(
             regions: translatableRegions,
             pageURL: page.sourceURL,
             targetLanguageCode: targetLanguageCode,
             glossaryTerms: glossaryTerms,
             readingDirection: options.readingDirection,
             qualityOptions: options.translationQuality,
+            activity: activity,
             regionProgress: regionProgress
         ) { value in
             progress(.translating, 0.4 + min(max(value, 0), 1) * 0.6)
@@ -240,7 +256,8 @@ public actor ComicTranslationPipeline {
             progress(1)
             return []
         }
-        guard let textRecognizer else { return regions }
+        guard let textRecognizer = textRecognizers[options.textLocalizationMethod]
+            ?? textRecognizer else { return regions }
         activity(.preparingTextModel)
         progress(0)
         activity(.detectingRegions)
@@ -283,7 +300,8 @@ public actor ComicTranslationPipeline {
         progress: @escaping InferenceProgress = { _ in }
     ) async throws -> DialogueRegion {
         try Task.checkCancellation()
-        guard let textRecognizer else { return region }
+        guard let textRecognizer = textRecognizers[options.textLocalizationMethod]
+            ?? textRecognizer else { return region }
         var candidate = region
         candidate.rawSourceText = nil
         candidate.sourceText = ""
@@ -311,16 +329,20 @@ public actor ComicTranslationPipeline {
     ) -> [DialogueRegion] {
         let recognizedByID = Dictionary(uniqueKeysWithValues: recognized.map { ($0.id, $0) })
         return originals.map { original in
-            guard let candidate = recognizedByID[original.id],
-                  !candidate.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return original
-            }
+            guard let candidate = recognizedByID[original.id] else { return original }
             var merged = original
-            merged.rawSourceText = candidate.rawSourceText
-            merged.sourceText = candidate.sourceText
             merged.ocrResults = original.ocrResults.merging(candidate.ocrResults) {
                 _, latest in latest
             }
+            guard !candidate.sourceText.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty else {
+                // 空 OCR 仍是該模型的有效診斷結果；保留候選與信心，但不可清掉
+                // 已有原文，也不可冒充成功辨識。
+                return merged
+            }
+            merged.rawSourceText = candidate.rawSourceText
+            merged.sourceText = candidate.sourceText
             merged.ocrTextRefined = candidate.ocrTextRefined
             merged.detectedWritingDirection = candidate.detectedWritingDirection
             // MCP 抽取結果屬於另一個來源；本機重新抽字不應沿用舊的 MCP 文字。

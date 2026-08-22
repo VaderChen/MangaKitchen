@@ -18,7 +18,7 @@ public actor PPOCRRecognitionRuntime: LocalOCRRecognizing {
 
     public init(
         modelURL: URL,
-        modelID: String = "ppocrv6-small-rec",
+        modelID: String = "ppocrv6-medium-rec",
         characters: [String],
         mean: [Float] = [0.5, 0.5, 0.5],
         standardDeviation: [Float] = [0.5, 0.5, 0.5]
@@ -335,26 +335,41 @@ public enum PPOCRCharacterList {
     }
 }
 
-/// 先由 VLM 決定文字區域，再以指定 OCR 模型保存獨立候選。
+/// 在步驟二已建立的對話遮罩區域上執行指定 OCR 模型。
 ///
-/// 這個 decorator 特意不覆寫 `sourceText`：目前只保存每個 OCR 模型的結果，
-/// 複合 OCR 與二次校稿融合留給後續功能。
+/// 每個模型的完整結果都會保存在 `ocrResults`。只有目前 `sourceText`
+/// 為空白時，才採用這個預設 OCR 候選作為翻譯原文；已有的 VLM、Agent 或人工
+/// 原文不會被覆寫，座標與遮罩也絕不在此步驟修改。
+public struct UnavailableOCRRegionTextRecognizer: RegionTextRecognizing {
+    public init() {}
+
+    public func recognizeRegions(
+        pageURL _: URL,
+        regions _: [DialogueRegion],
+        sourceLanguageCodes _: [String],
+        regionProgress _: @escaping PageRegionProgress,
+        progress _: @escaping InferenceProgress
+    ) async throws -> [DialogueRegion] {
+        throw ModelRuntimeError.featureNotFound("bundled PP-OCR recognition runtime")
+    }
+}
+
 public actor OCRRegionTextRecognitionService: RegionTextRecognizing {
-    private let locator: any RegionTextRecognizing
     private let ocr: any LocalOCRRecognizing
+    private let locator: (any LocalTextLocating)?
 
     public init(
-        locator: any RegionTextRecognizing,
-        ocr: any LocalOCRRecognizing
+        ocr: any LocalOCRRecognizing,
+        locator: (any LocalTextLocating)? = nil
     ) {
-        self.locator = locator
         self.ocr = ocr
+        self.locator = locator
     }
 
     public func recognizeRegions(
         pageURL: URL,
         regions: [DialogueRegion],
-        sourceLanguageCodes: [String],
+        sourceLanguageCodes _: [String],
         regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
@@ -362,47 +377,126 @@ public actor OCRRegionTextRecognitionService: RegionTextRecognizing {
             progress(1)
             return []
         }
-        let located = try await locator.recognizeRegions(
-            pageURL: pageURL,
-            regions: regions,
-            sourceLanguageCodes: sourceLanguageCodes,
-            regionProgress: regionProgress,
-            progress: { value in progress(min(max(value, 0), 1) * 0.6) }
-        )
-        try Task.checkCancellation()
-
         let source = try CGImageIO.load(from: pageURL)
-        var updated = located
-        let candidates = located.indices.filter {
-            !located[$0].sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-        guard !candidates.isEmpty else {
-            progress(1)
-            return updated
-        }
-
-        for (offset, index) in candidates.enumerated() {
+        var updated = regions
+        regionProgress(0, regions.count)
+        for index in regions.indices {
             try Task.checkCancellation()
             do {
-                let region = located[index]
-                let crop = try Self.crop(source: source, bounds: region.bounds)
-                var candidate = try await ocr.recognize(crop: crop, bounds: region.bounds)
-                if candidate.writingDirection == .automatic {
-                    candidate.writingDirection = region.detectedWritingDirection
-                }
-                // 只更新該模型的槽位；原文、座標、遮罩與既有 VLM 結果保持不變。
+                let region = regions[index]
+                let candidate = try await recognize(
+                    source: source,
+                    region: region
+                )
+                // 每個模型保留獨立槽位，方便後續複合 OCR／VLM 校稿。
                 updated[index].ocrResults[ocr.modelID] = candidate
+                let text = candidate.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if updated[index].sourceText.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty, !text.isEmpty {
+                    updated[index].rawSourceText = text
+                    updated[index].sourceText = text
+                    // `ocrTextRefined` 是舊版 VLM／人工確認標記；單模型 OCR
+                    // 只是預設原文來源，不得將這個標記設為 true。
+                    updated[index].ocrTextRefined = false
+                    if candidate.writingDirection != .automatic {
+                        updated[index].detectedWritingDirection = candidate.writingDirection
+                    }
+                }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // 單一區域 OCR 失敗時保留 VLM 結果，其他區域仍可完成翻譯。
+                // 單一區域 OCR 失敗時保留現有原文，並繼續其他區域。
             }
-            progress(0.6 + Double(offset + 1) / Double(candidates.count) * 0.4)
+            regionProgress(index + 1, regions.count)
+            progress(Double(index + 1) / Double(regions.count))
         }
         return updated
     }
 
-    private static func crop(source: CGImage, bounds: NormalizedRect) throws -> CGImage {
+    /// PP-OCR recognizer 是單行模型。有 locator 時，只在步驟二既有
+    /// `region.bounds` 內切出文字行／直排欄後逐一辨識；定位結果不會寫回
+    /// `DialogueRegion`，因此不可改變步驟二的座標、遮罩或背景。
+    private func recognize(
+        source: CGImage,
+        region: DialogueRegion
+    ) async throws -> OCRModelResult {
+        let regionCrop = try Self.crop(source: source, bounds: region.bounds)
+        let localizedLines: [TextLocalizationResult]
+        if let locator {
+            localizedLines = try await locator.locateText(in: regionCrop.image)
+        } else {
+            localizedLines = []
+        }
+        let mappedLines = localizedLines.compactMap {
+            Self.mapToPage(
+                $0,
+                cropBounds: regionCrop.pageBounds,
+                clippingBounds: region.bounds
+            )
+        }
+        let writingDirection = Self.resolvedWritingDirection(
+            preferred: region.detectedWritingDirection,
+            lines: mappedLines
+        )
+        let lineBounds = Self.orderedLineBounds(
+            mappedLines.map(\.bounds),
+            writingDirection: writingDirection
+        )
+        let recognitionBounds = lineBounds.isEmpty ? [region.bounds] : lineBounds
+
+        var recognizedLines: [OCRTextLineResult] = []
+        recognizedLines.reserveCapacity(recognitionBounds.count)
+        var recognizedDirections: [WritingDirection] = []
+        for bounds in recognitionBounds {
+            try Task.checkCancellation()
+            let rawCrop = try Self.crop(source: source, bounds: bounds).image
+            let lineDirection = Self.resolvedLineDirection(
+                bounds,
+                fallback: writingDirection
+            )
+            let preparedCrop = lineDirection == .vertical
+                ? try Self.rotateCounterClockwise(rawCrop)
+                : rawCrop
+            let result = try await ocr.recognize(
+                crop: preparedCrop,
+                bounds: bounds
+            )
+            guard !result.text.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty else { continue }
+            recognizedLines.append(OCRTextLineResult(
+                text: result.text,
+                confidence: result.confidence,
+                bounds: bounds
+            ))
+            if result.writingDirection != .automatic {
+                recognizedDirections.append(result.writingDirection)
+            }
+        }
+
+        let resolvedDirection = writingDirection == .automatic
+            ? (recognizedDirections.first ?? .automatic)
+            : writingDirection
+        let separator = resolvedDirection == .horizontal ? "\n" : ""
+        let text = recognizedLines.map(\.text).joined(separator: separator)
+        let confidences = recognizedLines.compactMap(\.confidence)
+        let confidence = confidences.isEmpty
+            ? nil
+            : confidences.reduce(0, +) / Double(confidences.count)
+        return OCRModelResult(
+            modelID: ocr.modelID,
+            text: text,
+            confidence: confidence,
+            lines: recognizedLines,
+            writingDirection: resolvedDirection
+        )
+    }
+
+    private static func crop(
+        source: CGImage,
+        bounds: NormalizedRect
+    ) throws -> (image: CGImage, pageBounds: NormalizedRect) {
         let width = Double(source.width)
         let height = Double(source.height)
         let x = max(0, min(width - 1, bounds.x * width))
@@ -418,6 +512,114 @@ public actor OCRRegionTextRecognitionService: RegionTextRecognizing {
         guard let crop = source.cropping(to: rect), crop.width > 0, crop.height > 0 else {
             throw ImageProcessingError.cannotCreateBitmap
         }
-        return crop
+        return (
+            crop,
+            NormalizedRect(
+                x: rect.minX / width,
+                y: rect.minY / height,
+                width: rect.width / width,
+                height: rect.height / height
+            ).clamped()
+        )
+    }
+
+    private static func mapToPage(
+        _ line: TextLocalizationResult,
+        cropBounds: NormalizedRect,
+        clippingBounds: NormalizedRect
+    ) -> TextLocalizationResult? {
+        let mappedBounds = NormalizedRect(
+            x: cropBounds.minX + line.bounds.minX * cropBounds.width,
+            y: cropBounds.minY + line.bounds.minY * cropBounds.height,
+            width: line.bounds.width * cropBounds.width,
+            height: line.bounds.height * cropBounds.height
+        ).expanded(by: 0.04).intersection(with: clippingBounds)
+        guard mappedBounds.width > 0, mappedBounds.height > 0 else { return nil }
+        return TextLocalizationResult(
+            confidence: line.confidence,
+            polygon: [
+                NormalizedPoint(x: mappedBounds.minX, y: mappedBounds.minY),
+                NormalizedPoint(x: mappedBounds.maxX, y: mappedBounds.minY),
+                NormalizedPoint(x: mappedBounds.maxX, y: mappedBounds.maxY),
+                NormalizedPoint(x: mappedBounds.minX, y: mappedBounds.maxY)
+            ],
+            bounds: mappedBounds
+        )
+    }
+
+    private static func resolvedWritingDirection(
+        preferred: WritingDirection,
+        lines: [TextLocalizationResult]
+    ) -> WritingDirection {
+        if preferred != .automatic { return preferred }
+        var vertical = 0
+        var horizontal = 0
+        for line in lines {
+            if line.bounds.height >= line.bounds.width * 1.25 {
+                vertical += 1
+            } else if line.bounds.width >= line.bounds.height * 1.25 {
+                horizontal += 1
+            }
+        }
+        if vertical > horizontal { return .vertical }
+        if horizontal > vertical { return .horizontal }
+        return .automatic
+    }
+
+    private static func resolvedLineDirection(
+        _ bounds: NormalizedRect,
+        fallback: WritingDirection
+    ) -> WritingDirection {
+        if bounds.height >= bounds.width * 1.25 { return .vertical }
+        if bounds.width >= bounds.height * 1.25 { return .horizontal }
+        return fallback
+    }
+
+    private static func orderedLineBounds(
+        _ bounds: [NormalizedRect],
+        writingDirection: WritingDirection
+    ) -> [NormalizedRect] {
+        bounds.sorted { lhs, rhs in
+            switch writingDirection {
+            case .vertical:
+                if abs(lhs.centerX - rhs.centerX) > 0.001 {
+                    return lhs.centerX > rhs.centerX
+                }
+                return lhs.minY < rhs.minY
+            case .horizontal, .automatic:
+                if abs(lhs.centerY - rhs.centerY) > 0.001 {
+                    return lhs.centerY < rhs.centerY
+                }
+                return lhs.minX < rhs.minX
+            }
+        }
+    }
+
+    private static func rotateCounterClockwise(_ source: CGImage) throws -> CGImage {
+        let rotatedWidth = source.height
+        let rotatedHeight = source.width
+        guard let context = CGContext(
+            data: nil,
+            width: rotatedWidth,
+            height: rotatedHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: rotatedWidth * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                | CGBitmapInfo.byteOrder32Big.rawValue
+        ) else {
+            throw ImageProcessingError.cannotCreateBitmap
+        }
+        context.translateBy(x: CGFloat(rotatedWidth), y: 0)
+        context.rotate(by: .pi / 2)
+        context.interpolationQuality = .high
+        context.draw(
+            source,
+            in: CGRect(x: 0, y: 0, width: source.width, height: source.height)
+        )
+        guard let image = context.makeImage() else {
+            throw ImageProcessingError.cannotCreateBitmap
+        }
+        return image
     }
 }

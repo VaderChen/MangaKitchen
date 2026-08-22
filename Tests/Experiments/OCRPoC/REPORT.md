@@ -4,7 +4,7 @@
 
 ## 結論
 
-PP-OCRv6 Small 可在不整合 MangaKitchen 的前提下完成原生 Core ML 轉換，且能在目前專案的 macOS 14 deployment target 上完整使用 Apple Neural Engine。建議後續若要整合，採「官方 safetensors → 固定尺寸 Core ML」路徑；ONNX Runtime 可作 Metal 備案，但不適合作為 ANE 主路徑。
+PP-OCRv6 Small 與 Medium 都已完成獨立 Core ML 可行性驗證；目前 App 預設使用 Medium，Small 作為 fallback。Medium 的 PyTorch→Core ML 直接轉換會在 attention `int` 節點失敗，但採「官方 Paddle inference → Paddle2ONNX → 固定尺寸 `onnx2coreml`」路徑後，可在 macOS 14 MLProgram 上完整使用 Apple Neural Engine。
 
 ## 測試環境
 
@@ -15,7 +15,7 @@ PP-OCRv6 Small 可在不整合 MangaKitchen 的前提下完成原生 Core ML 轉
 - Transformers 5.15.1 / PyTorch 2.13.0
 - Core ML Tools 9.0
 - ONNX Runtime 1.29.0
-- 模型：PP-OCRv6 Small detector / recognizer，Apache-2.0
+- 模型：PP-OCRv6 Small detector / recognizer，以及 PP-OCRv6 Medium recognizer，Apache-2.0
 
 Core ML Tools 9.0 會警告 PyTorch 2.13 尚未列入官方測試版本；本次已另外驗證 Torch trace 零差異、Core ML token 決策一致及實際漫畫輸出，正式建置時仍應鎖定一組 Apple 明列支援的 PyTorch 版本重新產製模型。
 
@@ -87,13 +87,15 @@ ANE 模型初次載入約 0.49–0.53 秒；表格中的 warm latency 不含載�
 
 ## 工作樹整合狀態（2026-08-22）
 
-本報告原本驗證的是獨立 PoC；目前工作樹已將 recognizer 以 `PPOCRRecognitionRuntime` 接入 MangaKitchenRuntime。整合採保守的候選保存策略：VLM 先決定區域，OCR 只追加 `ocrResults`，不自動取代 `sourceText`、座標或遮罩。轉換後的 `.mlpackage` 已納入 repository；App 在找不到模型資源時仍會回到原本的 VLM 路徑。
+本報告原本驗證的是獨立 PoC；目前工作樹已將 Medium recognizer（Small fallback）以 `PPOCRRecognitionRuntime` 接入 MangaKitchenRuntime。OCR 直接辨識步驟二已定位的對話文字區域，不先呼叫 VLM；每個模型的完整結果仍獨立保存於 `ocrResults`。當 `sourceText` 空白時採用預設 OCR 結果，但不改動座標、遮罩或覆寫已確認原文；App 找不到 Medium 與 Small OCR 資源時會明確失敗，不暗中改走 VLM。
 
 PoC 腳本本身仍不連結 MangaKitchen target；正式 App 的整合程式與回歸測試則位於 `Sources/MangaKitchenRuntime/` 與 `Tests/MangaKitchenRuntimeTests/`。
 
 ## 官方來源
 
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)
+- [PP-OCRv6 Medium recognition model](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_rec)
+- [PP-OCRv6 Medium ONNX model](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_rec_onnx)
 - [PP-OCRv6 Small recognition model](https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_safetensors)
 - [PP-OCRv6 Small detection model](https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det_safetensors)
 - [Core ML Tools：PyTorch conversion](https://apple.github.io/coremltools/docs-guides/source/convert-pytorch.html)

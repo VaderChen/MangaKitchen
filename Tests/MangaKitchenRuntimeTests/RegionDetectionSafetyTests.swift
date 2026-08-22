@@ -165,6 +165,82 @@ final class RegionDetectionSafetyTests: XCTestCase {
         XCTAssertEqual(decoded.first?.first?.index, 1)
     }
 
+    func testStructuredResponseDecoderIgnoresQwenThinkingBlock() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: """
+            <think>先分析語意，再輸出 JSON。</think>
+            [{"index":1}]
+            """
+        )
+
+        XCTAssertEqual(decoded.first?.first?.index, 1)
+    }
+
+    func testStructuredResponseDecoderAcceptsQwenTemplateClosingTagWithoutOpeningTag() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: """
+            I need to inspect every vertical column before producing the requested structure.
+            </think>
+            [{"index":1}]
+            """
+        )
+
+        XCTAssertEqual(decoded.first?.first?.index, 1)
+    }
+
+    func testStructuredResponseDecoderRejectsUnfinishedThinkingResponse() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: "<think>Reasoning with a provisional [{\"index\":99}]"
+        )
+
+        XCTAssertTrue(decoded.isEmpty)
+    }
+
+    func testReasoningStreamExcludesClosingTagAndFinalJSON() {
+        let text = VLMStructuredResponseDecoder.streamedReasoningText(from: """
+        Inspect the full dialogue region briefly.
+        </think>
+        [{"index":1,"text":"原文"}]
+        """)
+
+        XCTAssertEqual(text, "Inspect the full dialogue region briefly.")
+    }
+
+    func testReasoningStreamAcceptsExplicitOpeningTag() {
+        let text = VLMStructuredResponseDecoder.streamedReasoningText(
+            from: "<think>Short analysis"
+        )
+
+        XCTAssertEqual(text, "Short analysis")
+    }
+
+    func testStructuredFinalAnswerRequiresCompleteJSONAfterThinking() {
+        XCTAssertFalse(VLMStructuredResponseDecoder.hasCompleteStructuredFinalAnswer(
+            "Reasoning used the entire budget without a closing tag"
+        ))
+        XCTAssertFalse(VLMStructuredResponseDecoder.hasCompleteStructuredFinalAnswer(
+            "Reasoning</think>[{\"index\":1"
+        ))
+        XCTAssertTrue(VLMStructuredResponseDecoder.hasCompleteStructuredFinalAnswer(
+            "Reasoning</think>[{\"index\":1}]"
+        ))
+    }
+
     func testLocalMaskExpansionDoesNotScanEntireBubble() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MangaKitchen-MaskLocality-\(UUID().uuidString)", isDirectory: true)

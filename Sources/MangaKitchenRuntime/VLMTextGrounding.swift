@@ -38,19 +38,22 @@ struct VLMGroundingBox: Decodable, Equatable {
 enum VLMTextGrounding {
     static let coordinateMaximum = 1_000.0
 
-    static func pageBounds(
+    /// 保留模型回傳的每個文字行／直排欄座標。呼叫端可依間距分組，
+    /// 避免相接氣泡被無條件 union 成同一個翻譯區域。
+    static func pageRectangles(
         modelBoxes: [[Double]],
         cropRect: CGRect,
         imageWidth: Int,
         imageHeight: Int,
         clippingBounds: NormalizedRect?,
         paddingFraction: Double = 0.08
-    ) -> NormalizedRect? {
+    ) -> [NormalizedRect]? {
         guard imageWidth > 0, imageHeight > 0,
               cropRect.width > 0, cropRect.height > 0,
               !modelBoxes.isEmpty, modelBoxes.count <= 16 else { return nil }
 
         var rectangles: [NormalizedRect] = []
+        rectangles.reserveCapacity(modelBoxes.count)
         for values in modelBoxes {
             guard values.count == 4,
                   values.allSatisfy(\.isFinite),
@@ -100,6 +103,25 @@ enum VLMTextGrounding {
                 rectangles.append(padded)
             }
         }
+        return rectangles
+    }
+
+    static func pageBounds(
+        modelBoxes: [[Double]],
+        cropRect: CGRect,
+        imageWidth: Int,
+        imageHeight: Int,
+        clippingBounds: NormalizedRect?,
+        paddingFraction: Double = 0.08
+    ) -> NormalizedRect? {
+        guard let rectangles = pageRectangles(
+            modelBoxes: modelBoxes,
+            cropRect: cropRect,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            clippingBounds: clippingBounds,
+            paddingFraction: paddingFraction
+        ) else { return nil }
         guard let first = rectangles.first else { return nil }
         return rectangles.dropFirst().reduce(first) { $0.union(with: $1) }
     }

@@ -11,6 +11,8 @@ struct ProcessingRegionProgress: Sendable {
 
 @MainActor
 final class AppStore: ObservableObject {
+    let applicationLog: ApplicationLogStore
+    let modelReasoningStream: ModelReasoningStreamStore
     @Published private(set) var projects: [ComicProjectSummary] = []
     @Published private(set) var activeProjectID: UUID?
     @Published private(set) var pages: [ComicPage] = []
@@ -26,7 +28,14 @@ final class AppStore: ObservableObject {
     @Published private(set) var isSwitchingProject = false
     @Published private(set) var modelDownloadState: ModelDownloadState?
     @Published private(set) var modelLoadingState: ModelLoadingState?
+    @Published private(set) var modelThinkingEnabled = false
     @Published private(set) var automaticSuperResolutionEnabled = false
+    /// 高頻的系統指標不可觸發 AppStore.objectWillChange，否則 WebUI 會每秒
+    /// 重建編輯區 DOM，中斷文字選取與拖曳。它改由 transient publisher 同步。
+    private(set) var systemMetrics: SystemMetricsSnapshot = .unavailable {
+        didSet { systemMetricsDidChange.send(systemMetrics) }
+    }
+    let systemMetricsDidChange = PassthroughSubject<SystemMetricsSnapshot, Never>()
     @Published private(set) var processingActivities: [UUID: PageProcessingActivity] = [:]
     @Published private(set) var processingRegionProgress: [UUID: ProcessingRegionProgress] = [:]
     @Published var statusMessage: String?
@@ -53,6 +62,7 @@ final class AppStore: ObservableObject {
     private var processingTask: Task<Void, Never>?
     private var regionRecognitionTask: Task<Void, Never>?
     private var modelDownloadTask: Task<Void, Never>?
+    private var systemMetricsTask: Task<Void, Never>?
     private var persistenceTask: Task<Void, Never>?
     private var maskRegenerationTasks: [UUID: Task<Void, Never>] = [:]
     private var translationPreviewTasks: [UUID: Task<Void, Never>] = [:]
@@ -62,20 +72,39 @@ final class AppStore: ObservableObject {
     private var regionRedoHistory: [UUID: [[DialogueRegion]]] = [:]
     private var excludedSourceRelativePaths: Set<String> = []
 
+    /// 載入大型 MLX／Core ML 模型前的保守記憶體門檻。統一記憶體機種在
+    /// 模型建立期間會短暫同時保留權重與工作 buffer，因此不能等到 100% 才清理。
+    private static let modelLoadMemoryPressureThreshold = 0.80
+
     init(
         dataDirectoryPath: String? = nil,
         defaultOutputDirectoryPath: String? = nil,
         imageCompositingBackend: ImageCompositingBackend = .cpu,
+        textToTextModelPath: String? = nil,
         imageToTextModelPath: String? = nil,
+        modelThinkingEnabled: Bool = false,
         imageToImageModelPath: String? = nil,
         automaticSuperResolutionEnabled: Bool = false,
         superResolutionModelPath: String? = nil
     ) {
+        let applicationLog = ApplicationLogStore()
+        let modelReasoningStream = ModelReasoningStreamStore()
+        self.applicationLog = applicationLog
+        self.modelReasoningStream = modelReasoningStream
+        let runtimeLog = applicationLog.runtimeHandler()
+        let reasoningStream = modelReasoningStream.runtimeHandler()
+        applicationLog.append(.info, category: "App", message: "MangaKitchen runtime starting.")
+        self.modelThinkingEnabled = modelThinkingEnabled
         defaultOutputDirectoryURL = defaultOutputDirectoryPath
             .map { URL(fileURLWithPath: $0).standardizedFileURL }
         do {
             let metal = try MetalContext()
-            let models = ModelRuntimeHub(metal: metal)
+            let models = ModelRuntimeHub(
+                metal: metal,
+                thinkingEnabled: modelThinkingEnabled,
+                log: runtimeLog,
+                reasoningStream: reasoningStream
+            )
             let root = try Self.makeApplicationRoot(dataDirectoryPath: dataDirectoryPath)
             let artifactsRoot = root.appendingPathComponent("Artifacts", isDirectory: true)
             let projectsRoot = root.appendingPathComponent("Projects", isDirectory: true)
@@ -88,21 +117,45 @@ final class AppStore: ObservableObject {
             )
             let bubbleSegmenter = Self.bundledBubbleSegmenter()
             let htmlTypesetter = HTMLDialogueTypesetter()
-            let vlmTextRecognizer = VLMRegionTranscriptionService(model: models)
-            let textRecognizer: any RegionTextRecognizing
+            let ppocrTextRecognizer: any RegionTextRecognizing
             if let ocrRuntime = Self.bundledOCRRuntime() {
-                textRecognizer = OCRRegionTextRecognitionService(
-                    locator: vlmTextRecognizer,
-                    ocr: ocrRuntime
+                ppocrTextRecognizer = OCRRegionTextRecognitionService(
+                    ocr: ocrRuntime,
+                    // Medium Det 只在步驟三既有區域內切文字行，
+                    // 不參與步驟二氣泡與遮罩產生。
+                    locator: Self.bundledTextLocalizationRuntime()
                 )
             } else {
-                textRecognizer = vlmTextRecognizer
+                // 步驟三抽字必須固定使用 OCR；資源缺失時明確失敗，
+                // 不得暗中改走 VLM 而改變流程語意。
+                ppocrTextRecognizer = UnavailableOCRRegionTextRecognizer()
             }
+            // 恢復舊版已驗證的 VLM 整個對話區域轉錄。這個分流只在
+            // 步驟三依專案選項使用，不能寫回或重建步驟二產物。
+            let vlmTextRecognizer = VLMRegionTranscriptionService(model: models)
+            let imageTranslator = VLMRegionTranslationService(model: models, log: runtimeLog)
+            let textTranslator = VLMRegionTranslationService(
+                model: TextOnlyImageToTextAdapter(model: models),
+                usesImageContext: false,
+                log: runtimeLog
+            )
             let pipeline = ComicTranslationPipeline(
-                regionDetector: MangaBubbleMaskRegionDetector(bubbleSegmenter: bubbleSegmenter),
-                textRecognizer: textRecognizer,
+                // 步驟二永遠固定為氣泡偵測→像素內縮；OCR／VLM
+                // 選項只能在後續原文抽取使用，不得改變遮罩。
+                regionDetector: MangaBubbleMaskRegionDetector(
+                    bubbleSegmenter: bubbleSegmenter
+                ),
+                textRecognizer: ppocrTextRecognizer,
+                textRecognizers: [
+                    .ppocrv6MediumDet: ppocrTextRecognizer,
+                    .vlm: vlmTextRecognizer
+                ],
                 maskRefiner: MangaTextMaskRefiner(),
-                translator: VLMRegionTranslationService(model: models),
+                translator: textTranslator,
+                translators: [
+                    .textToText: textTranslator,
+                    .imageToText: imageTranslator
+                ],
                 maskGenerator: DialogueMaskGenerator(),
                 backgroundRestorer: backgroundRestorer,
                 typesetter: htmlTypesetter,
@@ -124,6 +177,7 @@ final class AppStore: ObservableObject {
                 fileURL: projectsRoot.appendingPathComponent("library.json")
             )
             statusMessage = "Metal 裝置已就緒，請建立或選取漫畫專案。"
+            applicationLog.append(.info, category: "App", message: "Metal and processing pipeline are ready.")
             self.automaticSuperResolutionEnabled = automaticSuperResolutionEnabled
         } catch {
             models = nil
@@ -135,11 +189,14 @@ final class AppStore: ObservableObject {
             legacyRepository = nil
             libraryRepository = nil
             statusMessage = error.localizedDescription
+            applicationLog.append(.error, category: "App", message: error.localizedDescription)
         }
+        startSystemMetricsUpdates()
         Task { [weak self] in
             guard let self else { return }
             await self.restoreProjectLibrary()
             await self.applyPreferredModelsNow(
+                textToTextPath: textToTextModelPath,
                 imageToTextPath: imageToTextModelPath,
                 imageToImagePath: imageToImageModelPath,
                 superResolutionPath: superResolutionModelPath
@@ -165,26 +222,54 @@ final class AppStore: ObservableObject {
         return try? MangaBubbleSegmentationCoreMLRuntime(modelURL: modelURL)
     }
 
-    /// OCR 模型是可選的：沒有隨 App 提供模型與字典時，翻譯仍使用原本的 VLM。
-    /// 一旦放入 `Resources/Models/OCR/`，App 便會在步驟三以原生 Core ML OCR
-    /// 保存該模型的獨立候選，不會改動 VLM 定位、sourceText 或遮罩。
-    private static func bundledOCRRuntime() -> PPOCRRecognitionRuntime? {
+    private static func bundledTextLocalizationRuntime() -> PPOCRTextDetectionRuntime? {
         guard let modelURL = Bundle.module.url(
-            forResource: "ppocrv6-small-rec-macos14",
+            forResource: "ppocrv6-medium-det-736x480-macos14",
             withExtension: "mlpackage",
-            subdirectory: "Models/OCR"
-        ), let characterURL = Bundle.module.url(
-            forResource: "ppocrv6-small-rec-characters",
-            withExtension: "json",
-            subdirectory: "Models/OCR"
-        ), let characters = try? PPOCRCharacterList.load(from: characterURL) else {
+            subdirectory: "Models/TextLocalization"
+        ) else {
             return nil
         }
-        return try? PPOCRRecognitionRuntime(
-            modelURL: modelURL,
-            modelID: "ppocrv6-small-rec",
-            characters: characters
-        )
+        return try? PPOCRTextDetectionRuntime(modelURL: modelURL)
+    }
+
+    /// 本機原文抽取固定使用內建 OCR；資源缺失時由上層明確回報錯誤。
+    /// 預設優先使用 Medium；若 Medium 資源無法載入則回退至已驗證的 Small。
+    /// OCR 只保存步驟二既有區域的獨立候選，不會改動座標或遮罩。
+    private static func bundledOCRRuntime() -> PPOCRRecognitionRuntime? {
+        let candidates = [
+            (
+                modelID: "ppocrv6-medium-rec",
+                modelResource: "ppocrv6-medium-rec-macos14",
+                characterResource: "ppocrv6-medium-rec-characters"
+            ),
+            (
+                modelID: "ppocrv6-small-rec",
+                modelResource: "ppocrv6-small-rec-macos14",
+                characterResource: "ppocrv6-small-rec-characters"
+            )
+        ]
+
+        for candidate in candidates {
+            guard let modelURL = Bundle.module.url(
+                forResource: candidate.modelResource,
+                withExtension: "mlpackage",
+                subdirectory: "Models/OCR"
+            ), let characterURL = Bundle.module.url(
+                forResource: candidate.characterResource,
+                withExtension: "json",
+                subdirectory: "Models/OCR"
+            ), let characters = try? PPOCRCharacterList.load(from: characterURL),
+            let runtime = try? PPOCRRecognitionRuntime(
+                modelURL: modelURL,
+                modelID: candidate.modelID,
+                characters: characters
+            ) else {
+                continue
+            }
+            return runtime
+        }
+        return nil
     }
 
     func setImageCompositingBackend(_ backend: ImageCompositingBackend) {
@@ -984,18 +1069,42 @@ final class AppStore: ObservableObject {
             statusMessage = "請先選取至少一張漫畫頁面。"
             return nil
         }
+        // 同一批頁面在同一操作尚未完成時，不重複建立工作。除了避免
+        // 使用者快速連點，也能防止 WebUI 狀態尚未回推時把同一批翻譯送出兩次。
+        let orderedIDSet = Set(orderedIDs)
+        if let existingJob = batchJobs.last(where: { job in
+            guard job.projectID == activeProjectID,
+                  [.queued, .running].contains(job.status),
+                  job.operation == operation else { return false }
+            return Set(job.pageIDs) == orderedIDSet
+        }) {
+            statusMessage = "這批頁面已在處理中，沿用現有工作。"
+            return existingJob.id
+        }
         guard pipeline != nil else {
             statusMessage = "漫畫處理 Runtime 尚未就緒。"
             return nil
         }
         if operation == .superResolve,
-           !loadedModels.contains(where: { $0.capability == .superResolution }) {
-            statusMessage = "請先在設定中下載並載入超解析模型。"
+           !hasConfiguredModel(.superResolution) {
+            statusMessage = "請先在設定中下載超解析模型。"
             return nil
         }
-        if operation.requiresTextModel,
-           !loadedModels.contains(where: { $0.capability == .imageToText }) {
-            statusMessage = "本機文字區域辨識或翻譯前請先載入圖生文模型。"
+        let orderedPageIDs = Array(orderedIDs)
+        if requiresTranslationModel(
+            for: operation,
+            pageIDs: orderedPageIDs,
+            forceRecalculation: forceRecalculation
+        ), effectiveTranslationModelMethod() == nil {
+            statusMessage = "請先在設定中下載並載入文生文或圖生文模型，才能翻譯文字。"
+            return nil
+        }
+        if requiresVLMTextExtraction(
+            for: operation,
+            pageIDs: orderedPageIDs,
+            forceRecalculation: forceRecalculation
+        ), !hasConfiguredModel(.imageToText) {
+            statusMessage = "目前原文抽取方式為 VLM，請先在設定中下載圖生文模型，或改用內建 PP-OCRv6。"
             return nil
         }
         if operation.requiresOutputDirectory, outputDirectoryURL == nil {
@@ -1015,6 +1124,199 @@ final class AppStore: ObservableObject {
         schedulePersistence()
         startBatchQueueIfNeeded()
         return job.id
+    }
+
+    /// 只在這次工作真的會產生新譯文時要求翻譯模型；既有譯文重排與輸出不受影響。
+    private func requiresTranslationModel(
+        for operation: BatchOperation,
+        pageIDs: [UUID],
+        forceRecalculation: Bool
+    ) -> Bool {
+        switch operation {
+        case .translate:
+            return pageIDs.contains { pageID in
+                guard let page = pages.first(where: { $0.id == pageID }),
+                      !page.regions.isEmpty else { return false }
+                return forceRecalculation || !hasTranslatedRegions(page)
+            }
+        case .retranslate:
+            return pageIDs.contains { pageID in
+                pages.first(where: { $0.id == pageID })?.regions.isEmpty == false
+            }
+        case .extractText:
+            return false
+        case .fullPage:
+            return pageIDs.contains { pageID in
+                // 還沒有遮罩時無法預知步驟二會產生幾個文字區域；
+                // 完整流程後續可能需要翻譯，因此先確保 VLM 可用。
+                guard hasMaskData(pageID: pageID),
+                      let page = pages.first(where: { $0.id == pageID }) else { return true }
+                return !page.regions.isEmpty && !hasTranslatedRegions(page)
+            }
+        case .detectMasks, .superResolve, .compose:
+            return false
+        }
+    }
+
+    /// VLM 只在使用者明確選為原文抽取方式時才是必要條件；翻譯模型可獨立選擇文生文。
+    private func requiresVLMTextExtraction(
+        for operation: BatchOperation,
+        pageIDs: [UUID],
+        forceRecalculation: Bool
+    ) -> Bool {
+        guard options.textLocalizationMethod == .vlm else { return false }
+        switch operation {
+        case .translate:
+            return pageIDs.contains { pageID in
+                guard let page = pages.first(where: { $0.id == pageID }),
+                      !page.regions.isEmpty else { return false }
+                return forceRecalculation || !hasTranslatedRegions(page)
+            }
+        case .extractText:
+            return pageIDs.contains { pageID in
+                pages.first(where: { $0.id == pageID })?.regions.isEmpty == false
+            }
+        case .fullPage:
+            return pageIDs.contains { pageID in
+                guard hasMaskData(pageID: pageID),
+                      let page = pages.first(where: { $0.id == pageID }) else { return true }
+                return !page.regions.isEmpty && !hasTranslatedRegions(page)
+            }
+        case .retranslate, .detectMasks, .superResolve, .compose:
+            return false
+        }
+    }
+
+    private func hasConfiguredModel(_ capability: ModelCapability) -> Bool {
+        loadedModels.contains(where: { $0.capability == capability })
+            || preferredModelPaths[capability] != nil
+    }
+
+    /// 優先採用專案指定的翻譯模型。文生文只要已有經驗證的偏好路徑即可，
+    /// 不要求啟動時常駐記憶體；真正翻譯前才由 `ensureTranslationModelLoaded` 載入。
+    private func effectiveTranslationModelMethod() -> TranslationModelMethod? {
+        let loadedCapabilities = Set(loadedModels.map(\.capability))
+        let preferredCapability: ModelCapability = options.translationModelMethod == .textToText
+            ? .textToText
+            : .imageToText
+        if loadedCapabilities.contains(preferredCapability)
+            || preferredModelPaths[preferredCapability] != nil {
+            return options.translationModelMethod
+        }
+        if loadedCapabilities.contains(.textToText) || preferredModelPaths[.textToText] != nil {
+            return .textToText
+        }
+        if loadedCapabilities.contains(.imageToText) || preferredModelPaths[.imageToText] != nil {
+            return .imageToText
+        }
+        return nil
+    }
+
+    private func ensureTranslationModelLoaded(
+        _ method: TranslationModelMethod
+    ) async throws {
+        let capability: ModelCapability = method == .textToText ? .textToText : .imageToText
+        try await ensureModelLoaded(capability, purpose: "translation")
+    }
+
+    private func ensureTextLocalizationModelLoaded() async throws {
+        guard options.textLocalizationMethod == .vlm else { return }
+        try await ensureModelLoaded(.imageToText, purpose: "text localization")
+    }
+
+    /// 只有真正執行指定推論時才載入模型；若相同 capability 已載入其他版本，
+    /// 先卸載舊 runtime，避免選單切換後誤用舊模型。
+    private func ensureModelLoaded(
+        _ capability: ModelCapability,
+        purpose: String
+    ) async throws {
+        guard let models else { throw AppWorkflowError.runtimeUnavailable }
+        let path = preferredModelPaths[capability].map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        }
+        let loaded = await models.loadedModels().first(where: { $0.capability == capability })
+        if let loaded {
+            if let path,
+               let manifest = try? ModelManifest.load(from: path),
+               loaded.matchesModel(
+                   id: manifest.id,
+                   capability: capability,
+                   at: path
+               ) {
+                loadedModels = await models.loadedModels()
+                return
+            }
+            await models.unloadModel(capability: capability)
+            loadedModels = await models.loadedModels()
+        }
+        guard let path else {
+            throw ModelRuntimeError.capabilityNotLoaded(capability)
+        }
+        applicationLog.append(
+            .info,
+            category: "Model",
+            message: "Lazy-loading \(capability.rawValue) model for \(purpose)."
+        )
+        _ = try await loadRuntimeModel(
+            from: path,
+            models: models,
+            sessionID: UUID(),
+            currentIndex: 1,
+            totalCount: 1
+        )
+        loadedModels = await models.loadedModels()
+    }
+
+    /// 在大型模型載入前釋放其他 runtime，讓 MLX／Metal 能取得連續的工作記憶體。
+    /// 偏好模型路徑仍保留，下一次真正使用時會再延遲載入。
+    private func releaseLoadedModelsForMemoryPressure(
+        models: ModelRuntimeHub,
+        reason: String,
+        preservingModelID: String? = nil,
+        preservingCapability: ModelCapability? = nil,
+        preservingLocation: URL? = nil
+    ) async {
+        let loaded = await models.loadedModels()
+        guard !loaded.isEmpty else { return }
+        var releasedCount = 0
+        for model in loaded {
+            if let preservingModelID,
+               let preservingCapability,
+               let preservingLocation,
+               model.matchesModel(
+                   id: preservingModelID,
+                   capability: preservingCapability,
+                   at: preservingLocation
+               ) {
+                continue
+            }
+            await models.unloadModel(capability: model.capability)
+            releasedCount += 1
+        }
+        guard releasedCount > 0 else { return }
+        loadedModels = await models.loadedModels()
+        systemMetrics = SystemMetricsReader.read()
+        applicationLog.append(
+            .warning,
+            category: "Model",
+            message: "Released \(releasedCount) loaded model runtime(s) before loading \(reason) because RAM usage was high."
+        )
+        // 讓 runtime 的 ARC／Metal 資源釋放完成，再建立下一個大型模型。
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(120))
+    }
+
+    private func shouldReleaseModelsBeforeLoad() -> Bool {
+        guard let usage = SystemMetricsReader.read().ramUsage else { return false }
+        return usage >= Self.modelLoadMemoryPressureThreshold
+    }
+
+    private func isLikelyMemoryLoadError(_ error: Error) -> Bool {
+        let description = error.localizedDescription.lowercased()
+        return description.contains("memory")
+            || description.contains("allocation")
+            || description.contains("out of") && description.contains("resource")
+            || description.contains("metal") && description.contains("buffer")
     }
 
     func cancelProcessing() {
@@ -1098,6 +1400,11 @@ final class AppStore: ObservableObject {
                 let operation = self.batchJobs[jobIndex].operation
                 let forceRecalculation = self.batchJobs[jobIndex].forceRecalculation
                 let pageIDs = self.batchJobs[jobIndex].pageIDs
+                self.applicationLog.append(
+                    .info,
+                    category: "Workflow",
+                    message: "Started \(operation.rawValue) for \(pageIDs.count) page(s)."
+                )
 
                 for pageID in pageIDs {
                     guard !Task.isCancelled,
@@ -1121,10 +1428,20 @@ final class AppStore: ObservableObject {
                         }
                         self.batchJobs[resultIndex].completedPageIDs.append(pageID)
                     } catch is CancellationError {
+                        self.applicationLog.append(
+                            .warning,
+                            category: "Workflow",
+                            message: "Cancelled \(operation.rawValue) for page \(pageID.uuidString)."
+                        )
                         self.processingActivities[pageID] = nil
                         self.processingRegionProgress[pageID] = nil
                         break
                     } catch {
+                        self.applicationLog.append(
+                            .error,
+                            category: "Workflow",
+                            message: "\(operation.rawValue) failed for page \(pageID.uuidString): \(error.localizedDescription)"
+                        )
                         guard let resultIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }),
                               self.batchJobs[resultIndex].status == .running else {
                             self.processingActivities[pageID] = nil
@@ -1453,8 +1770,13 @@ final class AppStore: ObservableObject {
             statusMessage = "目前已有工作進行中，請稍候再重新抽取。"
             return false
         }
-        guard loadedModels.contains(where: { $0.capability == .imageToText }) else {
-            statusMessage = "請先載入圖生文模型，才能重新抽取文字。"
+        guard let translationModelMethod = effectiveTranslationModelMethod() else {
+            statusMessage = "請先載入文生文或圖生文模型，才能重新抽取並翻譯文字。"
+            return false
+        }
+        if options.textLocalizationMethod == .vlm,
+           !hasConfiguredModel(.imageToText) {
+            statusMessage = "目前原文抽取方式為 VLM，請先在設定中下載圖生文模型，或改用內建 PP-OCRv6。"
             return false
         }
         guard let pipeline,
@@ -1471,6 +1793,8 @@ final class AppStore: ObservableObject {
             return false
         }
 
+        var processingOptions = options
+        processingOptions.translationModelMethod = translationModelMethod
         isProcessing = true
         processingActivities[pageID] = .preparingPage
         processingRegionProgress[pageID] = ProcessingRegionProgress(current: 0, total: 1)
@@ -1484,10 +1808,12 @@ final class AppStore: ObservableObject {
                 self.isProcessing = false
             }
             do {
+                try await self.ensureTextLocalizationModelLoaded()
+                try Task.checkCancellation()
                 let recognized = try await pipeline.recognizeRegion(
                     page: page,
                     region: region,
-                    options: self.options,
+                    options: processingOptions,
                     regionProgress: { current, total in
                         Task { @MainActor [weak self] in
                             self?.processingRegionProgress[pageID] = ProcessingRegionProgress(
@@ -1518,12 +1844,14 @@ final class AppStore: ObservableObject {
                     return
                 }
 
+                try await self.ensureTranslationModelLoaded(translationModelMethod)
+                try Task.checkCancellation()
                 self.processingActivities[pageID] = .translatingRegions
                 self.processingRegionProgress[pageID] = ProcessingRegionProgress(current: 0, total: 1)
                 let translated = try await pipeline.translate(
                     page: page,
                     regions: [recognized],
-                    options: self.options,
+                    options: processingOptions,
                     glossary: self.glossary,
                     recognizeText: false,
                     activity: { activity in
@@ -1731,12 +2059,14 @@ final class AppStore: ObservableObject {
     }
 
     func applyPreferredModels(
+        textToTextPath: String? = nil,
         imageToTextPath: String?,
         imageToImagePath: String?,
         superResolutionPath: String? = nil
     ) {
         Task {
             await applyPreferredModelsNow(
+                textToTextPath: textToTextPath,
                 imageToTextPath: imageToTextPath,
                 imageToImagePath: imageToImagePath,
                 superResolutionPath: superResolutionPath
@@ -1747,6 +2077,24 @@ final class AppStore: ObservableObject {
     func setAutomaticSuperResolutionEnabled(_ enabled: Bool) {
         automaticSuperResolutionEnabled = enabled
         schedulePersistence()
+    }
+
+    func setModelThinkingEnabled(_ enabled: Bool) {
+        guard modelThinkingEnabled != enabled else { return }
+        modelThinkingEnabled = enabled
+        guard let models else { return }
+        Task { @MainActor [weak self] in
+            await models.setThinkingEnabled(enabled)
+            self?.loadedModels = await models.loadedModels()
+            self?.applicationLog.append(
+                .info,
+                category: "Model",
+                message: "Think Mode \(enabled ? "enabled" : "disabled"); text runtimes will reload on demand."
+            )
+            self?.statusMessage = enabled
+                ? "Think Mode 已開啟；文字模型將在下次使用時重新載入。"
+                : "Think Mode 已關閉；文字模型將在下次使用時重新載入。"
+        }
     }
 
     func setOptions(_ value: ProcessingOptions) {
@@ -1908,6 +2256,14 @@ final class AppStore: ObservableObject {
         return page.regions.isEmpty || hasTranslatedRegions(page)
     }
 
+    /// 步驟四只需要步驟三已產生排版預覽。個別區域缺少原文或譯文
+    /// 會由 WebUI 先警告使用者，但不得阻擋其餘已完成區域的輸出。
+    private func hasTranslationPreviewData(pageID: UUID) -> Bool {
+        guard let page = pages.first(where: { $0.id == pageID }),
+              let previewURL = page.translationPreviewURL else { return false }
+        return FileManager.default.fileExists(atPath: previewURL.path)
+    }
+
     private func hasTranslatedRegions(_ page: ComicPage) -> Bool {
         guard !page.regions.isEmpty else { return false }
         return page.regions.allSatisfy {
@@ -1947,12 +2303,6 @@ final class AppStore: ObservableObject {
               let page = pages.first(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
         }
-        // 沒有可用的圖生文模型時，步驟二仍可進入手動模式；不要呼叫
-        // 氣泡／文字自動偵測，直接建立同尺寸全黑遮罩供畫筆編輯。
-        guard loadedModels.contains(where: { $0.capability == .imageToText }) else {
-            try await prepareEmptyMask(pageID: pageID, page: page, pipeline: pipeline)
-            return
-        }
         let result = try await pipeline.detectMasks(
             page: page,
             options: options,
@@ -1988,46 +2338,6 @@ final class AppStore: ObservableObject {
         schedulePersistence()
     }
 
-    /// 沒有圖生文模型時仍允許進入遮罩編輯：用空區域清單產生與原圖
-    /// 同尺寸的全黑遮罩。既有人工區域保留在頁面資料中，不因降級流程被清除。
-    private func prepareEmptyMask(
-        pageID: UUID,
-        page: ComicPage,
-        pipeline: ComicTranslationPipeline
-    ) async throws {
-        updateProcessingActivity(pageID: pageID, activity: .generatingMask)
-        updateProgress(pageID: pageID, stage: .detectingText, fraction: 0.9)
-        let maskURL = try await pipeline.regenerateMask(
-            page: page,
-            regions: [],
-            options: options
-        )
-        try Task.checkCancellation()
-
-        updateProcessingActivity(pageID: pageID, activity: .renderingMaskPreview)
-        let previewURL = try await pipeline.renderMaskPreview(
-            page: page,
-            regions: [],
-            maskURL: maskURL,
-            fillColorHex: options.eraseColorHex
-        )
-        try Task.checkCancellation()
-        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
-        undoneMaskStrokes[pageID] = nil
-        pages[index].maskURL = maskURL
-        pages[index].backgroundURL = previewURL
-        pages[index].superResolvedBackgroundURL = nil
-        advanceMaskRevision(pageID: pageID)
-        pages[index].translationPreviewURL = nil
-        pages[index].outputURL = nil
-        pages[index].stage = .maskReady
-        pages[index].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
-        pages[index].errorMessage = nil
-        try await persistStringTableNow(pageID: pageID)
-        statusMessage = "尚未載入圖生文模型；已建立全黑遮罩與去字背景，可手動編輯。"
-        schedulePersistence()
-    }
-
     private func runTextExtraction(pageID: UUID) async throws {
         await stopTranslationPreviewRegeneration(pageID: pageID)
         try Task.checkCancellation()
@@ -2055,6 +2365,8 @@ final class AppStore: ObservableObject {
         statusMessage = "第 \(page.index) 頁正在重新抽取文字…"
         schedulePersistence()
 
+        try await ensureTextLocalizationModelLoaded()
+        try Task.checkCancellation()
         let recognized = try await pipeline.recognizeRegions(
             page: page,
             regions: page.regions,
@@ -2135,13 +2447,21 @@ final class AppStore: ObservableObject {
         } else if !forceRecalculation && hasTranslatedRegions(page) {
             regions = page.regions
         } else {
-            guard await models?.isLoaded(.imageToText) == true else {
-                throw ModelRuntimeError.capabilityNotLoaded(.imageToText)
+            guard let translationModelMethod = effectiveTranslationModelMethod() else {
+                throw ModelRuntimeError.capabilityNotLoaded(.textToText)
             }
+            if recognizeText {
+                try await ensureTextLocalizationModelLoaded()
+                try Task.checkCancellation()
+            }
+            try await ensureTranslationModelLoaded(translationModelMethod)
+            try Task.checkCancellation()
+            var processingOptions = options
+            processingOptions.translationModelMethod = translationModelMethod
             regions = try await pipeline.translate(
                 page: page,
                 regions: page.regions,
-                options: options,
+                options: processingOptions,
                 glossary: glossary,
                 recognizeText: recognizeText,
                 activity: activityHandler(pageID: pageID),
@@ -2159,7 +2479,9 @@ final class AppStore: ObservableObject {
         }
         if superResolvedBackgroundURL == nil,
            automaticSuperResolutionEnabled,
-           loadedModels.contains(where: { $0.capability == .superResolution }) {
+           hasConfiguredModel(.superResolution) {
+            try await ensureModelLoaded(.superResolution, purpose: "automatic super resolution")
+            try Task.checkCancellation()
             updateProcessingActivity(pageID: pageID, activity: .superResolving)
             superResolvedBackgroundURL = try await pipeline.superResolve(
                 page: page,
@@ -2226,9 +2548,8 @@ final class AppStore: ObservableObject {
               FileManager.default.fileExists(atPath: backgroundURL.path) else {
             throw AppWorkflowError.maskRequired
         }
-        guard loadedModels.contains(where: { $0.capability == .superResolution }) else {
-            throw ModelRuntimeError.capabilityNotLoaded(.superResolution)
-        }
+        try await ensureModelLoaded(.superResolution, purpose: "super resolution")
+        try Task.checkCancellation()
         if let index = pages.firstIndex(where: { $0.id == pageID }) {
             pages[index].stage = .superResolving
             pages[index].progress = Self.totalProgress(stage: .superResolving, fraction: 0)
@@ -2287,7 +2608,7 @@ final class AppStore: ObservableObject {
         guard hasMaskData(pageID: pageID) else {
             throw AppWorkflowError.maskRequired
         }
-        guard hasTranslationData(pageID: pageID) else {
+        guard hasTranslationPreviewData(pageID: pageID) else {
             throw AppWorkflowError.translationPreviewRequired
         }
         guard let initialIndex = pages.firstIndex(where: { $0.id == pageID }) else {
@@ -3073,82 +3394,82 @@ final class AppStore: ObservableObject {
     }
 
     private func loadProjectModels(_ directories: [URL]) async {
-        guard let models else { return }
         let fileManager = FileManager.default
-        let loadableDirectories = directories.filter { directoryURL in
-            guard fileManager.fileExists(atPath: directoryURL.path) else { return false }
-            if let manifest = try? ModelManifest.load(from: directoryURL),
-               preferredModelPaths[manifest.capability] != nil {
-                return false
-            }
-            return true
-        }
-        let sessionID = UUID()
-        for (offset, directoryURL) in loadableDirectories.enumerated() {
-            let succeeded = await loadModelNow(
-                from: directoryURL,
-                models: models,
-                persist: false,
-                sessionID: sessionID,
-                currentIndex: offset + 1,
-                totalCount: loadableDirectories.count
+        // 專案復原只登記上次使用的模型路徑，不在啟動階段建立 runtime。
+        // 需要模型的工作會在對應步驟透過 ensureModelLoaded() 延遲載入。
+        for directoryURL in directories where fileManager.fileExists(atPath: directoryURL.path) {
+            guard let manifest = try? ModelManifest.load(from: directoryURL) else { continue }
+            _ = await configureLazyPreferredModel(
+                capability: manifest.capability,
+                path: directoryURL.path
             )
-            if !succeeded { break }
         }
     }
 
     private func applyPreferredModelsNow(
+        textToTextPath: String?,
         imageToTextPath: String?,
         imageToImagePath: String?,
         superResolutionPath: String?
     ) async {
         guard let models else { return }
-        _ = await replacePreferredModel(
+        _ = await configureLazyPreferredModel(
+            capability: .textToText,
+            path: textToTextPath
+        )
+        _ = await configureLazyPreferredModel(
             capability: .imageToText,
-            path: imageToTextPath,
-            models: models
+            path: imageToTextPath
         )
-        _ = await replacePreferredModel(
+        _ = await configureLazyPreferredModel(
             capability: .imageToImage,
-            path: imageToImagePath,
-            models: models
+            path: imageToImagePath
         )
-        _ = await replacePreferredModel(
+        _ = await configureLazyPreferredModel(
             capability: .superResolution,
-            path: superResolutionPath,
-            models: models
+            path: superResolutionPath
         )
         loadedModels = await models.loadedModels()
     }
 
-    private func replacePreferredModel(
+    /// 設定偏好模型但不載入 runtime。啟動與設定切換都只走這條路徑；
+    /// 實際推論前才由 ensureModelLoaded() 建立對應模型。
+    private func configureLazyPreferredModel(
         capability: ModelCapability,
-        path: String?,
-        models: ModelRuntimeHub
+        path: String?
     ) async -> Bool {
-        guard preferredModelPaths[capability] != path else { return true }
-        await models.unloadModel(capability: capability)
-        guard let path else {
-            preferredModelPaths.removeValue(forKey: capability)
+        guard let models else { return false }
+        let normalizedPath = path.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        if preferredModelPaths[capability] == normalizedPath {
             return true
         }
-        let directoryURL = URL(fileURLWithPath: path).standardizedFileURL
+        await models.unloadModel(capability: capability)
+        guard let normalizedPath else {
+            preferredModelPaths.removeValue(forKey: capability)
+            applicationLog.append(
+                .info,
+                category: "Model",
+                message: "Cleared lazy \(capability.rawValue) model configuration."
+            )
+            return true
+        }
         do {
+            let directoryURL = URL(fileURLWithPath: normalizedPath).standardizedFileURL
             let manifest = try ModelManifest.load(from: directoryURL)
             guard manifest.capability == capability else {
                 throw PreferredModelError.capabilityMismatch(expected: capability)
             }
-            _ = try await loadRuntimeModel(
-                from: directoryURL,
-                models: models,
-                sessionID: UUID(),
-                currentIndex: 1,
-                totalCount: 1
+            preferredModelPaths[capability] = normalizedPath
+            applicationLog.append(
+                .info,
+                category: "Model",
+                message: "Configured \(manifest.displayName) for lazy loading."
             )
-            preferredModelPaths[capability] = path
             return true
         } catch {
+            preferredModelPaths.removeValue(forKey: capability)
             statusMessage = error.localizedDescription
+            applicationLog.append(.error, category: "Model", message: error.localizedDescription)
             return false
         }
     }
@@ -3182,6 +3503,7 @@ final class AppStore: ObservableObject {
             return true
         } catch {
             statusMessage = error.localizedDescription
+            applicationLog.append(.error, category: "Model", message: error.localizedDescription)
             return false
         }
     }
@@ -3195,9 +3517,24 @@ final class AppStore: ObservableObject {
     ) async throws -> LoadedModelInfo {
         let safeTotalCount = max(1, totalCount)
         let safeCurrentIndex = min(max(1, currentIndex), safeTotalCount)
-        let fallbackName = directoryURL.lastPathComponent
-        let displayName = (try? ModelManifest.load(from: directoryURL))?.displayName
-            ?? fallbackName
+        let canonicalDirectoryURL = directoryURL.standardizedFileURL.resolvingSymlinksInPath()
+        let manifest = try ModelManifest.load(from: canonicalDirectoryURL)
+        let displayName = manifest.displayName
+        if let loaded = await models.loadedModels().first(where: {
+            $0.matchesModel(
+                id: manifest.id,
+                capability: manifest.capability,
+                at: canonicalDirectoryURL
+            )
+        }) {
+            loadedModels = await models.loadedModels()
+            applicationLog.append(
+                .debug,
+                category: "Model",
+                message: "Skipped loading \(loaded.displayName) because it is already active."
+            )
+            return loaded
+        }
         modelLoadingState = ModelLoadingState(
             id: sessionID,
             phase: .loading,
@@ -3210,7 +3547,33 @@ final class AppStore: ObservableObject {
         statusMessage = "正在載入模型：\(displayName)…"
 
         do {
-            let info = try await models.loadModel(at: directoryURL)
+            let shouldPrepareMemory = shouldReleaseModelsBeforeLoad()
+            if shouldPrepareMemory {
+                await releaseLoadedModelsForMemoryPressure(
+                    models: models,
+                    reason: displayName,
+                    preservingModelID: manifest.id,
+                    preservingCapability: manifest.capability,
+                    preservingLocation: canonicalDirectoryURL
+                )
+            }
+
+            let info: LoadedModelInfo
+            do {
+                info = try await models.loadModel(at: canonicalDirectoryURL)
+            } catch {
+                // 大型模型可能在建立權重或 Metal buffer 時才回報記憶體不足；
+                // 即使載入前的比例尚未超過門檻，也清理一次並只重試一次。
+                guard isLikelyMemoryLoadError(error) else { throw error }
+                await releaseLoadedModelsForMemoryPressure(
+                    models: models,
+                    reason: displayName,
+                    preservingModelID: manifest.id,
+                    preservingCapability: manifest.capability,
+                    preservingLocation: canonicalDirectoryURL
+                )
+                info = try await models.loadModel(at: canonicalDirectoryURL)
+            }
             guard modelLoadingState?.id == sessionID else { return info }
             modelLoadingState?.displayName = info.displayName
             modelLoadingState?.progress = Double(safeCurrentIndex) / Double(safeTotalCount)
@@ -3282,6 +3645,17 @@ final class AppStore: ObservableObject {
     private static func makeApplicationRoot(dataDirectoryPath: String?) throws -> URL {
         try ApplicationDirectories.applicationSupportRoot(customPath: dataDirectoryPath)
     }
+
+    private func startSystemMetricsUpdates() {
+        systemMetrics = SystemMetricsReader.read()
+        systemMetricsTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                self?.systemMetrics = SystemMetricsReader.read()
+            }
+        }
+    }
 }
 
 private enum PreferredModelError: LocalizedError {
@@ -3310,10 +3684,6 @@ private enum ModelDeletionError: LocalizedError {
 }
 
 private extension BatchOperation {
-    var requiresTextModel: Bool {
-        self == .translate || self == .extractText || self == .retranslate || self == .fullPage
-    }
-
     var requiresOutputDirectory: Bool {
         self == .compose || self == .fullPage
     }

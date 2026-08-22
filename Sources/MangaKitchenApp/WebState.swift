@@ -216,11 +216,17 @@ struct WebGlobalSettings: Encodable {
     var activeDataDirectoryPath: String?
     var dataDirectoryRestartRequired: Bool
     var imageCompositingBackend: ImageCompositingBackend
+    var textToTextModelPath: String?
+    var textToTextModelDownloadDirectoryPath: String?
+    var textToTextModelVariant: String
+    var textToTextModelOptions: [ModelOption]
+    var textToTextModelInstalled: Bool
     var imageToTextModelPath: String?
     var imageToTextModelDownloadDirectoryPath: String?
     var imageToTextModelVariant: String
     var imageToTextModelOptions: [ModelOption]
     var imageToTextModelInstalled: Bool
+    var modelThinkingEnabled: Bool
     var modelDownloadState: ModelDownloadState?
     var imageToImageModelPath: String?
     var automaticSuperResolutionEnabled: Bool
@@ -255,6 +261,29 @@ struct WebGlobalSettings: Encodable {
         dataDirectoryRestartRequired = configuredDataDirectoryPath != store.applicationDataDirectoryPath
         defaultOutputDirectoryPath = preferences.defaultOutputDirectoryPath
         imageCompositingBackend = preferences.resolvedImageCompositingBackend
+        textToTextModelPath = preferences.textToTextModelPath
+        textToTextModelDownloadDirectoryPath = preferences.textToTextModelDownloadDirectoryPath
+        let selectedTextToTextModelVariant = preferences.resolvedTextToTextModelVariant
+        textToTextModelVariant = selectedTextToTextModelVariant
+        let textToTextStorageDirectoryURL = preferences.textToTextModelDownloadDirectoryPath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        }
+        textToTextModelOptions = DownloadableModelCatalog.textToTextModels.map { model in
+            ModelOption(
+                id: model.id,
+                displayName: model.displayName,
+                recommended: model.recommended,
+                installed: textToTextStorageDirectoryURL.flatMap {
+                    DownloadableModelCatalog.installedModelDirectory(
+                        storageDirectoryURL: $0,
+                        model: model
+                    )
+                } != nil
+            )
+        }
+        textToTextModelInstalled = textToTextModelOptions.first {
+            $0.id == selectedTextToTextModelVariant
+        }?.installed ?? false
         imageToTextModelPath = preferences.imageToTextModelPath
         imageToTextModelDownloadDirectoryPath = preferences.imageToTextModelDownloadDirectoryPath
         let selectedImageToTextModelVariant = preferences.resolvedImageToTextModelVariant
@@ -278,6 +307,7 @@ struct WebGlobalSettings: Encodable {
         imageToTextModelInstalled = imageToTextModelOptions.first {
             $0.id == selectedImageToTextModelVariant
         }?.installed ?? false
+        modelThinkingEnabled = preferences.modelThinkingEnabled
         modelDownloadState = store.modelDownloadState
         imageToImageModelPath = preferences.imageToImageModelPath
         automaticSuperResolutionEnabled = preferences.automaticSuperResolutionEnabled
@@ -319,8 +349,32 @@ struct WebGlobalSettings: Encodable {
     }
 }
 
+struct WebUpdateCheckState: Encodable, Equatable {
+    enum Phase: String, Encodable {
+        case checking
+        case upToDate
+        case updateAvailable
+        case failed
+    }
+
+    var id: UUID
+    var phase: Phase
+}
+
+/// 只含高頻、不應觸發主畫面重繪的狀態。
+struct WebTransientState: Encodable {
+    var systemMetrics: SystemMetricsSnapshot
+    var modelReasoningStream: ModelReasoningStreamSnapshot
+
+    @MainActor
+    init(store: AppStore) {
+        systemMetrics = store.systemMetrics
+        modelReasoningStream = store.modelReasoningStream.snapshot
+    }
+}
+
 struct WebAppState: Encodable {
-    var schemaVersion = 7
+    var schemaVersion = 10
     var globalSettings: WebGlobalSettings
     var projects: [WebProject]
     var activeProjectID: UUID?
@@ -332,6 +386,7 @@ struct WebAppState: Encodable {
     var availableFontFamilies: [String]
     var loadedModels: [LoadedModelInfo]
     var modelLoadingState: ModelLoadingState?
+    var modelReasoningStream: ModelReasoningStreamSnapshot
     var glossary: [WebGlossaryEntry]
     var batchJobs: [WebBatchJob]
     var sourceDirectoryPath: String?
@@ -340,13 +395,16 @@ struct WebAppState: Encodable {
     var isSwitchingProject: Bool
     var statusMessage: String?
     var availableUpdate: GitHubReleaseUpdate?
+    var updateCheck: WebUpdateCheckState?
+    var systemMetrics: SystemMetricsSnapshot
 
     @MainActor
     init(
         store: AppStore,
         preferences: AppPreferences,
         mcpController: MCPServiceController,
-        availableUpdate: GitHubReleaseUpdate?
+        availableUpdate: GitHubReleaseUpdate?,
+        updateCheck: WebUpdateCheckState?
     ) {
         globalSettings = WebGlobalSettings(
             preferences: preferences,
@@ -373,6 +431,7 @@ struct WebAppState: Encodable {
         )
         loadedModels = store.loadedModels
         modelLoadingState = store.modelLoadingState
+        modelReasoningStream = store.modelReasoningStream.snapshot
         glossary = store.glossary.entries.map {
             WebGlossaryEntry(entry: $0, targetLanguageCode: store.options.resolvedTargetLanguageCode)
         }
@@ -383,5 +442,7 @@ struct WebAppState: Encodable {
         isSwitchingProject = store.isSwitchingProject
         statusMessage = store.statusMessage
         self.availableUpdate = availableUpdate
+        self.updateCheck = updateCheck
+        systemMetrics = store.systemMetrics
     }
 }

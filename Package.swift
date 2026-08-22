@@ -15,11 +15,11 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/ml-explore/mlx-swift-lm.git",
-            exact: "2.30.6"
+            exact: "3.31.4"
         ),
         .package(
             url: "https://github.com/ml-explore/mlx-swift.git",
-            exact: "0.30.6"
+            exact: "0.31.4"
         ),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
@@ -42,8 +42,11 @@ let package = Package(
                 "MangaKitchenCore",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-lm")
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers")
             ]
         ),
         .executableTarget(

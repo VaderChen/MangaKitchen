@@ -512,7 +512,8 @@ public actor VLMSupplementalRegionDetector: SemanticRegionDetecting {
         - For ignore, return an empty text string.
         - Never translate, explain, omit, duplicate, or renumber a REGION.
 
-        Return only a syntactically valid JSON array in this exact shape:
+        \(VLMStructuredResponseDecoder.finalJSONInstruction)
+        Return a syntactically valid JSON array in this exact shape:
         [{"index":1,"text":"source text","kind":"dialogue","direction":"vertical"}]
         \(VLMStructuredResponseDecoder.retryInstruction(attempt: attempt))
         """

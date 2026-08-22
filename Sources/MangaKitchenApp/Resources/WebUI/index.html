@@ -15,6 +15,7 @@
       </div>
 
       <div class="toolbar-spacer"></div>
+      <button id="open-log" class="secondary icon-button log-button" data-i18n-title="openApplicationLog" data-i18n-aria-label="openApplicationLog" title="程式 LOG" aria-label="程式 LOG"><i class="fa-solid fa-terminal" aria-hidden="true"></i></button>
       <button id="open-settings" class="secondary icon-button settings-button" data-i18n-title="settings" data-i18n-aria-label="settings" title="設定" aria-label="設定"><i class="fa-solid fa-gear" aria-hidden="true"></i></button>
     </header>
 
@@ -226,6 +227,16 @@
               </select>
             </div>
           </div>
+          <label><span data-i18n="textLocalizationMethod">原文抽取方式</span>
+            <select id="text-localization-method">
+              <option value="ppocrv6MediumDet">PP-OCRv6 Medium Det</option>
+            </select>
+          </label>
+          <label><span data-i18n="translationModelMethod">文字翻譯方式</span>
+            <select id="translation-model-method">
+              <option value="" data-i18n="translationModelNotLoaded">尚未載入翻譯模型</option>
+            </select>
+          </label>
           <fieldset class="translation-quality-settings">
             <legend data-i18n="translationQuality">翻譯品質</legend>
             <label class="checkbox-label"><input id="translation-page-context" type="checkbox"> <span data-i18n="translationPageContext">使用整頁語境</span></label>
@@ -243,7 +254,7 @@
               <textarea id="translation-style-guide" maxlength="4000" rows="4" data-i18n-placeholder="translationStyleGuidePlaceholder" placeholder="例如：角色稱謂、語氣、禁用詞與標點規則"></textarea>
             </label>
           </fieldset>
-          <label class="checkbox-label"><input id="use-image-model" type="checkbox" disabled> <span data-i18n="useImageModel">使用圖生圖修補</span></label>
+          <label class="checkbox-label" hidden><input id="use-image-model" type="checkbox" disabled> <span data-i18n="useImageModel">使用圖生圖修補</span></label>
         </section>
 
         <section id="inspector-panel-glossary" class="inspector-section glossary-panel" role="tabpanel" data-inspector-panel="glossary" aria-labelledby="inspector-tab-glossary" hidden>
@@ -287,7 +298,13 @@
     <footer class="status-bar">
       <progress id="page-progress" value="0" max="1"></progress>
       <span id="status" data-i18n="initializing">初始化中…</span>
+      <span id="system-metrics" aria-label="GPU、記憶體使用狀態">
+        <span><span class="system-metric-label">GPU</span> <strong id="gpu-usage">--</strong></span>
+        <span class="status-info-divider" aria-hidden="true"></span>
+        <span><span class="system-metric-label">MEMORY</span> <strong id="memory-usage">--</strong></span>
+      </span>
       <span id="canvas-info" hidden>
+        <span class="status-info-divider" aria-hidden="true"></span>
         <span id="canvas-resolution"></span>
         <span class="status-info-divider" aria-hidden="true"></span>
         <span id="canvas-zoom"></span>
@@ -375,10 +392,19 @@
 
             <section class="settings-page" data-settings-page="models" hidden>
               <h3 data-i18n="settingsModels">模型</h3>
+              <label class="settings-switch-row model-thinking-switch">
+                <span>
+                  <strong data-i18n="modelThinkingMode">Think Mode (Beta)</strong>
+                  <small data-i18n="modelThinkingModeHelp">允許支援的模型進行短暫的輕度思考，再強制輸出 JSON；預設關閉。</small>
+                </span>
+                <input id="settings-model-thinking" type="checkbox" role="switch">
+              </label>
               <nav class="model-tabs" data-i18n-aria-label="modelTabs" aria-label="模型分類" role="tablist">
+                <button type="button" class="model-tab" data-model-tab="imageToText" role="tab" aria-selected="false" aria-controls="model-page-image-to-text" data-i18n="modelTabImageToText">多模態</button>
+                <button type="button" class="model-tab" data-model-tab="textLocalization" role="tab" aria-selected="false" aria-controls="model-page-text-localization" data-i18n="modelTabTextLocalization">文字定位</button>
                 <button type="button" class="model-tab active" data-model-tab="ocr" role="tab" aria-selected="true" aria-controls="model-page-ocr" data-i18n="modelTabOCR">OCR</button>
+                <button type="button" class="model-tab" data-model-tab="textToText" role="tab" aria-selected="false" aria-controls="model-page-text-to-text" data-i18n="modelTabTextToText">文生文</button>
                 <button type="button" class="model-tab" data-model-tab="superResolution" role="tab" aria-selected="false" aria-controls="model-page-super-resolution" data-i18n="modelTabSuperResolution">超高解析度</button>
-                <button type="button" class="model-tab" data-model-tab="imageToText" role="tab" aria-selected="false" aria-controls="model-page-image-to-text" data-i18n="modelTabImageToText">圖生文</button>
                 <button type="button" class="model-tab" data-model-tab="imageToImage" role="tab" aria-selected="false" aria-controls="model-page-image-to-image" data-i18n="modelTabImageToImage">圖生圖</button>
               </nav>
               <div class="model-pages">
@@ -390,15 +416,53 @@
                   </div>
                   <div class="settings-field">
                     <label for="settings-ocr-model" data-i18n="ocrModel">OCR 模型</label>
-                    <input id="settings-ocr-model" readonly value="PP-OCRv6 Small · Core ML">
+                    <input id="settings-ocr-model" readonly value="PP-OCRv6 Medium · Core ML · ANE">
                   </div>
-                  <p class="section-help" data-i18n="ocrModelDescription">VLM 負責文字定位；OCR 只在逐區／整頁翻譯前保存獨立候選，不會覆寫原文或遮罩。</p>
+                  <p class="section-help" data-i18n="ocrModelDescription">用途：在已確認的對話框區域內辨識原文。只負責抽字，不偵測氣泡、不產生遮罩，也不執行翻譯。</p>
                 </div>
+              </section>
+              <section id="model-page-text-localization" class="model-page" data-model-page="textLocalization" role="tabpanel" hidden>
+                <div class="settings-path-group">
+                  <div class="settings-card-heading">
+                    <strong data-i18n="textLocalizationModel">文字定位模型</strong>
+                    <span data-i18n="modelBuiltIn">內建</span>
+                  </div>
+                  <div class="settings-field">
+                    <label for="settings-text-localization-model" data-i18n="textLocalizationModel">文字定位模型</label>
+                    <input id="settings-text-localization-model" readonly value="PP-OCRv6 Medium Det · Core ML · ANE">
+                  </div>
+                  <p class="section-help" data-i18n="textLocalizationModelDescription">用途：在已確認的對話框內找出文字行或文字欄座標，供後續 OCR 抽字使用。只掃描框內文字，不處理框外狀聲字，也不改動步驟二遮罩。</p>
+                </div>
+              </section>
+              <section id="model-page-text-to-text" class="model-page" data-model-page="textToText" role="tabpanel" hidden>
+              <div class="settings-path-group">
+                <div class="settings-field">
+                  <label for="settings-text-to-text-model" data-i18n="textToTextModel">文生文模型</label>
+                  <div class="settings-directory-row">
+                    <input id="settings-text-to-text-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+                    <button id="choose-text-to-text-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
+                  </div>
+                </div>
+                <label class="settings-field">
+                  <span data-i18n="modelVersion">模型版本</span>
+                  <select id="settings-text-to-text-model-variant"></select>
+                </label>
+                <div class="settings-actions">
+                  <button id="download-text-to-text-model" type="button" class="primary" data-i18n="downloadModel" disabled>下載</button>
+                  <button id="clear-text-to-text-model" type="button" class="quiet" data-i18n="clear">清除</button>
+                  <button id="delete-text-to-text-model" type="button" class="quiet danger-text" data-i18n="delete" hidden>刪除</button>
+                </div>
+                <div id="text-to-text-model-download-progress" class="model-download-progress" hidden>
+                  <progress id="text-to-text-model-download-progress-bar" value="0" max="1"></progress>
+                  <small id="text-to-text-model-download-status"></small>
+                </div>
+                <p class="section-help" data-i18n="textToTextModelDescription">用途：接收 OCR／VLM 已抽出的原文，執行翻譯、二次校稿與翻譯品質檢查；不讀取漫畫圖片。</p>
+              </div>
               </section>
               <section id="model-page-image-to-text" class="model-page" data-model-page="imageToText" role="tabpanel" hidden>
               <div class="settings-path-group">
                 <div class="settings-field">
-                  <label for="settings-image-to-text-model" data-i18n="imageToTextModel">圖生文模型</label>
+                  <label for="settings-image-to-text-model" data-i18n="imageToTextModel">多模態模型</label>
                   <div class="settings-directory-row">
                     <input id="settings-image-to-text-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
                     <button id="choose-image-to-text-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
@@ -407,7 +471,7 @@
                 <label class="settings-field">
                   <span data-i18n="modelVersion">模型版本</span>
                   <select id="settings-image-to-text-model-variant">
-                    <option value="qwen3-vl-4b-4bit">Qwen3-VL-4B 4-bit（推薦）</option>
+                    <option value="qwen3.5-4b-4bit">Qwen3.5-4B 4-bit（推薦）</option>
                   </select>
                 </label>
                 <div class="settings-actions">
@@ -419,6 +483,7 @@
                   <progress id="image-to-text-model-download-progress-bar" value="0" max="1"></progress>
                   <small id="image-to-text-model-download-status"></small>
                 </div>
+                <p class="section-help" data-i18n="imageToTextModelDescription">用途：多模態模型可以同時取代文字定位、OCR 與翻譯工作，直接從圖片找出文字座標、抽取原文並翻譯；還能分析畫面內容，調整語氣並對應角色。特別推薦在希望簡化流程、保留畫面語境時使用。它不參與氣泡偵測或遮罩產生。</p>
               </div>
               </section>
               <section id="model-page-super-resolution" class="model-page" data-model-page="superResolution" role="tabpanel" hidden>
@@ -454,6 +519,7 @@
                   <progress id="super-resolution-model-download-progress-bar" value="0" max="1"></progress>
                   <small id="super-resolution-model-download-status"></small>
                 </div>
+                <p class="section-help" data-i18n="superResolutionModelDescription">用途：放大步驟二完成的去字背景，再交給排版與輸出；不重新抽字、翻譯或重建遮罩。</p>
               </div>
               </section>
               <section id="model-page-image-to-image" class="model-page" data-model-page="imageToImage" role="tabpanel" hidden>
@@ -479,6 +545,7 @@
                   <button id="download-image-to-image-model" type="button" class="primary" disabled data-i18n="downloadModel">下載</button>
                   <button id="clear-image-to-image-model" type="button" class="quiet" disabled data-i18n="clear">清除</button>
                 </div>
+                <p class="section-help" data-i18n="imageToImageModelDescription">用途：預留給生成式背景修補與圖像編輯。目前尚未啟用，不會參與既有處理流程。</p>
               </div>
               </section>
               </div>
@@ -521,12 +588,53 @@
               <img class="about-mark" src="./MangaKitchen-AppIcon.png" data-i18n-alt="appTitle" alt="漫畫廚房">
               <h3 data-i18n="appTitle">漫畫廚房</h3>
               <p><span data-i18n="version">版本</span> <span id="settings-app-version">0.1.0</span></p>
+              <div class="about-links" data-i18n-aria-label="officialLinks" aria-label="官方連結">
+                <a id="about-github-link" class="about-link" href="https://github.com/VaderChen/MangaKitchen" data-i18n-aria-label="githubRepository" aria-label="GitHub 專案">
+                  <i class="fa-brands fa-github" aria-hidden="true"></i>
+                  <span>https://github.com/VaderChen/MangaKitchen</span>
+                  <i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i>
+                </a>
+                <a id="about-releases-link" class="about-link" href="https://github.com/VaderChen/MangaKitchen/releases" data-i18n-aria-label="githubReleases" aria-label="GitHub Releases">
+                  <i class="fa-solid fa-tag" aria-hidden="true"></i>
+                  <span>https://github.com/VaderChen/MangaKitchen/releases</span>
+                  <i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i>
+                </a>
+              </div>
+              <button id="about-check-updates" type="button" class="secondary about-check-updates">
+                <i class="fa-solid fa-rotate" aria-hidden="true"></i>
+                <span id="about-check-updates-label" data-i18n="checkForUpdates">檢查新版本</span>
+              </button>
+              <p id="about-update-status" class="about-update-status" aria-live="polite" hidden></p>
             </section>
           </div>
         </div>
 
         <footer class="settings-dialog-footer">
           <button id="close-settings" type="button" class="primary" data-i18n="close">關閉</button>
+        </footer>
+      </div>
+    </dialog>
+
+    <dialog id="log-dialog" aria-labelledby="log-dialog-title">
+      <div class="log-dialog-shell">
+        <header class="log-dialog-header">
+          <div>
+            <h2 id="log-dialog-title" data-i18n="applicationLog">程式 LOG</h2>
+            <p data-i18n="applicationLogMemoryOnly">紀錄只保留在記憶體中，關閉程式後即消失。</p>
+          </div>
+          <button id="close-log-icon" type="button" class="quiet icon-button" data-i18n-title="close" data-i18n-aria-label="close" title="關閉" aria-label="關閉"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+        </header>
+        <div class="log-dialog-toolbar">
+          <span id="log-entry-count">0</span>
+          <div>
+            <button id="refresh-log" type="button" class="secondary"><i class="fa-solid fa-rotate" aria-hidden="true"></i> <span data-i18n="refresh">重新整理</span></button>
+            <button id="clear-log" type="button" class="quiet danger-text"><i class="fa-solid fa-trash-can" aria-hidden="true"></i> <span data-i18n="clearLog">清除紀錄</span></button>
+          </div>
+        </div>
+        <div id="log-list" class="log-list" role="log" aria-live="off"></div>
+        <p id="log-empty" class="log-empty" data-i18n="noApplicationLogs">目前沒有 LOG 紀錄。</p>
+        <footer class="log-dialog-footer">
+          <button id="close-log" type="button" class="primary" data-i18n="close">關閉</button>
         </footer>
       </div>
     </dialog>
@@ -586,9 +694,22 @@
           </div>
         </div>
         <progress id="calculation-progress" max="1" value="0"></progress>
+        <section id="calculation-reasoning" class="calculation-reasoning" aria-labelledby="calculation-reasoning-title" hidden>
+          <div class="calculation-reasoning-heading">
+            <strong id="calculation-reasoning-title">THINK</strong>
+            <span id="calculation-reasoning-status" data-i18n="reasoningWaiting">Waiting for reasoning…</span>
+          </div>
+          <div id="calculation-reasoning-content" class="markdown-body" aria-live="off"></div>
+        </section>
         <div class="calculation-dialog-actions">
           <time id="calculation-elapsed" class="dialog-elapsed" aria-live="off">已等待 00:00</time>
-          <button id="calculation-cancel" type="button" class="secondary" data-i18n="cancelJob">取消工作</button>
+          <div class="calculation-dialog-buttons">
+            <button id="calculation-reasoning-toggle" type="button" class="secondary" aria-expanded="true" hidden>
+              <i class="fa-solid fa-chevron-up" aria-hidden="true"></i>
+              <span data-i18n="collapseReasoning">收合思考</span>
+            </button>
+            <button id="calculation-cancel" type="button" class="secondary" data-i18n="cancelJob">取消工作</button>
+          </div>
         </div>
       </div>
     </dialog>

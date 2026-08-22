@@ -1,6 +1,29 @@
 import Foundation
 import MangaKitchenCore
 
+/// 讓既有的整頁翻譯服務可複用純文字模型。`imageURL` 只是舊協定的
+/// 相容參數，純文字 runtime 不會讀取圖片。
+public actor TextOnlyImageToTextAdapter: ImageToTextGenerating {
+    private let model: any TextGenerating
+
+    public init(model: any TextGenerating) {
+        self.model = model
+    }
+
+    public func generateText(
+        imageURL _: URL,
+        prompt: String,
+        maximumOutputTokens: Int?,
+        progress: @escaping InferenceProgress
+    ) async throws -> String {
+        try await model.generateText(
+            prompt: prompt,
+            maximumOutputTokens: maximumOutputTokens,
+            progress: progress
+        )
+    }
+}
+
 public actor VLMRegionTranslationService: RegionTranslating {
     private struct PromptRegion: Codable {
         var index: Int
@@ -28,9 +51,17 @@ public actor VLMRegionTranslationService: RegionTranslating {
     }
 
     private let model: any ImageToTextGenerating
+    private let usesImageContext: Bool
+    private let log: RuntimeLogHandler
 
-    public init(model: any ImageToTextGenerating) {
+    public init(
+        model: any ImageToTextGenerating,
+        usesImageContext: Bool = true,
+        log: @escaping RuntimeLogHandler = { _, _, _ in }
+    ) {
         self.model = model
+        self.usesImageContext = usesImageContext
+        self.log = log
     }
 
     public func translate(
@@ -40,6 +71,7 @@ public actor VLMRegionTranslationService: RegionTranslating {
         glossaryTerms: [ResolvedGlossaryTerm],
         readingDirection: ReadingDirection,
         qualityOptions: TranslationQualityOptions,
+        activity: @escaping PagePipelineActivity = { _ in },
         regionProgress: @escaping PageRegionProgress,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
@@ -47,6 +79,12 @@ public actor VLMRegionTranslationService: RegionTranslating {
             progress(1)
             return []
         }
+
+        log(
+            .info,
+            "Translation",
+            "Starting \(usesImageContext ? "image-to-text" : "text-to-text") translation for \(regions.count) region(s) into \(targetLanguageCode)."
+        )
 
         let glossaryJSON = try Self.json(glossaryTerms)
         let promptRegions = regions.enumerated().map { index, region in
@@ -63,12 +101,16 @@ public actor VLMRegionTranslationService: RegionTranslating {
         }
         let promptRegionsJSON = try Self.json(promptRegions)
         let draftEnd = qualityOptions.reviewPassEnabled ? 0.55 : 0.9
+        activity(.translatingRegions)
+        regionProgress(0, regions.count)
 
         var drafts: [UUID: TranslationItem]
         if qualityOptions.usePageContext {
-            // 整頁回覆偶爾只含部分 UUID。大部分結果仍可保留，只針對遺漏區域
-            // 個別補翻；同時為補翻預留一小段單調遞增的進度範圍。
+            // 整頁回覆偶爾只含部分 UUID。保留已成功的結果，缺漏部分最多再
+            // 送出一次批次補翻；不得逐區各自多次 retry，否則 UI 會反覆從
+            // 第 1 區開始，看起來像同一頁被翻譯很多次。
             let pageDraftEnd = draftEnd * 0.85
+            var pageDraftSucceeded = false
             do {
                 drafts = try await generateItems(
                     pageURL: pageURL,
@@ -77,44 +119,59 @@ public actor VLMRegionTranslationService: RegionTranslating {
                         readingDirection: readingDirection,
                         glossaryJSON: glossaryJSON,
                         regionsJSON: promptRegionsJSON,
-                        qualityOptions: qualityOptions
+                        qualityOptions: qualityOptions,
+                        usesImageContext: usesImageContext
                     ),
                     expectedRegions: regions,
+                    regionProgress: regionProgress,
                     progress: { value in progress(value * pageDraftEnd) }
                 )
+                pageDraftSucceeded = true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                log(
+                    .warning,
+                    "Translation",
+                    "Page translation failed; running one bounded batch recovery: \(error.localizedDescription)"
+                )
+                drafts = try await generateRecoveryBatch(
+                    regions: regions,
+                    pageURL: pageURL,
+                    targetLanguageCode: targetLanguageCode,
+                    glossaryJSON: glossaryJSON,
+                    readingDirection: readingDirection,
+                    qualityOptions: qualityOptions,
+                    progress: { value in
+                        progress(pageDraftEnd + value * (draftEnd - pageDraftEnd))
+                    }
+                )
+            }
+            if pageDraftSucceeded {
                 let missingRegions = regions.filter {
                     drafts[$0.id]?.resolvedDisplayTranslation == nil
                 }
                 if missingRegions.isEmpty {
                     progress(draftEnd)
                 } else {
-                    let recovered = try await generateIndividually(
+                    log(
+                        .warning,
+                        "Translation",
+                        "Page response omitted \(missingRegions.count) region(s); running one bounded batch recovery."
+                    )
+                    let recovered = try await generateRecoveryBatch(
                         regions: missingRegions,
                         pageURL: pageURL,
                         targetLanguageCode: targetLanguageCode,
                         glossaryJSON: glossaryJSON,
+                        readingDirection: readingDirection,
                         qualityOptions: qualityOptions,
-                        regionProgress: regionProgress,
                         progress: { value in
                             progress(pageDraftEnd + value * (draftEnd - pageDraftEnd))
                         }
                     )
                     drafts.merge(recovered) { _, recoveredValue in recoveredValue }
                 }
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                drafts = try await generateIndividually(
-                    regions: regions,
-                    pageURL: pageURL,
-                    targetLanguageCode: targetLanguageCode,
-                    glossaryJSON: glossaryJSON,
-                    qualityOptions: qualityOptions,
-                    regionProgress: regionProgress,
-                    progress: { value in
-                        progress(pageDraftEnd + value * (draftEnd - pageDraftEnd))
-                    }
-                )
             }
         } else {
             drafts = try await generateIndividually(
@@ -127,10 +184,11 @@ public actor VLMRegionTranslationService: RegionTranslating {
                 progress: { value in progress(value * draftEnd) }
             )
         }
-        regionProgress(0, 0)
-
         var reviewed = drafts
         if qualityOptions.reviewPassEnabled, !drafts.isEmpty {
+            log(.info, "Translation", "Starting second-pass review for \(drafts.count) draft(s).")
+            activity(.reviewingTranslations)
+            regionProgress(0, regions.count)
             let reviewPayload = regions.compactMap { drafts[$0.id] }
             if let reviewJSON = try? Self.json(reviewPayload),
                let values = try? await generateItems(
@@ -141,33 +199,48 @@ public actor VLMRegionTranslationService: RegionTranslating {
                        glossaryJSON: glossaryJSON,
                        regionsJSON: promptRegionsJSON,
                        draftsJSON: reviewJSON,
-                       qualityOptions: qualityOptions
+                       qualityOptions: qualityOptions,
+                       usesImageContext: usesImageContext
                    ),
                    expectedRegions: regions,
+                   regionProgress: regionProgress,
                    progress: { value in progress(draftEnd + value * (0.9 - draftEnd)) }
                ) {
                 reviewed.merge(values) { _, new in new }
             }
         }
+        regionProgress(0, 0)
 
         var translatedRegions: [DialogueRegion] = []
         translatedRegions.reserveCapacity(regions.count)
         for region in regions {
             try Task.checkCancellation()
             var translated = region
-            if let item = reviewed[region.id], let display = item.resolvedDisplayTranslation {
-                let literal = item.literalTranslation?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let item = reviewed[region.id], let rawDisplay = item.resolvedDisplayTranslation {
+                let display = Self.normalizedTranslation(
+                    rawDisplay,
+                    targetLanguageCode: targetLanguageCode
+                )
+                let literal = item.literalTranslation.map {
+                    Self.normalizedTranslation(
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines),
+                        targetLanguageCode: targetLanguageCode
+                    )
+                }
                 translated.literalTranslatedText = qualityOptions.preserveLiteralTranslation
                     ? (literal?.isEmpty == false ? literal : display)
                     : nil
                 translated.translatedText = display
                 translated.speakerID = Self.nonEmpty(item.speakerID)
-                translated.tone = Self.nonEmpty(item.tone)
+                translated.tone = Self.nonEmpty(item.tone.map {
+                    Self.normalizedTranslation($0, targetLanguageCode: targetLanguageCode)
+                })
                 translated.translationConfidence = item.confidence.map { min(max($0, 0), 1) }
                 var flags = Set((item.qaFlags ?? []).compactMap(TranslationQAFlag.init(rawValue:)))
                 if qualityOptions.reviewPassEnabled,
-                   drafts[region.id]?.resolvedDisplayTranslation != display {
+                   drafts[region.id]?.resolvedDisplayTranslation.map({
+                       Self.normalizedTranslation($0, targetLanguageCode: targetLanguageCode)
+                   }) != display {
                     flags.insert(.reviewAdjusted)
                 }
                 if qualityOptions.qualityCheckEnabled {
@@ -188,6 +261,44 @@ public actor VLMRegionTranslationService: RegionTranslating {
 
         progress(1)
         return translatedRegions
+    }
+
+    /// 整頁回覆失敗或缺漏時的唯一自動 fallback。所有待補區域合併成一次請求，
+    /// 不再逐區循環，也不在這個 fallback 內再次 retry。
+    private func generateRecoveryBatch(
+        regions: [DialogueRegion],
+        pageURL: URL,
+        targetLanguageCode: String,
+        glossaryJSON: String,
+        readingDirection: ReadingDirection,
+        qualityOptions: TranslationQualityOptions,
+        progress: @escaping InferenceProgress
+    ) async throws -> [UUID: TranslationItem] {
+        let payload = regions.enumerated().map { index, region in
+            PromptRegion(
+                index: index + 1,
+                id: region.id,
+                sourceText: region.sourceText,
+                existingTranslation: region.translatedText.isEmpty ? nil : region.translatedText,
+                approximateCharacterLimit: Self.characterLimit(
+                    sourceText: region.sourceText,
+                    mode: qualityOptions.lengthMode
+                )
+            )
+        }
+        return try await generateItems(
+            pageURL: pageURL,
+            prompt: Self.draftPrompt(
+                targetLanguageCode: targetLanguageCode,
+                readingDirection: readingDirection,
+                glossaryJSON: glossaryJSON,
+                regionsJSON: try Self.json(payload),
+                qualityOptions: qualityOptions,
+                usesImageContext: usesImageContext
+            ),
+            expectedRegions: regions,
+            progress: progress
+        )
     }
 
     private func generateIndividually(
@@ -221,7 +332,8 @@ public actor VLMRegionTranslationService: RegionTranslating {
                         readingDirection: .topToBottom,
                         glossaryJSON: glossaryJSON,
                         regionsJSON: try Self.json(payload),
-                        qualityOptions: qualityOptions
+                        qualityOptions: qualityOptions,
+                        usesImageContext: usesImageContext
                     ),
                     expectedRegions: [region],
                     progress: { value in
@@ -244,27 +356,62 @@ public actor VLMRegionTranslationService: RegionTranslating {
         pageURL: URL,
         prompt: String,
         expectedRegions: [DialogueRegion],
+        regionProgress: PageRegionProgress? = nil,
         progress: @escaping InferenceProgress
     ) async throws -> [UUID: TranslationItem] {
-        for attempt in 0..<VLMStructuredResponseDecoder.maximumAttempts {
-            try Task.checkCancellation()
-            let response = try await model.generateText(
-                imageURL: pageURL,
-                prompt: prompt + "\n" + VLMStructuredResponseDecoder.retryInstruction(attempt: attempt),
-                maximumOutputTokens: min(16_384, max(2_048, expectedRegions.count * 384)),
-                progress: { value in
-                    progress(VLMStructuredResponseDecoder.mappedProgress(attempt: attempt, value: value))
-                }
-            )
-            let expectedIDs = Set(expectedRegions.map(\.id))
-            let candidates = VLMStructuredResponseDecoder.decodeArrays(TranslationItem.self, from: response)
-            for candidate in candidates {
-                let items = candidate.filter { expectedIDs.contains($0.id) && $0.resolvedDisplayTranslation != nil }
-                guard !items.isEmpty else { continue }
-                return Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+        try Task.checkCancellation()
+        let response = try await model.generateText(
+            imageURL: pageURL,
+            prompt: prompt,
+            maximumOutputTokens: min(16_384, max(2_048, expectedRegions.count * 384)),
+            progress: { value in
+                regionProgress?(
+                    Self.estimatedRegionIndex(
+                        inferenceProgress: value,
+                        total: expectedRegions.count
+                    ),
+                    expectedRegions.count
+                )
+                progress(min(max(value, 0), 1))
             }
+        )
+        let expectedIDs = Set(expectedRegions.map(\.id))
+        let candidates = VLMStructuredResponseDecoder.decodeArrays(TranslationItem.self, from: response)
+        log(
+            .debug,
+            "Translation Response",
+            "characters=\(response.count), decodedCandidates=\(candidates.count), rawOutput=omitted"
+        )
+        for candidate in candidates {
+            let items = candidate.filter {
+                expectedIDs.contains($0.id) && $0.resolvedDisplayTranslation != nil
+            }
+            guard !items.isEmpty else { continue }
+            log(
+                .info,
+                "Translation",
+                "Accepted \(items.count) / \(expectedRegions.count) translated region(s)."
+            )
+            regionProgress?(expectedRegions.count, expectedRegions.count)
+            return Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
         }
+        log(.error, "Translation", "The structured translation response was invalid; automatic retry is disabled.")
         throw TranslationRuntimeError.invalidModelResponse
+    }
+
+    /// MLX VLM 在約 55% 前仍在載入與準備輸入，之後才開始串流輸出。整頁語境
+    /// 翻譯沒有逐區 request，因此以輸出串流比例和固定輸入順序估算目前生成區域；
+    /// 回覆解碼成功時會再明確回報 total / total。
+    static func estimatedRegionIndex(
+        inferenceProgress: Double,
+        total: Int
+    ) -> Int {
+        guard total > 0 else { return 0 }
+        let generationStart = 0.55
+        let value = min(max(inferenceProgress, 0), 1)
+        guard value > generationStart else { return 0 }
+        let fraction = (value - generationStart) / (1 - generationStart)
+        return min(total, max(1, Int(ceil(fraction * Double(total)))))
     }
 
     private static func draftPrompt(
@@ -272,13 +419,19 @@ public actor VLMRegionTranslationService: RegionTranslating {
         readingDirection: ReadingDirection,
         glossaryJSON: String,
         regionsJSON: String,
-        qualityOptions: TranslationQualityOptions
+        qualityOptions: TranslationQualityOptions,
+        usesImageContext: Bool
     ) -> String {
-        """
+        let contextInstruction = usesImageContext
+            ? "Use the page image for speaker identity, relationships, gender, tone, ambiguity and visual context."
+            : "No page image is available. Infer continuity, tone and ambiguity only from the ordered source text; never invent visual facts."
+        return """
         You are producing the first translation draft for one complete comic page.
+        \(VLMStructuredResponseDecoder.finalJSONInstruction)
         Translate every sourceText into BCP-47 language "\(targetLanguageCode)".
+        Target-language script rule: \(targetLanguageRequirement(for: targetLanguageCode))
         Read all regions together in index order using reading direction "\(readingDirection.rawValue)".
-        Use the page image for speaker identity, relationships, gender, tone, ambiguity and visual context.
+        \(contextInstruction)
         Keep the same speakerID for the same visible speaker. Use stable descriptive IDs when names are unknown.
         literalTranslation must preserve the complete meaning. displayTranslation must sound natural and fit
         approximateCharacterLimit without dropping plot facts, names, numbers, negation or emotional intent.
@@ -286,7 +439,8 @@ public actor VLMRegionTranslationService: RegionTranslating {
         Project style guide: \(qualityOptions.styleGuide.isEmpty ? "No additional style guide." : qualityOptions.styleGuide)
         Terminology is authoritative; whenever sourceTerm occurs, use preferredTranslation exactly:
         \(glossaryJSON)
-        Return only one valid JSON array with every UUID unchanged, in this exact shape:
+        Return only one valid JSON array in the same index order, with every UUID unchanged,
+        in this exact shape:
         [{"id":"UUID","literalTranslation":"...","displayTranslation":"...","speakerID":"...","tone":"...","confidence":0.0,"qaFlags":[]}]
         confidence is 0...1. qaFlags may only contain missingTranslation, glossaryMismatch, numberMismatch,
         excessiveLength, modelUncertain or sourceTextLeak. Do not add explanations.
@@ -301,11 +455,17 @@ public actor VLMRegionTranslationService: RegionTranslating {
         glossaryJSON: String,
         regionsJSON: String,
         draftsJSON: String,
-        qualityOptions: TranslationQualityOptions
+        qualityOptions: TranslationQualityOptions,
+        usesImageContext: Bool
     ) -> String {
-        """
+        let comparisonInstruction = usesImageContext
+            ? "Compare every draft against its sourceText and the page image."
+            : "Compare every draft against its sourceText and ordered page context; no page image is available."
+        return """
         You are the senior editor reviewing a complete comic-page translation into "\(targetLanguageCode)".
-        Compare every draft against its sourceText and the page image. Review in "\(readingDirection.rawValue)"
+        \(VLMStructuredResponseDecoder.finalJSONInstruction)
+        Target-language script rule: \(targetLanguageRequirement(for: targetLanguageCode))
+        \(comparisonInstruction) Review in "\(readingDirection.rawValue)"
         reading order. Correct mistranslation, omitted meaning, pronouns, negation, numbers, terminology,
         inconsistent speaker IDs, forms of address, register, tone and unnatural dialogue.
         Keep literalTranslation semantically complete. Make displayTranslation natural and concise for the balloon,
@@ -319,6 +479,39 @@ public actor VLMRegionTranslationService: RegionTranslating {
         \(draftsJSON)
         Return only the complete corrected JSON array in the same shape as the drafts. Keep every UUID.
         """
+    }
+
+    /// 模型即使收到 zh-Hant 仍可能混入簡體字；以 Foundation／ICU 在寫入專案前
+    /// 做最後一道 script 正規化。明確指定 zh-Hans 時也採對稱處理。
+    static func normalizedTranslation(
+        _ text: String,
+        targetLanguageCode: String
+    ) -> String {
+        let normalizedCode = targetLanguageCode
+            .replacingOccurrences(of: "_", with: "-")
+            .lowercased()
+        let transformName: String
+        if normalizedCode == "zh-hant" || normalizedCode.hasPrefix("zh-hant-") {
+            transformName = "Simplified-Traditional"
+        } else if normalizedCode == "zh-hans" || normalizedCode.hasPrefix("zh-hans-") {
+            transformName = "Traditional-Simplified"
+        } else {
+            return text
+        }
+        return text.applyingTransform(StringTransform(transformName), reverse: false) ?? text
+    }
+
+    private static func targetLanguageRequirement(for targetLanguageCode: String) -> String {
+        let normalizedCode = targetLanguageCode
+            .replacingOccurrences(of: "_", with: "-")
+            .lowercased()
+        if normalizedCode == "zh-hant" || normalizedCode.hasPrefix("zh-hant-") {
+            return "Use Traditional Chinese characters only. Never output Simplified Chinese characters."
+        }
+        if normalizedCode == "zh-hans" || normalizedCode.hasPrefix("zh-hans-") {
+            return "Use Simplified Chinese characters only. Never output Traditional Chinese characters."
+        }
+        return "Follow the script and regional form specified by the BCP-47 target language code."
     }
 
     private static func qualityFlags(

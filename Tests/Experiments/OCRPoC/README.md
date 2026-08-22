@@ -1,6 +1,6 @@
 # MangaKitchen OCR 獨立 PoC
 
-此目錄只驗證 PP-OCRv6 Small 的辨識品質與 Apple Silicon 硬體分派，不會連結或修改 MangaKitchen 的任何 target。Apple Vision 不在驗證範圍內。
+此目錄驗證 PP-OCRv6 Small 與 Medium 的辨識品質、模型轉換及 Apple Silicon 硬體分派，不會連結或修改 MangaKitchen 的任何 target。Apple Vision 不在驗證範圍內。
 
 ## 環境
 
@@ -28,7 +28,7 @@ uv run python benchmark_coreml.py
 ## 驗證內容
 
 - `quality_check.py`：以官方 PaddleOCR pipeline 跑三張現有漫畫樣本，並對第二、三張人工校對的直排對話計算嚴格 CER。
-- `convert_coreml.py`：從官方 safetensors 直接轉成 macOS 14 MLProgram。辨識輸入固定為 `1×3×48×320`；偵測輸入固定為 `1×3×640×416`。
+- `convert_coreml.py`：從官方 Small safetensors 直接轉成 macOS 14 MLProgram。Medium 的正式 artifact 另由 Paddle inference → Paddle2ONNX → `onnx2coreml` 離線產製，辨識輸入固定為 `1×3×48×320`。
 - `verify_coreml.py`：用 ANE 執行實際漫畫裁切，驗證文字結果與偵測覆蓋率。
 - `benchmark_coreml.py`：分別鎖定 Auto、ANE、GPU/Metal 與 CPU，輸出 warm latency 和 Core ML Compute Plan。
 

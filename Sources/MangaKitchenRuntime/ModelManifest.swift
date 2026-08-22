@@ -127,7 +127,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
     public static func load(from directoryURL: URL) throws -> ModelManifest {
         let manifestURL = directoryURL.appendingPathComponent("mangakitchen-model.json")
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
-            if let inferredManifest = inferMLXVLMManifest(from: directoryURL) {
+            if let inferredManifest = inferMLXLanguageManifest(from: directoryURL) {
                 return inferredManifest
             }
             throw ModelRuntimeError.manifestNotFound(manifestURL)
@@ -139,7 +139,9 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         return manifest
     }
 
-    private static func inferMLXVLMManifest(from directoryURL: URL) -> ModelManifest? {
+    /// 無 manifest 的 Hugging Face MLX 目錄會依 config 自動區分純文字 LLM
+    /// 與 VLM，避免 Qwen3 純文字權重被誤判為圖生文。
+    private static func inferMLXLanguageManifest(from directoryURL: URL) -> ModelManifest? {
         let fileManager = FileManager.default
         let configURL = directoryURL.appendingPathComponent("config.json")
         guard let entries = try? fileManager.contentsOfDirectory(
@@ -167,8 +169,6 @@ public struct ModelManifest: Codable, Hashable, Sendable {
             let normalized = descriptor.lowercased()
             return normalized.contains("vision") || normalized.contains("image")
         }
-        guard hasImageCapability else { return nil }
-
         let configuredID = (config["_name_or_path"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let directoryName = directoryURL.lastPathComponent
@@ -182,7 +182,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         return ModelManifest(
             id: modelID,
             displayName: directoryName,
-            capability: .imageToText,
+            capability: hasImageCapability ? .imageToText : .textToText,
             backend: .mlxSwift,
             generation: Generation()
         )

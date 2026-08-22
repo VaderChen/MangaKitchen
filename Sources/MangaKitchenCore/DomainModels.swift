@@ -1,6 +1,7 @@
 import Foundation
 
 public enum ModelCapability: String, Codable, CaseIterable, Hashable, Sendable {
+    case textToText
     case imageToText
     case imageToImage
     case superResolution
@@ -15,6 +16,22 @@ public enum ModelBackend: String, Codable, CaseIterable, Hashable, Sendable {
 public enum ImageCompositingBackend: String, Codable, CaseIterable, Hashable, Sendable {
     case gpu
     case cpu
+}
+
+/// 專案在步驟二採用的文字粗定位來源。
+public enum TextLocalizationMethod: String, Codable, CaseIterable, Hashable, Sendable {
+    /// 內建原生 Core ML detector；不需要先載入圖生文模型。
+    case ppocrv6MediumDet
+    /// 目前載入的 image-to-text VLM。
+    case vlm
+}
+
+/// 步驟三翻譯使用的本機模型類型。
+public enum TranslationModelMethod: String, Codable, CaseIterable, Hashable, Sendable {
+    /// 純文字 MLX LLM；預設選項，不需要頁面圖片。
+    case textToText
+    /// 圖生文 VLM；可利用人物、表情與畫面語境。
+    case imageToText
 }
 
 public struct LoadedModelInfo: Codable, Hashable, Sendable, Identifiable {
@@ -36,6 +53,21 @@ public struct LoadedModelInfo: Codable, Hashable, Sendable, Identifiable {
         self.capability = capability
         self.backend = backend
         self.location = location
+    }
+
+    /// 比對「相同 capability 的相同模型目錄」。路徑會先標準化並解析
+    /// symlink，避免同一個模型因路徑表示不同被誤判為新模型。
+    public func matchesModel(
+        id requestedID: String,
+        capability requestedCapability: ModelCapability,
+        at requestedLocation: URL
+    ) -> Bool {
+        guard id == requestedID, capability == requestedCapability else { return false }
+        return Self.canonicalModelPath(location) == Self.canonicalModelPath(requestedLocation)
+    }
+
+    private static func canonicalModelPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 }
 
@@ -81,6 +113,7 @@ public enum PageProcessingActivity: String, Codable, CaseIterable, Hashable, Sen
     case renderingMaskPreview
     case applyingGlossary
     case translatingRegions
+    case reviewingTranslations
     case preparingTranslationPreview
     case restoringBackground
     case typesettingTranslation
@@ -273,9 +306,10 @@ public struct TranslationQualityOptions: Codable, Hashable, Sendable {
 
 /// 單一 OCR 模型在一個對話區域產生的候選結果。
 ///
-/// OCR 只在步驟三翻譯前被用來產生候選，不會覆寫 `DialogueRegion.sourceText`、
-/// `bounds` 或任何遮罩。不同模型的結果以 `DialogueRegion.ocrResults` 的模型 ID
-/// 分開保存，之後的複合 OCR／二次校稿才能回看每個模型的原始候選。
+/// OCR 在步驟三翻譯前產生候選，不會改動 `bounds` 或任何遮罩。
+/// 不同模型的結果以 `DialogueRegion.ocrResults` 的模型 ID 分開保存；當正式
+/// `sourceText` 尚為空白時，上層可明確採用預設 OCR 候選，之後仍能以完整的
+/// 模型結果進行複合 OCR／二次校稿。
 public struct OCRTextLineResult: Codable, Hashable, Sendable {
     public var text: String
     public var confidence: Double?
@@ -334,14 +368,15 @@ public struct DialogueRegion: Identifiable, Codable, Hashable, Sendable {
     /// 與 `style.writingDirection` 分開：那是使用者偏好，會被 `defaultStyle` 覆寫；
     /// 這是對這張圖的觀測結果，只在使用者選 automatic 時用來決定實際排版方向。
     public var detectedWritingDirection: WritingDirection
-    /// VLM、Agent 或人工最初提供的文字，人工修改 sourceText 時不覆寫。
+    /// OCR、VLM、Agent 或人工最初提供的文字，人工修改 sourceText 時不覆寫。
     public var rawSourceText: String?
     /// 供詞表比對與翻譯使用的來源文字。
     public var sourceText: String
-    /// 各 OCR 模型獨立產生的候選結果。只供後續複合 OCR／二次校稿使用，
-    /// 不代表目前已確認的 `sourceText`。
+    /// 各 OCR 模型獨立產生的候選結果。預設 OCR 候選可在原文空白時被採用，
+    /// 但每個模型的完整候選仍保留於此，供後續複合 OCR／二次校稿使用。
     public var ocrResults: [String: OCRModelResult]
-    /// 相容舊 `.str` 的完成標記；新流程代表來源文字已由 VLM、Agent 或人工確認。
+    /// 相容舊 `.str` 的完成標記；代表來源文字已由 VLM、Agent 或人工確認。
+    /// 單一 OCR 候選被採用時不會冒用此標記。
     public var ocrTextRefined: Bool
     /// 忠實保留語意的直譯稿；最終排版仍使用 translatedText。
     public var literalTranslatedText: String?
@@ -583,6 +618,10 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
     public var sourceLanguageCodes: [String]
     public var targetLanguageCode: String
     public var readingDirection: ReadingDirection
+    /// 步驟三的原文抽取方式；不得改動步驟二遮罩。
+    public var textLocalizationMethod: TextLocalizationMethod
+    /// 步驟三翻譯選用純文字模型或圖生文 VLM。
+    public var translationModelMethod: TranslationModelMethod
     public var defaultStyle: DialogueStyle
     public var maskExpansion: Double
     /// 去字修補使用的底紙顏色；`AUTO` 代表由修補器自動估算，也可指定 HEX 或由滴管更新。
@@ -598,6 +637,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         sourceLanguageCodes: [String] = ["ja-JP", "zh-Hans", "zh-Hant", "en-US"],
         targetLanguageCode: String = TargetLanguageResolver.automaticCode,
         readingDirection: ReadingDirection = .rightToLeft,
+        textLocalizationMethod: TextLocalizationMethod = .ppocrv6MediumDet,
+        translationModelMethod: TranslationModelMethod = .textToText,
         defaultStyle: DialogueStyle = DialogueStyle(),
         maskExpansion: Double = 0.035,
         eraseColorHex: String = ProcessingOptions.automaticEraseColor,
@@ -609,6 +650,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.sourceLanguageCodes = sourceLanguageCodes
         self.targetLanguageCode = targetLanguageCode
         self.readingDirection = readingDirection
+        self.textLocalizationMethod = textLocalizationMethod
+        self.translationModelMethod = translationModelMethod
         self.defaultStyle = defaultStyle
         self.maskExpansion = maskExpansion
         self.eraseColorHex = Self.normalizedEraseColor(
@@ -639,6 +682,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         case sourceLanguageCodes
         case targetLanguageCode
         case readingDirection
+        case textLocalizationMethod
+        case translationModelMethod
         case defaultStyle
         case maskExpansion
         case eraseColorHex
@@ -660,6 +705,13 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         readingDirection = try values.decodeIfPresent(
             ReadingDirection.self, forKey: .readingDirection
         ) ?? defaults.readingDirection
+        // 舊專案沒有定位來源欄位時，使用內建 PP-OCRv6 Medium Det。
+        textLocalizationMethod = try values.decodeIfPresent(
+            TextLocalizationMethod.self, forKey: .textLocalizationMethod
+        ) ?? defaults.textLocalizationMethod
+        translationModelMethod = try values.decodeIfPresent(
+            TranslationModelMethod.self, forKey: .translationModelMethod
+        ) ?? defaults.translationModelMethod
         defaultStyle = try values.decodeIfPresent(
             DialogueStyle.self, forKey: .defaultStyle
         ) ?? defaults.defaultStyle

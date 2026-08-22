@@ -189,7 +189,7 @@ actor MCPWorkflowService {
     }
     /// Agent 提供區域粗框與文字；遮罩由系統產生。
     private let agentPipeline: ComicTranslationPipeline
-    /// 區域由本機 Core ML BBOX／氣泡形狀定位；文字與排版仍由 Agent 提供。
+    /// 區域由本機 Core ML 氣泡模型與像素精修建立；文字與排版仍由 Agent 提供。
     private let localDetectionPipeline: ComicTranslationPipeline
     private var pipeline: ComicTranslationPipeline {
         switch regionSource {
@@ -237,7 +237,8 @@ actor MCPWorkflowService {
         let artifactsRoot = root.appendingPathComponent("Artifacts", isDirectory: true)
         // 翻譯位置在兩條管線都是 AgentDrivenTranslator：MCP 永遠不會用
         // 內建圖生文模型翻譯，這一點不隨模式改變。
-        self.bubbleSegmenter = Self.bundledBubbleSegmenter()
+        let bundledBubbleSegmenter = Self.bundledBubbleSegmenter()
+        self.bubbleSegmenter = bundledBubbleSegmenter
         self.agentPipeline = ComicTranslationPipeline(
             regionDetector: AgentDrivenRegionDetector(),
             maskRefiner: MangaTextMaskRefiner(),
@@ -248,8 +249,10 @@ actor MCPWorkflowService {
             outputRoot: artifactsRoot
         )
         self.localDetectionPipeline = ComicTranslationPipeline(
+            // MCP 與 App 的步驟二共用同一語意：先找氣泡，再以
+            // 原圖像素精修遮罩，不根據 OCR／VLM 選項切換 detector。
             regionDetector: MangaBubbleMaskRegionDetector(
-                bubbleSegmenter: Self.bundledBubbleSegmenter()
+                bubbleSegmenter: bundledBubbleSegmenter
             ),
             maskRefiner: MangaTextMaskRefiner(),
             translator: AgentDrivenTranslator(),
@@ -1510,7 +1513,8 @@ actor MCPWorkflowService {
         progress(.maskReady, 1)
     }
 
-    /// 預設 App-first 模式：只以氣泡 BBOX 與像素精修建立遮罩，並保留 Agent 已寫入的資料。
+    /// App-first 模式：依專案選定的 PP-OCRv6／VLM 定位來源與像素精修建立遮罩，
+    /// 並保留 Agent 已寫入的資料。
     private func detectByLocalPipeline(
         pageIndex: Int,
         progress: @escaping PagePipelineProgress

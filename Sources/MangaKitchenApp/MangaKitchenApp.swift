@@ -51,7 +51,9 @@ private struct MangaKitchenApplication: App {
             dataDirectoryPath: settings.dataDirectoryPath,
             defaultOutputDirectoryPath: settings.defaultOutputDirectoryPath,
             imageCompositingBackend: settings.resolvedImageCompositingBackend,
+            textToTextModelPath: settings.textToTextModelPath,
             imageToTextModelPath: settings.imageToTextModelPath,
+            modelThinkingEnabled: settings.modelThinkingEnabled,
             imageToImageModelPath: settings.imageToImageModelPath,
             automaticSuperResolutionEnabled: settings.automaticSuperResolutionEnabled,
             superResolutionModelPath: settings.superResolutionModelPath

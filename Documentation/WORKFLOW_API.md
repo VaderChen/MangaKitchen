@@ -9,7 +9,7 @@
       ↓ ComicPage[]
 2. Core ML dialogue BBOXes → glyph mask refinement ⇄ edit mask strokes
       ↓ DialogueRegion[]（未確認原文）+ dialogue-mask.png + 去字校對預覽 + page.str
-3. VLM classification/transcription → translate + auto layout ⇄ edit text/style
+3. bundled OCR/VLM transcription → text/multimodal/Agent translate + auto layout ⇄ edit text/style
       ↓ page.str + translation preview.png
 4. save output
       ↓ copy confirmed translation preview to translated page.png
@@ -17,7 +17,7 @@
 
 一鍵模式不是第五套流程。`runFullPage` 只依序呼叫步驟二、三、四；步驟一提供已掃描的頁面列表。
 
-步驟二若找不到已載入的 `imageToText` 模型，App 不會改用系統 OCR，也不會產生猜測區域；它會建立同尺寸全黑遮罩並進入手動模式。使用者可用畫筆新增／擦除遮罩，待載入模型後再執行需要模型的重新計算或翻譯。
+步驟二固定使用內建氣泡分割與原圖像素精修，不需要 PP-OCR 文字偵測或 `imageToText` 模型，也不會因 OCR／VLM 偏好而改變遮罩。步驟三的原文抽取才依專案選項分流：PP-OCR 以 Medium Det 切欄後逐行辨識，VLM 則沿用整區轉錄。翻譯、可選二次校稿與語意 QA 依 `translationModelMethod` 使用文生文或多模態模型；只有 VLM 原文抽取或多模態翻譯需要 `imageToText`。
 
 ## 專案、複選與批次規則
 
@@ -25,13 +25,14 @@
 - `selectedPageID` 是中央畫布顯示的單一作用中頁面；`selectedPageIDs` 是批次命令集合，兩者不可混為同一狀態。
 - Command 點擊切換個別選取，Shift 點擊加入連續範圍；搜尋或狀態篩選只改變列表顯示，不會隱式刪除既有頁面。
 - `BatchJob` 固定保存建立當下的 `projectID`、`operation`、`pageIDs` 與是否強制重算，執行途中切換專案會被阻止。
-- GPU 模型工作使用單一循序佇列；新工作可以排隊，但不會取消正在執行的前一筆工作。
+- GPU 模型工作使用單一循序佇列；新工作可以排隊，但不會取消正在執行的前一筆工作。模型只在實際使用時載入；同模型 ID／capability／canonical path 直接重用，同 capability 的並行載入會序列化。
+- 載入大型模型前會讀取 unified-memory 使用率；超過壓力門檻時先釋放其他 runtime，但保留偏好路徑供下次延遲載入。
 - App 非正常結束後，原本為 `queued` 或 `running` 的紀錄會復原為 `cancelled`，不會未經確認自動重跑模型。
 - 每個等待 DLG 都顯示從開啟起算的累計時間（`MM:SS`）；逐區翻譯另顯示目前區域／總區域，進度條仍使用頁面與批次進度。
 
 ### 逐區處理與進度
 
-- 步驟三的 VLM 轉錄與翻譯都以區域為獨立工作單位。單一區域的裁切、模型推論、回應解析或翻譯失敗時，該區保留原有 `DialogueRegion`，其他區域仍會繼續；`CancellationError` 不會被吞掉，取消工作仍會停止整體佇列。
+- 步驟三的 OCR 辨識與文生文／多模態翻譯都以區域為獨立工作單位。單一區域的裁切、模型推論、回應解析或翻譯失敗時，該區保留原有 `DialogueRegion`，其他區域仍會繼續；`CancellationError` 不會被吞掉，取消工作仍會停止整體佇列。
 - `RegionTranslating.translate` 透過 `PageRegionProgress` 回報 1-based 的 `(current, total)`；`ComicTranslationPipeline` 另外透過 `PagePipelineProgress` 回報頁面 0...1 實際進度。兩者不可互相推算，UI 應使用前者顯示文字、後者更新 progress bar。
 - App 的等待 DLG 在逐區翻譯時顯示「第 current / total 區」，進度條則使用目前頁面進度與批次已完成頁面數計算，不會因區域索引跳動而跳格。
 
@@ -68,16 +69,16 @@
 
 全域設定的 `defaultOutputDirectoryPath` 是新專案的預設輸出根目錄；尚未有專案輸出設定時，App 會在此根目錄下建立以專案名稱命名的子目錄，再把輸出寫入其中。不會覆寫既有專案的 `outputDirectoryURL`。`selectionColorHex` 保存 WebUI 畫布的選取框顏色，僅影響介面顯示，不會寫入頁面像素或 `.str`。
 
-`TranslationQualityOptions` 預設啟用整頁語境、翻譯 QA 與直譯稿保存，二次校稿預設關閉，長度策略為 `balanced`。本機 VLM 第一階段一次讀取整頁有序區域，產生直譯稿、顯示譯文、角色、語氣與信心；若整頁回覆遺漏區域，只對缺少的 UUID 逐區補翻。啟用二次校稿時才以相同整頁資料統一稱謂、詞表、數字、否定、語氣與長度。QA 會檢查缺譯、詞表、數字、長度及低信心，結果保存於 `.str`，不只存在記憶體。
+`TranslationQualityOptions` 預設啟用整頁語境、翻譯 QA 與直譯稿保存，二次校稿預設關閉，長度策略為 `balanced`。所選文生文／多模態模型第一階段一次讀取整頁有序區域，產生直譯稿、顯示譯文、語氣與信心；若整頁回覆遺漏區域，只對缺少 UUID 執行一次有界補翻。啟用二次校稿時才以相同整頁資料統一稱謂、詞表、數字、否定、語氣與長度，UI 明確顯示「二次校稿」而不是再次顯示翻譯。QA 會檢查缺譯、詞表、數字、長度及低信心，結果保存於 `.str`，不只存在記憶體。
 
 - `NormalizedPoint` 與 `NormalizedRect` 都以原圖左上角為原點，範圍為 `0...1`。
 - 遮罩畫筆的 `diameter` 是相對於原圖短邊的比例，範圍為 `0.001...1`。
 - `MaskStroke.mode` 為 `add` 或 `erase`，筆劃依保存順序套用。
-- `rawSourceText` 保留 VLM、MCP Agent 或人工最初提供的原文；`sourceText` 是目前供詞表比對與翻譯使用的來源文字。
+- `rawSourceText` 保留 OCR、VLM、MCP Agent 或人工最初提供的原文；`sourceText` 是目前供詞表比對與翻譯使用的來源文字。
 - `mcpExtractedSourceText` 只保存 MCP Agent 回傳的原文抽取結果；本機 VLM 的直譯稿不會填入此欄位，WebUI 只有在 MCP 實際回傳內容時才顯示「MCP 抽取原文」。
-- `ocrResults` 以 OCR 模型 ID 分開保存各模型的候選 `text`、信心、文字行與正規化座標；目前只在步驟三翻譯前追加資料，不會覆寫 `sourceText`、`bounds`、`maskPolygons` 或人工筆劃。複合 OCR 與二次校稿融合尚未啟用。
-- `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；新流程的 `true` 代表來源文字已由 VLM、MCP Agent 或人工確認，不會觸發任何 OCR 校正服務。
-- **GUI 路徑**：步驟二在有 `imageToText` 模型時由內建 `MangaBubbleSegmentationCoreMLRuntime` 以 Apple Neural Engine 優先產生對話框 BBOX 與氣泡形狀，再以原圖像素連通元件將 `bounds` 與遮罩收斂到實際字形；此時才會需要圖生文模型做候選辨識。未載入模型時不呼叫自動偵測，而是建立同尺寸全黑遮罩並進入手動畫筆模式；這不是系統 OCR fallback。步驟三先由 `VLMRegionTranscriptionService` 定位、分類與轉錄；若有本機 OCR，`OCRRegionTextRecognitionService` 只追加 `ocrResults`，翻譯與二次校稿仍由既有 VLM 流程負責。
+- `ocrResults` 以 OCR 模型 ID 分開保存各模型的候選 `text`、信心、文字行與正規化座標；當 `sourceText` 空白時，預設 OCR 候選會被採用為翻譯原文，但不覆寫已確認原文、`bounds`、`maskPolygons` 或人工筆劃。複合 OCR 與多模型校稿融合尚未啟用。
+- `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；`true` 代表來源文字已由 VLM、MCP Agent 或人工確認。單模型 OCR 候選被採用時不會冒用此標記。
+- **GUI 路徑**：步驟二一律先由 `MangaBubbleSegmentationCoreMLRuntime` 產生對話框 BBOX 與氣泡形狀，再固定以原圖像素收斂為遮罩；不會呼叫 Medium Det 或 VLM。步驟三才依「原文抽取方式」選擇 `OCRRegionTextRecognitionService` 逐欄 OCR 或 `VLMRegionTranscriptionService` 整區轉錄；辨識合併只採用原文與 OCR 候選，不覆寫座標與遮罩。翻譯、可選二次校稿與語意 QA 再依「文字翻譯方式」選擇 `textToText` 或 `imageToText` runtime。
 - **MCP 路徑**：App 先完成區域、像素遮罩與去字背景，再由 `prepare_agent_task` 將原圖及完整遮罩 JSON 一次交給 Agent；Agent 只依既有 `region_id` 抽取原文、翻譯與決定排版，最後以 `submit_agent_result` 一次回寫並建立步驟三預覽。只有使用者要求輸出時才以 `page.render` 儲存步驟四結果。MCP 不接受 Agent 修改區域或遮罩，也不呼叫內建 VLM 翻譯。詳見〈標準 MCP〉。
 - `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形像素遮罩；抗鋸齒遲滯與固定像素膨脹都在像素層完成，不再對逐條矩形做向量描邊，因此輸出的 `dialogue-mask.png` 維持二值邊界。
 - `maskCoverageRatio` 是系統像素精修保留的前景筆畫比例；`null` 代表尚未執行自動檢查。
@@ -191,8 +192,8 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
       "sourceText": "原文",
       "mcpExtractedSourceText": null,
       "ocrResults": {
-        "ppocrv6-small-rec": {
-          "modelID": "ppocrv6-small-rec",
+        "ppocrv6-medium-rec": {
+          "modelID": "ppocrv6-medium-rec",
           "text": "原文候選",
           "confidence": 0.91,
           "lines": [],
@@ -238,9 +239,9 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `setInterfaceLanguage(language)` | 設定 `auto`、`zh-Hant`、`en`、`ja` 或 `ko`，立即重繪並保存偏好 |
 | `updateGlobalSettings(settings)` | 更新完整全域設定；包含色系、框選顏色、資料位置、預設輸出位置、偏好模型與 MCP 網路設定 |
 | `chooseDataDirectory()` | 開啟原生資料目錄選擇面板；回傳 `{ path }`，套用後需重新啟動 |
-| `choosePreferredModelDirectory(capability)` | 選取並驗證 `imageToText`、`imageToImage` 或 `superResolution` 模型目錄 |
-| `chooseModelDownloadDirectory(capability)` | 選取圖生文或超高解析度模型儲存根目錄；若直接選到支援的既有模型，會回傳其版本 |
-| `downloadPreferredModel(capability, variantID)` | 從 Hugging Face 下載所選圖生文或超高解析度模型；已存在時不重複下載 |
+| `choosePreferredModelDirectory(capability)` | 選取並驗證 `textToText`、`imageToText`、`imageToImage` 或 `superResolution` 模型目錄 |
+| `chooseModelDownloadDirectory(capability)` | 選取文生文、多模態或超高解析度模型儲存根目錄；若直接選到支援的既有模型，會回傳其版本 |
+| `downloadPreferredModel(capability, variantID)` | 從 Hugging Face 下載所選文生文、多模態或超高解析度模型；已存在時不重複下載 |
 | `createProject()`／`chooseSourceDirectory()` | 從圖片、資料夾、ZIP／CBZ、RAR／CBR 或 PDF 建立受管理專案 |
 | `appendPages()` | 將相同支援格式追加到目前專案；必要時先把外部來源轉成受管理專案 |
 | `switchProject(projectID)` | 切換目前專案 |
@@ -276,7 +277,7 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `removeRegion(pageID, regionID)` | 移除區域 |
 | `moveRegion(pageID, regionID, offset)` | 調整閱讀順序及 PSD 文字圖層順序 |
 | `updateRegion(pageID, regionID, changes)` | 更新文字、`translationAnchor` 譯文中心點、字型、字級及排字設定 |
-| `updateSettings(changes)` | 更新專案處理設定；`eraseColorHex` 可指定 `AUTO` 或步驟二去字底紙色，`translationQuality` 可控制整頁語境、校稿、品質檢查、直譯稿、長度策略與風格指南 |
+| `updateSettings(changes)` | 更新專案處理設定；`textLocalizationMethod` 可為 `ppocrv6MediumDet`（預設）或 `vlm`，`eraseColorHex` 可指定 `AUTO` 或步驟二去字底紙色，`translationQuality` 可控制整頁語境、校稿、品質檢查、直譯稿、長度策略與風格指南 |
 
 命令 Promise 代表 Native 已接受命令。長工序的實際狀態、進度及結果由 `window.MangaKitchenNative.receiveState` 持續推送。
 

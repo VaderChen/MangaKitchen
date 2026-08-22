@@ -54,6 +54,11 @@ DerivedData/
 !Sources/MangaKitchenApp/Resources/Models/OCR/
 !Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-small-rec-macos14.mlpackage/
 !Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-small-rec-macos14.mlpackage/**
+!Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-medium-rec-macos14.mlpackage/
+!Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-medium-rec-macos14.mlpackage/**
+!Sources/MangaKitchenApp/Resources/Models/TextLocalization/
+!Sources/MangaKitchenApp/Resources/Models/TextLocalization/ppocrv6-medium-det-736x480-macos14.mlpackage/
+!Sources/MangaKitchenApp/Resources/Models/TextLocalization/ppocrv6-medium-det-736x480-macos14.mlpackage/**
 
 # Runtime worker binaries
 /RuntimeSupport/QwenImageEditWorker/MangaKitchenQwenImageEditWorker

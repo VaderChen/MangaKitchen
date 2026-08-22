@@ -164,7 +164,8 @@ public actor VLMRegionTranscriptionService: RegionTextRecognizing {
         - Do not return coordinates, bounding boxes, masks, explanations, or Markdown.
         - For ignore, return an empty text string.
 
-        Return only a syntactically valid JSON array in this exact shape:
+        \(VLMStructuredResponseDecoder.finalJSONInstruction)
+        Return a syntactically valid JSON array in this exact shape:
         [{"index":1,"text":"source text","kind":"dialogue","direction":"vertical"}]
         \(VLMStructuredResponseDecoder.retryInstruction(attempt: attempt))
         """

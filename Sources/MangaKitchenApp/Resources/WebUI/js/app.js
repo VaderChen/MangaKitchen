@@ -1,4 +1,4 @@
-import { invoke, onState } from "./bridge.js";
+import { invoke, onState, onTransientState } from "./bridge.js";
 import {
   applyTranslations,
   interfaceLanguageSetting,
@@ -6,6 +6,7 @@ import {
   setInterfaceLanguage,
   t,
 } from "./i18n.js";
+import { renderMarkdown } from "./markdown.js";
 import "./workflow.js";
 
 let state = null;
@@ -23,6 +24,8 @@ let calculationElapsedTimer = null;
 let dismissedModelLoadingFailureID = null;
 const presentedUpdateTags = new Set();
 let updateDialogRetryTimer = null;
+let lastHandledUpdateCheckID = null;
+let logRefreshTimer = null;
 let maskTool = "add";
 let activeMaskStroke = null;
 // 譯文編輯的防抖更新在筆劃期間不能送出：它一送出，後端推回的狀態會蓋掉
@@ -36,6 +39,7 @@ let regionUpdatesSuspended = false;
 let translationDrag = null;
 let translationResize = null;
 let eraseColorPicking = false;
+let activeViewportColorInput = null;
 const canvasViewport = { pageID: null, scale: 1, x: 0, y: 0, drag: null };
 const canvasBaseSizes = new WeakMap();
 const colorSchemeStorageKey = "mangakitchen.color-scheme";
@@ -101,9 +105,21 @@ const elements = {
   canvasInfo: document.querySelector("#canvas-info"),
   canvasResolution: document.querySelector("#canvas-resolution"),
   canvasZoom: document.querySelector("#canvas-zoom"),
+  systemMetrics: document.querySelector("#system-metrics"),
+  gpuUsage: document.querySelector("#gpu-usage"),
+  memoryUsage: document.querySelector("#memory-usage"),
   projectPath: document.querySelector("#project-path"),
   selectionSummary: document.querySelector("#selection-summary"),
   settingsDialog: document.querySelector("#settings-dialog"),
+  openLog: document.querySelector("#open-log"),
+  logDialog: document.querySelector("#log-dialog"),
+  logList: document.querySelector("#log-list"),
+  logEmpty: document.querySelector("#log-empty"),
+  logEntryCount: document.querySelector("#log-entry-count"),
+  refreshLog: document.querySelector("#refresh-log"),
+  clearLog: document.querySelector("#clear-log"),
+  closeLog: document.querySelector("#close-log"),
+  closeLogIcon: document.querySelector("#close-log-icon"),
   confirmationDialog: document.querySelector("#confirmation-dialog"),
   confirmationTitle: document.querySelector("#confirmation-title"),
   confirmationMessage: document.querySelector("#confirmation-message"),
@@ -121,6 +137,10 @@ const elements = {
   calculationMessage: document.querySelector("#calculation-message"),
   calculationProgress: document.querySelector("#calculation-progress"),
   calculationElapsed: document.querySelector("#calculation-elapsed"),
+  calculationReasoning: document.querySelector("#calculation-reasoning"),
+  calculationReasoningStatus: document.querySelector("#calculation-reasoning-status"),
+  calculationReasoningContent: document.querySelector("#calculation-reasoning-content"),
+  calculationReasoningToggle: document.querySelector("#calculation-reasoning-toggle"),
   calculationCancel: document.querySelector("#calculation-cancel"),
   modelLoadingDialog: document.querySelector("#model-loading-dialog"),
   modelLoadingTitle: document.querySelector("#model-loading-title"),
@@ -138,6 +158,15 @@ const elements = {
   settingsDataDirectory: document.querySelector("#settings-data-directory"),
   dataDirectoryRestartNote: document.querySelector("#data-directory-restart-note"),
   settingsDefaultOutputDirectory: document.querySelector("#settings-default-output-directory"),
+  settingsModelThinking: document.querySelector("#settings-model-thinking"),
+  settingsTextToTextModel: document.querySelector("#settings-text-to-text-model"),
+  settingsTextToTextModelVariant: document.querySelector("#settings-text-to-text-model-variant"),
+  settingsTextToTextModelDownload: document.querySelector("#download-text-to-text-model"),
+  settingsTextToTextModelClear: document.querySelector("#clear-text-to-text-model"),
+  settingsTextToTextModelDelete: document.querySelector("#delete-text-to-text-model"),
+  settingsTextToTextModelDownloadProgress: document.querySelector("#text-to-text-model-download-progress"),
+  settingsTextToTextModelDownloadProgressBar: document.querySelector("#text-to-text-model-download-progress-bar"),
+  settingsTextToTextModelDownloadStatus: document.querySelector("#text-to-text-model-download-status"),
   settingsImageToTextModel: document.querySelector("#settings-image-to-text-model"),
   settingsImageToTextModelVariant: document.querySelector("#settings-image-to-text-model-variant"),
   settingsImageToTextModelDownload: document.querySelector("#download-image-to-text-model"),
@@ -163,6 +192,11 @@ const elements = {
   settingsMCPClient: document.querySelector("#settings-mcp-client"),
   mcpWhitelist: document.querySelector("#mcp-whitelist"),
   settingsAppVersion: document.querySelector("#settings-app-version"),
+  aboutGitHubLink: document.querySelector("#about-github-link"),
+  aboutReleasesLink: document.querySelector("#about-releases-link"),
+  aboutCheckUpdates: document.querySelector("#about-check-updates"),
+  aboutCheckUpdatesLabel: document.querySelector("#about-check-updates-label"),
+  aboutUpdateStatus: document.querySelector("#about-update-status"),
   targetLanguage: document.querySelector("#target-language"),
   readingDirection: document.querySelector("#reading-direction"),
   writingDirection: document.querySelector("#writing-direction"),
@@ -176,6 +210,8 @@ const elements = {
   fontNameTrigger: document.querySelector("#font-name-trigger"),
   fontNameValue: document.querySelector("#font-name-value"),
   fontNameList: document.querySelector("#font-name-list"),
+  textLocalizationMethod: document.querySelector("#text-localization-method"),
+  translationModelMethod: document.querySelector("#translation-model-method"),
   translationPageContext: document.querySelector("#translation-page-context"),
   translationReviewPass: document.querySelector("#translation-review-pass"),
   translationQualityCheck: document.querySelector("#translation-quality-check"),
@@ -280,6 +316,7 @@ const processingActivityLabelKeys = {
   renderingMaskPreview: "activityRenderingMaskPreview",
   applyingGlossary: "activityApplyingGlossary",
   translatingRegions: "activityTranslatingRegions",
+  reviewingTranslations: "activityReviewingTranslations",
   preparingTranslationPreview: "activityPreparingTranslationPreview",
   restoringBackground: "activityRestoringBackground",
   typesettingTranslation: "activityTypesettingTranslation",
@@ -289,6 +326,102 @@ const processingActivityLabelKeys = {
 
 function activePage() {
   return state?.pages.find((page) => page.id === state.selectedPageID) ?? null;
+}
+
+function availableTranslationModels() {
+  const settings = state?.globalSettings;
+  const models = [];
+  const appendInstalled = (capability, options) => {
+    for (const model of options ?? []) {
+      if (!model.installed) continue;
+      models.push({
+        capability,
+        variantID: model.id,
+        displayName: model.displayName,
+      });
+    }
+  };
+  appendInstalled("textToText", settings?.textToTextModelOptions);
+  appendInstalled("imageToText", settings?.imageToTextModelOptions);
+
+  // 手動載入、未列在下載目錄 catalog 的模型仍可使用；若同類型已有已下載
+  // 清單，避免把同一個 runtime 以 manifest ID 再列一次。
+  for (const loaded of state?.loadedModels ?? []) {
+    if (!["textToText", "imageToText"].includes(loaded.capability)) continue;
+    if (models.some((model) => model.capability === loaded.capability)) continue;
+    models.push({
+      capability: loaded.capability,
+      variantID: null,
+      displayName: loaded.displayName,
+    });
+  }
+  return models.sort((left, right) => {
+    if (left.capability === right.capability) return left.displayName.localeCompare(right.displayName);
+    return left.capability === "textToText" ? -1 : 1;
+  });
+}
+
+function availableTextLocalizationVLMs() {
+  const models = [];
+  const append = (model, variantID = model?.id ?? null) => {
+    if (!model?.displayName || models.some((item) => item.variantID === variantID
+        && item.displayName === model.displayName)) return;
+    models.push({
+      variantID,
+      displayName: model.displayName,
+    });
+  };
+  for (const model of state?.globalSettings?.imageToTextModelOptions ?? []) {
+    if (model.installed) append(model, model.id);
+  }
+  for (const model of state?.loadedModels ?? []) {
+    if (model.capability !== "imageToText") continue;
+    const catalogModel = (state?.globalSettings?.imageToTextModelOptions ?? [])
+      .find((option) => option.id === model.id);
+    append(model, catalogModel?.id ?? null);
+  }
+  return models;
+}
+
+function hasAvailableModelCapability(capability) {
+  if ((state?.loadedModels ?? []).some((model) => model.capability === capability)) {
+    return true;
+  }
+  const settings = state?.globalSettings;
+  const options = capability === "imageToText"
+    ? settings?.imageToTextModelOptions
+    : capability === "superResolution"
+      ? settings?.superResolutionModelOptions
+      : capability === "textToText"
+        ? settings?.textToTextModelOptions
+        : [];
+  return (options ?? []).some((model) => model.installed);
+}
+
+function translationModelOptionValue(model) {
+  return `${model.capability}::${model.variantID ?? ""}`;
+}
+
+function selectedTranslationModelValue() {
+  const method = state?.options?.translationModelMethod ?? "textToText";
+  const settings = state?.globalSettings;
+  const variantID = method === "textToText"
+    ? settings?.textToTextModelVariant
+    : settings?.imageToTextModelVariant;
+  const models = availableTranslationModels();
+  const exact = models.find(
+    (model) => model.capability === method && model.variantID === variantID
+  );
+  const sameMethod = models.find((model) => model.capability === method);
+  return translationModelOptionValue(exact ?? sameMethod ?? models[0] ?? {
+    capability: "",
+    variantID: null,
+  });
+}
+
+function parsedTranslationModelSelection() {
+  const [capability = "", variantID = ""] = elements.translationModelMethod.value.split("::", 2);
+  return { capability, variantID: variantID || null };
 }
 
 function workflowStepForPage(page) {
@@ -352,6 +485,16 @@ function hasWorkflowStepData(page, step) {
   return true;
 }
 
+function hasTranslationPreview(page) {
+  return Boolean(page?.translationPreviewURL || page?.outputPreviewURL);
+}
+
+function incompleteTranslationRegionCount(pages) {
+  return pages.reduce((count, page) => count + (page.regions ?? []).filter((region) => (
+    !region.sourceText?.trim() || !region.translatedText?.trim()
+  )).length, 0);
+}
+
 function calculationStepLabel(operation) {
   const key = operationLabelKeys[operation];
   return key ? t(key) : operation;
@@ -395,11 +538,16 @@ function openCalculationDialog(operation, pageIDs) {
     jobID: null,
     started: false,
     startedAt: Date.now(),
+    reasoningExpanded: true,
+    reasoningGenerationID: null,
+    renderedReasoningText: null,
+    initialReasoningID: state?.modelReasoningStream?.id?.toLowerCase() ?? null,
   };
   elements.calculationTitle.textContent = t("calculatingStep", { step });
   elements.calculationMessage.textContent = t("preparingCalculation");
   elements.calculationProgress.value = 0;
   elements.calculationCancel.disabled = false;
+  renderCalculationReasoning();
   startCalculationElapsedTimer();
   if (!elements.calculationDialog.open) elements.calculationDialog.showModal();
 }
@@ -407,6 +555,9 @@ function openCalculationDialog(operation, pageIDs) {
 function closeCalculationDialog() {
   stopCalculationElapsedTimer();
   calculationDialogState = null;
+  elements.calculationReasoning.hidden = true;
+  elements.calculationReasoningToggle.hidden = true;
+  elements.calculationDialog.classList.remove("reasoning-visible");
   if (elements.calculationDialog.open) elements.calculationDialog.close();
 }
 
@@ -467,8 +618,51 @@ function stopRegionUpdateTimers() {
   }
 }
 
+function renderCalculationReasoning() {
+  const enabled = Boolean(
+    calculationDialogState && state?.globalSettings?.modelThinkingEnabled
+  );
+  elements.calculationReasoningToggle.hidden = !enabled;
+  elements.calculationDialog.classList.toggle("reasoning-visible", enabled);
+  if (!enabled) {
+    elements.calculationReasoning.hidden = true;
+    return;
+  }
+
+  const expanded = calculationDialogState.reasoningExpanded !== false;
+  elements.calculationReasoningToggle.setAttribute("aria-expanded", String(expanded));
+  elements.calculationReasoningToggle.querySelector("span").textContent = t(
+    expanded ? "collapseReasoning" : "expandReasoning"
+  );
+  elements.calculationReasoning.hidden = !expanded;
+
+  const stream = state?.modelReasoningStream;
+  const streamID = stream?.id?.toLowerCase() ?? null;
+  const isNewGeneration = streamID
+    && streamID !== calculationDialogState.initialReasoningID
+    && streamID !== calculationDialogState.reasoningGenerationID;
+  if (isNewGeneration || (stream?.isActive && streamID)) {
+    calculationDialogState.reasoningGenerationID = streamID;
+  }
+  const belongsToDialog = streamID
+    && streamID === calculationDialogState.reasoningGenerationID;
+  const text = belongsToDialog ? stream?.text ?? "" : "";
+  elements.calculationReasoningStatus.textContent = belongsToDialog
+    ? t(stream?.isActive ? "reasoningStreaming" : "reasoningComplete")
+    : t("reasoningWaiting");
+  if (calculationDialogState.renderedReasoningText !== text) {
+    calculationDialogState.renderedReasoningText = text;
+    elements.calculationReasoningContent.innerHTML = renderMarkdown(text);
+    if (expanded) {
+      elements.calculationReasoningContent.scrollTop =
+        elements.calculationReasoningContent.scrollHeight;
+    }
+  }
+}
+
 function renderCalculationDialog() {
   if (!calculationDialogState) return;
+  renderCalculationReasoning();
   updateCalculationElapsed();
   const step = calculationStepLabel(calculationDialogState.operation);
   elements.calculationTitle.textContent = t("calculatingStep", { step });
@@ -535,13 +729,17 @@ function renderCalculationDialog() {
     const regionProgressKeys = {
       detectingRegions: "activityDetectingRegionProgress",
       translatingRegions: "activityTranslatingRegionProgress",
+      reviewingTranslations: "activityReviewingTranslationProgress",
     };
     const regionProgressKey = regionProgressKeys[currentPage.processingActivity];
-    const activityKey = regionProgressKey && currentPage.processingRegionCount > 0
+    const hasCurrentRegion = currentPage.processingRegionCount > 0
+      && currentPage.processingRegionIndex > 0;
+    const activityKey = regionProgressKey && hasCurrentRegion
       ? regionProgressKey
       : activityLabelKey;
     if (activityKey === "activityDetectingRegionProgress"
-        || activityKey === "activityTranslatingRegionProgress") {
+        || activityKey === "activityTranslatingRegionProgress"
+        || activityKey === "activityReviewingTranslationProgress") {
       parameters.current = currentPage.processingRegionIndex ?? 0;
       parameters.total = currentPage.processingRegionCount;
     }
@@ -580,25 +778,29 @@ async function selectOrCalculateWorkflowStep(step, operation, force = false) {
     translate: "mask",
     compose: "translate",
   }[step];
+  const allowsIncompleteTranslation = step === "compose"
+    && prerequisiteStep === "translate"
+    && pages.every(hasTranslationPreview);
   if (prerequisiteStep
+      && !allowsIncompleteTranslation
       && pages.some((page) => !hasWorkflowStepData(page, prerequisiteStep))) {
     showError(new Error(t("completeCurrentStepFirst")));
     return;
+  }
+  if (step === "compose") {
+    const incompleteCount = incompleteTranslationRegionCount(pages);
+    if (incompleteCount > 0) {
+      await showNotice(
+        t("incompleteTranslationNoticeTitle"),
+        t("incompleteTranslationNoticeMessage", { count: incompleteCount }),
+        t("continueToOutputStep")
+      );
+    }
   }
   selectWorkflowStep(step);
   const pendingPages = force ? pages : pages.filter((page) => !hasWorkflowStepData(page, step));
   if (!pendingPages.length) return;
   const pageIDs = pendingPages.map((page) => page.id);
-  const hasImageToTextModel = state.loadedModels.some(
-    (model) => model.capability === "imageToText"
-  );
-  if (operation === "detectMasks" && !hasImageToTextModel) {
-    await showNotice(
-      t("manualMaskModeTitle"),
-      t("manualMaskModeMessage"),
-      t("enterManualMaskMode")
-    );
-  }
   if (operation === "compose") {
     await runBatch(operation, pageIDs);
     return;
@@ -612,7 +814,10 @@ function advanceWorkflowStep() {
     showError(new Error(t("selectAtLeastOnePage")));
     return Promise.resolve();
   }
+  const canLeaveIncompleteTranslation = activeWorkflowStep === "translate"
+    && pages.every(hasTranslationPreview);
   if (activeWorkflowStep !== "pages"
+      && !canLeaveIncompleteTranslation
       && pages.some((page) => !hasWorkflowStepData(page, activeWorkflowStep))) {
     showError(new Error(t("completeCurrentStepFirst")));
     return Promise.resolve();
@@ -635,13 +840,29 @@ async function runBatchWithCalculationDialog(
     showError(new Error(t("selectAtLeastOnePage")));
     return null;
   }
-  const hasImageToTextModel = state.loadedModels.some(
-    (model) => model.capability === "imageToText"
-  );
-  if (["fullPage", "extractText", "retranslate"].includes(operation) && !hasImageToTextModel) {
-    showError(new Error(t("vlmRequiredForDetection")));
+  const translationOperations = new Set(["translate", "retranslate", "fullPage"]);
+  const translationNeeded = translationOperations.has(operation) && pageIDs.some((pageID) => {
+    const page = state.pages.find((item) => item.id === pageID);
+    if (!page) return false;
+    if (operation === "fullPage" && !page.maskAppliedPreviewURL) return true;
+    if (!page.regions?.length) return false;
+    return forceRecalculation || page.regions.some(
+      (region) => !region.sourceText?.trim() || !region.translatedText?.trim()
+    );
+  });
+  if (translationNeeded && availableTranslationModels().length === 0) {
+    await showNotice(
+      t("translationModelRequiredTitle"),
+      t("translationModelRequired"),
+      t("openTextToTextModels")
+    );
+    showSettingsPage("models");
+    showModelTab("textToText");
+    elements.settingsDialog.showModal();
     return null;
   }
+  // VLM 門檻由 native workflow 依每頁實際產物判斷。純 OCR 抽字與
+  // 已有譯文的重排不應因為沒有 imageToText 模型而被前端擋下。
   openCalculationDialog(operation, pageIDs);
   const result = await runBatch(operation, pageIDs, forceRecalculation);
   if (!result?.jobID) {
@@ -659,11 +880,15 @@ async function runRegionExtractionWithCalculationDialog(pageID, regionID) {
   if (state.isProcessing) return null;
   await flushPendingRegionUpdates();
   if (state.isProcessing) return null;
-  const hasImageToTextModel = state.loadedModels.some(
-    (model) => model.capability === "imageToText"
-  );
-  if (!hasImageToTextModel) {
-    showError(new Error(t("vlmRequiredForDetection")));
+  if (availableTranslationModels().length === 0) {
+    await showNotice(
+      t("translationModelRequiredTitle"),
+      t("translationModelRequired"),
+      t("openTextToTextModels")
+    );
+    showSettingsPage("models");
+    showModelTab("textToText");
+    elements.settingsDialog.showModal();
     return null;
   }
   openCalculationDialog("extractRegion", [pageID]);
@@ -715,6 +940,56 @@ function makeIconButton(icon, label, className, click) {
   item.title = label;
   item.setAttribute("aria-label", label);
   return item;
+}
+
+function openViewportAnchoredColorPicker(input, anchor) {
+  if (activeViewportColorInput && activeViewportColorInput !== input) {
+    activeViewportColorInput.remove();
+  }
+  const bounds = anchor.getBoundingClientRect();
+  input.className = "viewport-color-picker-proxy";
+  input.tabIndex = -1;
+  input.setAttribute("aria-hidden", "true");
+  input.style.left = `${bounds.left}px`;
+  input.style.top = `${bounds.top}px`;
+  input.style.width = `${bounds.width}px`;
+  input.style.height = `${bounds.height}px`;
+  document.body.append(input);
+  activeViewportColorInput = input;
+
+  input.onchange = () => {
+    // 等 WebKit 完成原生色盤的 change dispatch 再移除錨點，避免泡泡在
+    // 關閉前瞬間跳回可捲動側欄的文件座標。
+    setTimeout(() => {
+      if (activeViewportColorInput === input) activeViewportColorInput = null;
+      input.remove();
+    }, 0);
+  };
+  // 強制 WebKit 在 show picker 前提交 fixed frame，原生泡泡才會使用目前
+  // viewport 座標，而不是側欄捲動前的文件座標。
+  input.getBoundingClientRect();
+  input.click();
+}
+
+function makeRegionColorButton(input, label) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "region-color-picker-button";
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  const swatch = document.createElement("span");
+  swatch.className = "region-color-swatch";
+  swatch.setAttribute("aria-hidden", "true");
+  const renderSwatch = () => swatch.style.setProperty("--region-color", input.value);
+  renderSwatch();
+  input.addEventListener("input", renderSwatch);
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (button.disabled) return;
+    openViewportAnchoredColorPicker(input, button);
+  });
+  button.append(swatch);
+  return button;
 }
 
 function requestConfirmation(title, message, confirmLabel) {
@@ -773,6 +1048,38 @@ function renderAvailableUpdateDialog() {
   elements.updateReleaseName.textContent = update.name || update.tag;
   elements.updateOpenRelease.dataset.url = update.releaseURL;
   elements.updateDialog.showModal();
+}
+
+function renderManualUpdateCheck() {
+  const check = state?.updateCheck;
+  const checking = check?.phase === "checking";
+  elements.aboutCheckUpdates.disabled = checking;
+  elements.aboutCheckUpdates.setAttribute("aria-busy", String(checking));
+  elements.aboutCheckUpdatesLabel.textContent = t(
+    checking ? "checkingForUpdates" : "checkForUpdates"
+  );
+
+  let status = "";
+  if (checking) {
+    status = t("checkingForUpdates");
+  } else if (check?.phase === "upToDate") {
+    status = t("updateCheckUpToDate", { version: state.globalSettings.appVersion });
+  } else if (check?.phase === "updateAvailable") {
+    status = t("updateCheckAvailable", {
+      version: updateDisplayVersion(state.availableUpdate),
+    });
+  } else if (check?.phase === "failed") {
+    status = t("updateCheckFailed");
+  }
+  elements.aboutUpdateStatus.textContent = status;
+  elements.aboutUpdateStatus.hidden = !status;
+
+  if (!check?.id || checking || check.id === lastHandledUpdateCheckID) return;
+  lastHandledUpdateCheckID = check.id;
+  if (check.phase === "updateAvailable" && state.availableUpdate?.tag) {
+    // 手動檢查必須能再次顯示曾被「稍後」關閉的同一版本。
+    presentedUpdateTags.delete(state.availableUpdate.tag);
+  }
 }
 
 function requestPageName(page) {
@@ -1208,11 +1515,13 @@ function renderModels() {
   }
   for (const model of state.loadedModels) {
     const item = document.createElement("li");
-    const capability = model.capability === "imageToText"
-      ? t("imageToText")
-      : model.capability === "superResolution"
-        ? t("superResolutionLoaded")
-        : t("imageToImage");
+    const capability = model.capability === "textToText"
+      ? t("textToText")
+      : model.capability === "imageToText"
+        ? t("imageToText")
+        : model.capability === "superResolution"
+          ? t("superResolutionLoaded")
+          : t("imageToImage");
     item.textContent = `${capability} · ${model.displayName}`;
     elements.modelList.append(item);
   }
@@ -1315,7 +1624,8 @@ function renderRegions(page) {
     const translationMetadata = document.createElement("div");
     translationMetadata.className = "translation-quality-metadata";
     const metadataItems = [];
-    if (region.speakerID) metadataItems.push(`${t("translationSpeaker")}: ${region.speakerID}`);
+    // speakerID 仍保留在專案與 `.str` 供後續校稿，但目前辨識不夠準確，
+    // 不在文字區域卡片揭露，避免將模型的隨機 ID 誤當成角色資訊。
     if (region.tone) metadataItems.push(`${t("translationTone")}: ${region.tone}`);
     if (Number.isFinite(region.translationConfidence)) {
       metadataItems.push(`${t("translationConfidence")}: ${Math.round(region.translationConfidence * 100)}%`);
@@ -1398,6 +1708,8 @@ function renderRegions(page) {
     const textColor = document.createElement("input");
     textColor.type = "color";
     textColor.value = region.style.textColorHex ?? "#111111";
+    const textColorButton = makeRegionColorButton(textColor, t("textColor"));
+    textColorButton.disabled = state.isProcessing || regionUpdatesSuspended;
     const reextractButton = makeIconButton(
       "fa-arrows-rotate",
       t("reextractRegionText"),
@@ -1413,10 +1725,12 @@ function renderRegions(page) {
     reextractButton.disabled = state.isProcessing || activeWorkflowStep !== "translate";
     const textColorControl = document.createElement("div");
     textColorControl.className = "region-color-control";
-    textColorControl.append(textColor, reextractButton);
+    textColorControl.append(textColorButton, reextractButton);
     const strokeColor = document.createElement("input");
     strokeColor.type = "color";
     strokeColor.value = region.style.strokeColorHex ?? "#FFFFFF";
+    const strokeColorButton = makeRegionColorButton(strokeColor, t("strokeColor"));
+    strokeColorButton.disabled = state.isProcessing || regionUpdatesSuspended;
     const strokeWidth = document.createElement("input");
     strokeWidth.type = "range";
     strokeWidth.min = "0";
@@ -1456,7 +1770,7 @@ function renderRegions(page) {
     styleControls.append(
       makeStyleField("textAlignment", alignment),
       makeStyleField("textColor", textColorControl),
-      makeStyleField("strokeColor", strokeColor),
+      makeStyleField("strokeColor", strokeColorButton),
       makeStyleField("strokeWidth", strokeWidth, strokeOutput),
       makeStyleField("layerOpacity", opacity, opacityOutput),
       makeStyleField("layerRotation", rotation, rotationOutput),
@@ -2456,9 +2770,7 @@ function renderPage() {
   elements.emptyState.hidden = hasProject && Boolean(page);
   elements.workspace.hidden = !page;
   const outputStepActive = activeWorkflowStep === "compose";
-  const hasImageToTextModel = state.loadedModels.some(
-    (model) => model.capability === "imageToText"
-  );
+  const hasImageToTextModel = hasAvailableModelCapability("imageToText");
   const hasCalculatedOutput = Boolean(
     page?.maskPreviewURL
       || page?.maskAppliedPreviewURL
@@ -2477,20 +2789,23 @@ function renderPage() {
     || (activeWorkflowStep === "pages" && !hasCalculatedOutput);
   elements.reveal.disabled = outputStepActive
     ? !page?.outputPreviewURL
-    : !page || state.isProcessing || !hasImageToTextModel;
+    : !page || state.isProcessing;
   elements.exportPSD.hidden = !outputStepActive;
   elements.exportPSD.disabled = !outputStepActive || !page || state.isProcessing
     || !Boolean(page.outputPreviewURL || page.translationPreviewURL || page.maskAppliedPreviewURL);
-  const canRecalculateTranslation = Boolean(
-    page && activeWorkflowStep === "translate" && hasImageToTextModel
+  const canReextractText = Boolean(
+    page
+      && activeWorkflowStep === "translate"
+      && (state.options.textLocalizationMethod !== "vlm" || hasImageToTextModel)
   );
+  const canRetranslate = Boolean(page && activeWorkflowStep === "translate");
   elements.reextractText.hidden = !page || activeWorkflowStep !== "translate";
-  elements.reextractText.disabled = !canRecalculateTranslation || state.isProcessing;
+  // 「重新抽字」依專案選項走逐欄 OCR 或舊版 VLM 整區轉錄；
+  // 只有實際選擇 VLM 時才需要 imageToText 模型。
+  elements.reextractText.disabled = !canReextractText || state.isProcessing;
   elements.retranslate.hidden = !page || activeWorkflowStep !== "translate";
-  elements.retranslate.disabled = !canRecalculateTranslation || state.isProcessing;
-  const hasSuperResolutionModel = state.loadedModels.some(
-    (model) => model.capability === "superResolution"
-  );
+  elements.retranslate.disabled = !canRetranslate || state.isProcessing;
+  const hasSuperResolutionModel = hasAvailableModelCapability("superResolution");
   elements.superResolution.hidden = !page || activeWorkflowStep !== "translate";
   elements.superResolution.disabled = !page?.maskAppliedPreviewURL
     || state.isProcessing
@@ -2637,6 +2952,60 @@ function renderSettings() {
   for (const option of elements.fontNameList.querySelectorAll(".font-preview-option")) {
     option.setAttribute("aria-selected", String(option.dataset.fontName === selectedFont));
   }
+  const selectedLocalizationMethod = options.textLocalizationMethod ?? "ppocrv6MediumDet";
+  const localizationOptions = [];
+  const ppocrOption = document.createElement("option");
+  ppocrOption.value = "ppocrv6MediumDet";
+  ppocrOption.textContent = "PP-OCRv6 Medium Det + Rec";
+  localizationOptions.push(ppocrOption);
+  const availableVLMs = availableTextLocalizationVLMs();
+  const selectedImageToTextVariant = state.globalSettings?.imageToTextModelVariant;
+  for (const model of availableVLMs) {
+    const vlmOption = document.createElement("option");
+    vlmOption.value = "vlm";
+    vlmOption.dataset.modelVariantID = model.variantID ?? "";
+    vlmOption.textContent = `${model.displayName} · VLM`;
+    vlmOption.selected = model.variantID === selectedImageToTextVariant;
+    localizationOptions.push(vlmOption);
+  }
+  if (availableVLMs.length === 0 && selectedLocalizationMethod === "vlm") {
+    // 保留舊專案的選擇，讓使用者看得出目前缺少模型並可切回 PP-OCRv6。
+    const unavailableVLMOption = document.createElement("option");
+    unavailableVLMOption.value = "vlm";
+    unavailableVLMOption.textContent = t("vlmLocalizationUnavailable");
+    unavailableVLMOption.disabled = true;
+    localizationOptions.push(unavailableVLMOption);
+  }
+  elements.textLocalizationMethod.replaceChildren(...localizationOptions);
+  elements.textLocalizationMethod.value = selectedLocalizationMethod;
+  if (selectedLocalizationMethod === "vlm") {
+    const selectedOption = localizationOptions.find(
+      (option) => option.dataset.modelVariantID === selectedImageToTextVariant
+    );
+    if (selectedOption) selectedOption.selected = true;
+  }
+  // 翻譯選單顯示所有已下載的模型版本；runtime 只會載入目前選取的版本，
+  // 因此不能以 state.loadedModels（每種 capability 最多一個）作為唯一來源。
+  const translationModels = availableTranslationModels();
+  const translationOptions = translationModels.map((model) => {
+    const option = document.createElement("option");
+    option.value = translationModelOptionValue(model);
+    option.textContent = `${model.displayName} · ${t(
+      model.capability === "textToText" ? "modelTabTextToText" : "modelTabImageToText"
+    )}`;
+    return option;
+  });
+  if (!translationOptions.length) {
+    const unavailable = document.createElement("option");
+    unavailable.value = "";
+    unavailable.textContent = t("translationModelNotLoaded");
+    unavailable.disabled = true;
+    translationOptions.push(unavailable);
+  }
+  elements.translationModelMethod.replaceChildren(...translationOptions);
+  elements.translationModelMethod.value = translationModels.length
+    ? selectedTranslationModelValue()
+    : "";
   const quality = options.translationQuality ?? {};
   elements.translationPageContext.checked = quality.usePageContext ?? true;
   elements.translationReviewPass.checked = quality.reviewPassEnabled ?? false;
@@ -2653,6 +3022,8 @@ function renderSettings() {
     elements.readingDirection,
     elements.writingDirection,
     elements.fontName,
+    elements.textLocalizationMethod,
+    elements.translationModelMethod,
     elements.translationPageContext,
     elements.translationReviewPass,
     elements.translationQualityCheck,
@@ -2662,6 +3033,10 @@ function renderSettings() {
   ]) {
     control.disabled = !state.activeProjectID;
   }
+  elements.textLocalizationMethod.disabled = !state.activeProjectID || state.isProcessing;
+  elements.translationModelMethod.disabled = !state.activeProjectID
+    || state.isProcessing
+    || !translationModels.length;
   elements.eraseColorTrigger.disabled = !state.activeProjectID;
   elements.eraseColorEyedropper.disabled = activeWorkflowStep !== "pages"
     || !activePage()
@@ -2742,9 +3117,13 @@ function globalSettingsPayload(overrides = {}) {
     imageCompositingBackend: current.imageCompositingBackend,
     dataDirectoryPath: current.dataDirectoryPath,
     defaultOutputDirectoryPath: current.defaultOutputDirectoryPath,
+    textToTextModelPath: current.textToTextModelPath,
+    textToTextModelDownloadDirectoryPath: current.textToTextModelDownloadDirectoryPath,
+    textToTextModelVariant: current.textToTextModelVariant,
     imageToTextModelPath: current.imageToTextModelPath,
     imageToTextModelDownloadDirectoryPath: current.imageToTextModelDownloadDirectoryPath,
     imageToTextModelVariant: current.imageToTextModelVariant,
+    modelThinkingEnabled: current.modelThinkingEnabled,
     imageToImageModelPath: current.imageToImageModelPath,
     automaticSuperResolutionEnabled: current.automaticSuperResolutionEnabled,
     superResolutionModelPath: current.superResolutionModelPath,
@@ -2811,7 +3190,68 @@ function renderGlobalSettings() {
   elements.settingsImageCompositingBackend.value = settings.imageCompositingBackend;
   elements.settingsDataDirectory.value = settings.configuredDataDirectoryPath ?? "";
   elements.settingsDefaultOutputDirectory.value = settings.defaultOutputDirectoryPath ?? "";
+  elements.settingsModelThinking.checked = settings.modelThinkingEnabled ?? false;
+  elements.settingsModelThinking.disabled = state.isProcessing;
   elements.dataDirectoryRestartNote.hidden = !settings.dataDirectoryRestartRequired;
+  elements.settingsTextToTextModel.value = settings.textToTextModelDownloadDirectoryPath ?? "";
+  const textToTextOptions = settings.textToTextModelOptions ?? [];
+  const textToTextSignature = textToTextOptions.map((model) => [
+    model.id,
+    model.displayName,
+    model.recommended,
+    model.installed,
+    t("recommended"),
+    t("modelDownloaded"),
+  ].join(":" )).join("\n");
+  if (elements.settingsTextToTextModelVariant.dataset.optionsSignature !== textToTextSignature) {
+    elements.settingsTextToTextModelVariant.replaceChildren(...textToTextOptions.map((model) => {
+      const option = document.createElement("option");
+      option.value = model.id;
+      const annotations = [];
+      if (model.recommended) annotations.push(t("recommended"));
+      if (model.installed) annotations.push(t("modelDownloaded"));
+      option.textContent = annotations.length > 0
+        ? `${model.displayName}（${annotations.join(" · ")}）`
+        : model.displayName;
+      return option;
+    }));
+    elements.settingsTextToTextModelVariant.dataset.optionsSignature = textToTextSignature;
+  }
+  elements.settingsTextToTextModelVariant.value = settings.textToTextModelVariant;
+  const textToTextDownload = settings.modelDownloadState?.capability === "textToText"
+    ? settings.modelDownloadState
+    : null;
+  const textToTextDownloading = Boolean(textToTextDownload);
+  const textToTextDirectorySelected = Boolean(settings.textToTextModelDownloadDirectoryPath);
+  elements.settingsTextToTextModelDownload.disabled = !textToTextDirectorySelected
+    || settings.textToTextModelInstalled
+    || textToTextDownloading;
+  elements.settingsTextToTextModelDownload.textContent = settings.textToTextModelInstalled
+    ? t("modelInstalled")
+    : textToTextDownloading ? t("downloadingModel") : t("downloadModel");
+  elements.settingsTextToTextModelVariant.disabled = textToTextDownloading;
+  elements.settingsTextToTextModelClear.disabled = !textToTextDownloading
+    && !settings.textToTextModelDownloadDirectoryPath
+    && !settings.textToTextModelPath;
+  elements.settingsTextToTextModelClear.textContent = textToTextDownloading
+    ? t("stopDownload") : t("clear");
+  elements.settingsTextToTextModelClear.classList.toggle("danger-text", textToTextDownloading);
+  elements.settingsTextToTextModelDelete.hidden = !settings.textToTextModelInstalled;
+  elements.settingsTextToTextModelDelete.disabled = textToTextDownloading || state.isProcessing;
+  elements.settingsTextToTextModelDownloadProgress.hidden = !textToTextDownloading;
+  if (textToTextDownload) {
+    const progress = Math.round(textToTextDownload.progress * 100);
+    elements.settingsTextToTextModelDownloadProgressBar.value = textToTextDownload.progress;
+    elements.settingsTextToTextModelDownloadStatus.textContent = textToTextDownload.totalByteCount > 0
+      ? t("modelDownloadProgressDetail", {
+          progress,
+          downloaded: formatByteCount(textToTextDownload.downloadedByteCount),
+          total: formatByteCount(textToTextDownload.totalByteCount),
+          speed: textToTextDownload.bytesPerSecond > 0
+            ? formatByteCount(textToTextDownload.bytesPerSecond) : "—",
+        })
+      : t("modelDownloadProgress", { progress });
+  }
   elements.settingsImageToTextModel.value = settings.imageToTextModelDownloadDirectoryPath ?? "";
   const modelOptions = settings.imageToTextModelOptions ?? [];
   const modelOptionsSignature = modelOptions
@@ -2946,6 +3386,7 @@ function renderGlobalSettings() {
     elements.settingsMCPPort.value = String(settings.mcpPort);
   }
   elements.settingsAppVersion.textContent = settings.appVersion;
+  renderManualUpdateCheck();
   renderMCPWhitelist(settings);
 }
 
@@ -3155,12 +3596,113 @@ function render(nextState) {
   renderCalculationDialog();
   renderAvailableUpdateDialog();
   renderSelectionSummary();
+  renderSystemMetrics();
   elements.cancel.disabled = !state.isProcessing;
   elements.status.textContent = state.statusMessage || t("ready");
 }
 
+/// GPU／MEMORY 與 THINK 串流會高頻更新；只修改對應節點，不呼叫
+/// renderPage() 或 renderSettings()，才不會重建使用者正在操作的輸入與拖曳元件。
+function renderTransientState(nextState) {
+  if (!state || !nextState) return;
+  if (nextState.systemMetrics) state.systemMetrics = nextState.systemMetrics;
+  if (nextState.modelReasoningStream) {
+    state.modelReasoningStream = nextState.modelReasoningStream;
+  }
+  renderSystemMetrics();
+  if (calculationDialogState) renderCalculationReasoning();
+}
+
+function renderSystemMetrics() {
+  const metrics = state?.systemMetrics ?? {};
+  const format = (value) => Number.isFinite(value)
+    ? String(Math.round(Math.min(1, Math.max(0, value)) * 100)) + "%"
+    : "--";
+  elements.gpuUsage.textContent = format(metrics.gpuUsage);
+  elements.memoryUsage.textContent = format(metrics.ramUsage);
+  elements.systemMetrics.classList.toggle(
+    "metrics-high",
+    [metrics.gpuUsage, metrics.ramUsage].some(
+      (value) => Number.isFinite(value) && value >= 0.8
+    )
+  );
+}
+
 function showError(error) {
-  elements.status.textContent = error.message;
+  const message = error?.message ?? String(error);
+  elements.status.textContent = message;
+  if (!String(message).includes("bridge unavailable")) {
+    invoke("appendApplicationLog", {
+      level: "error",
+      category: "WebUI",
+      message,
+    }).catch(() => {});
+  }
+}
+
+function renderApplicationLogs(entries) {
+  const logs = Array.isArray(entries) ? entries : [];
+  const stickToBottom = elements.logList.hidden
+    || elements.logList.scrollHeight - elements.logList.scrollTop - elements.logList.clientHeight < 32;
+  elements.logEntryCount.textContent = t("applicationLogCount", { count: logs.length });
+  elements.logEmpty.hidden = logs.length > 0;
+  elements.logList.hidden = logs.length === 0;
+  elements.logList.replaceChildren(...logs.map((entry) => {
+    const row = document.createElement("article");
+    const level = ["debug", "info", "warning", "error"].includes(entry.level)
+      ? entry.level
+      : "debug";
+    row.className = `log-entry level-${level}`;
+
+    const timestamp = document.createElement("time");
+    const date = new Date(entry.timestamp);
+    timestamp.dateTime = Number.isNaN(date.getTime()) ? "" : date.toISOString();
+    timestamp.textContent = Number.isNaN(date.getTime())
+      ? "--:--:--"
+      : new Intl.DateTimeFormat(resolvedInterfaceLanguage(), {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          fractionalSecondDigits: 3,
+          hour12: false,
+        }).format(date);
+
+    const levelElement = document.createElement("span");
+    levelElement.className = "log-entry-level";
+    levelElement.textContent = level.toUpperCase();
+    const category = document.createElement("span");
+    category.className = "log-entry-category";
+    category.textContent = entry.category || "App";
+    const message = document.createElement("span");
+    message.className = "log-entry-message";
+    message.textContent = entry.message || "";
+    row.append(timestamp, levelElement, category, message);
+    return row;
+  }));
+  if (stickToBottom && logs.length) {
+    requestAnimationFrame(() => {
+      elements.logList.scrollTop = elements.logList.scrollHeight;
+    });
+  }
+}
+
+async function refreshApplicationLogs() {
+  const entries = await invoke("getApplicationLogs");
+  renderApplicationLogs(entries);
+}
+
+function stopLogRefresh() {
+  if (logRefreshTimer !== null) clearInterval(logRefreshTimer);
+  logRefreshTimer = null;
+}
+
+async function openApplicationLog() {
+  if (!elements.logDialog.open) elements.logDialog.showModal();
+  await refreshApplicationLogs();
+  stopLogRefresh();
+  logRefreshTimer = setInterval(() => {
+    refreshApplicationLogs().catch(showError);
+  }, 1_500);
 }
 
 function syncNativeInterfaceLanguage() {
@@ -3207,6 +3749,15 @@ async function choosePreferenceDirectory(method, overrides) {
 function updateSettings() {
   const previousDefaultFont = state?.options.defaultStyle.fontName;
   const nextDefaultFont = elements.fontName.value;
+  const previousLocalizationMethod = state?.options.textLocalizationMethod ?? "ppocrv6MediumDet";
+  const nextLocalizationMethod = elements.textLocalizationMethod.value || "ppocrv6MediumDet";
+  const selectedLocalizationOption = elements.textLocalizationMethod.selectedOptions[0];
+  const selectedImageToTextVariant = nextLocalizationMethod === "vlm"
+    ? selectedLocalizationOption?.dataset.modelVariantID || null
+    : null;
+  const previousTranslationMethod = state?.options.translationModelMethod ?? "textToText";
+  const selectedTranslation = parsedTranslationModelSelection();
+  const nextTranslationMethod = selectedTranslation.capability || previousTranslationMethod;
   const previousRegionFonts = [];
   elements.fontName.style.fontFamily = elements.fontName.value;
   elements.fontNameValue.textContent = elements.fontName.value;
@@ -3222,11 +3773,19 @@ function updateSettings() {
     }
     renderTranslationLayer(activePage());
   }
-  return invoke("updateSettings", {
+  if (state) state.options.textLocalizationMethod = nextLocalizationMethod;
+  if (state) state.options.translationModelMethod = nextTranslationMethod;
+  const persistLocalizationModel = selectedImageToTextVariant
+    && selectedImageToTextVariant !== state?.globalSettings?.imageToTextModelVariant
+    ? updateGlobalSettings({ imageToTextModelVariant: selectedImageToTextVariant })
+    : Promise.resolve(true);
+  return persistLocalizationModel.then(() => invoke("updateSettings", {
     targetLanguageCode: elements.targetLanguage.value,
     readingDirection: elements.readingDirection.value,
     writingDirection: elements.writingDirection.value,
     fontName: elements.fontName.value,
+    textLocalizationMethod: nextLocalizationMethod,
+    translationModelMethod: nextTranslationMethod,
     eraseColorHex: elements.eraseColor.value,
     translationQuality: {
       usePageContext: elements.translationPageContext.checked,
@@ -3237,15 +3796,32 @@ function updateSettings() {
       styleGuide: elements.translationStyleGuide.value,
     },
     useImageToImageRestoration: false,
-  }).catch((error) => {
+    imageToTextModelVariant: selectedImageToTextVariant,
+  })).catch((error) => {
+    if (state) state.options.textLocalizationMethod = previousLocalizationMethod;
+    if (state) state.options.translationModelMethod = previousTranslationMethod;
     if (state && previousDefaultFont !== nextDefaultFont) {
       state.options.defaultStyle.fontName = previousDefaultFont;
       for (const [region, fontName] of previousRegionFonts) region.style.fontName = fontName;
       renderTranslationLayer(activePage());
-      renderSettings();
     }
+    if (state) renderSettings();
     showError(error);
   });
+}
+
+async function handleTranslationModelChange() {
+  const selected = parsedTranslationModelSelection();
+  if (!selected.capability) return;
+  const variantKey = selected.capability === "textToText"
+    ? "textToTextModelVariant"
+    : "imageToTextModelVariant";
+  // 手動載入且不在下載目錄 catalog 的模型沒有 variant ID，只需切換流程類型。
+  if (selected.variantID) {
+    const updated = await updateGlobalSettings({ [variantKey]: selected.variantID });
+    if (!updated) return;
+  }
+  await updateSettings();
 }
 
 function closeFontPreviewList() {
@@ -3364,6 +3940,16 @@ function addGlossaryEntry() {
 
 document.querySelector("#import-pages").addEventListener("click", () => invoke("chooseSourceDirectory").catch(showError));
 elements.deleteProject.addEventListener("click", () => deleteActiveProject().catch(showError));
+elements.openLog.addEventListener("click", () => openApplicationLog().catch(showError));
+elements.refreshLog.addEventListener("click", () => refreshApplicationLogs().catch(showError));
+elements.clearLog.addEventListener("click", async () => {
+  await invoke("clearApplicationLogs");
+  await refreshApplicationLogs();
+});
+for (const closeButton of [elements.closeLog, elements.closeLogIcon]) {
+  closeButton.addEventListener("click", () => elements.logDialog.close());
+}
+elements.logDialog.addEventListener("close", stopLogRefresh);
 document.querySelector("#open-settings").addEventListener("click", () => {
   showSettingsPage("general");
   elements.settingsDialog.showModal();
@@ -3394,12 +3980,27 @@ elements.updateOpenRelease.addEventListener("click", async () => {
     showError(error);
   }
 });
+for (const link of [elements.aboutGitHubLink, elements.aboutReleasesLink]) {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    invoke("openExternalURL", { url: link.href }).catch(showError);
+  });
+}
+elements.aboutCheckUpdates.addEventListener("click", () => {
+  if (elements.aboutCheckUpdates.disabled) return;
+  invoke("checkForUpdates").catch(showError);
+});
 elements.calculationCancel.addEventListener("click", () => {
   elements.calculationCancel.disabled = true;
   closeCalculationDialog();
   invoke("cancelProcessing").catch((error) => {
     showError(error);
   });
+});
+elements.calculationReasoningToggle.addEventListener("click", () => {
+  if (!calculationDialogState) return;
+  calculationDialogState.reasoningExpanded = !calculationDialogState.reasoningExpanded;
+  renderCalculationReasoning();
 });
 for (const tab of document.querySelectorAll("[data-settings-tab]")) {
   tab.addEventListener("click", () => showSettingsPage(tab.dataset.settingsTab));
@@ -3537,7 +4138,7 @@ elements.workflowNext.addEventListener("click", () => {
 elements.superResolution.addEventListener("click", () => {
   const page = activePage();
   if (!page) return;
-  const hasModel = state.loadedModels.some((model) => model.capability === "superResolution");
+  const hasModel = hasAvailableModelCapability("superResolution");
   if (!hasModel) {
     showNotice(
       t("superResolutionModelRequiredTitle"),
@@ -3655,6 +4256,9 @@ elements.settingsSelectionColor.addEventListener("input", () => {
   document.documentElement.style.setProperty("--selection-color", value);
   updateGlobalSettings({ selectionColorHex: value });
 });
+elements.settingsModelThinking.addEventListener("change", () => {
+  updateGlobalSettings({ modelThinkingEnabled: elements.settingsModelThinking.checked });
+});
 elements.settingsImageCompositingBackend.addEventListener("change", () => {
   updateGlobalSettings({
     imageCompositingBackend: elements.settingsImageCompositingBackend.value,
@@ -3695,6 +4299,55 @@ document.querySelector("#choose-default-output-directory").addEventListener("cli
 });
 document.querySelector("#reset-default-output-directory").addEventListener("click", () => {
   updateGlobalSettings({ defaultOutputDirectoryPath: null });
+});
+document.querySelector("#choose-text-to-text-model").addEventListener("click", () => {
+  invoke("chooseModelDownloadDirectory", { capability: "textToText" })
+    .then((result) => {
+      if (!result?.path) return;
+      updateGlobalSettings({
+        textToTextModelDownloadDirectoryPath: result.path,
+        textToTextModelVariant: result.variant ?? state.globalSettings.textToTextModelVariant,
+      });
+    })
+    .catch(showError);
+});
+elements.settingsTextToTextModelVariant.addEventListener("change", () => {
+  updateGlobalSettings({
+    textToTextModelVariant: elements.settingsTextToTextModelVariant.value,
+  });
+});
+elements.settingsTextToTextModelDownload.addEventListener("click", () => {
+  invoke("downloadPreferredModel", {
+    capability: "textToText",
+    variantID: elements.settingsTextToTextModelVariant.value,
+  }).catch(showError);
+});
+elements.settingsTextToTextModelClear.addEventListener("click", () => {
+  if (state.globalSettings.modelDownloadState?.capability === "textToText") {
+    invoke("cancelModelDownload").catch(showError);
+    return;
+  }
+  updateGlobalSettings({
+    textToTextModelPath: null,
+    textToTextModelDownloadDirectoryPath: null,
+  });
+});
+elements.settingsTextToTextModelDelete.addEventListener("click", () => {
+  const settings = state.globalSettings;
+  if (!settings.textToTextModelInstalled) return;
+  const modelName = elements.settingsTextToTextModelVariant.selectedOptions[0]?.textContent
+    ?? settings.textToTextModelVariant;
+  requestConfirmation(
+    t("deleteInstalledModelTitle"),
+    t("deleteInstalledModelConfirmation", { name: modelName }),
+    t("delete")
+  ).then((confirmed) => {
+    if (!confirmed) return;
+    return invoke("deleteInstalledModel", {
+      capability: "textToText",
+      variantID: settings.textToTextModelVariant,
+    });
+  }).catch(showError);
 });
 document.querySelector("#choose-image-to-text-model").addEventListener("click", () => {
   invoke("chooseModelDownloadDirectory", { capability: "imageToText" })
@@ -3902,6 +4555,7 @@ for (const control of [
   elements.readingDirection,
   elements.writingDirection,
   elements.fontName,
+  elements.textLocalizationMethod,
   elements.useImageModel,
   elements.translationPageContext,
   elements.translationReviewPass,
@@ -3912,8 +4566,28 @@ for (const control of [
   control.addEventListener("change", updateSettings);
 }
 elements.translationStyleGuide.addEventListener("change", updateSettings);
+elements.translationModelMethod.addEventListener("change", () => {
+  handleTranslationModelChange().catch(showError);
+});
+
+window.addEventListener("error", (event) => {
+  invoke("appendApplicationLog", {
+    level: "error",
+    category: "WebUI",
+    message: `${event.message || "JavaScript error"}${event.filename ? ` · ${event.filename}:${event.lineno}` : ""}`,
+  }).catch(() => {});
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const message = event.reason?.message ?? String(event.reason ?? "Unhandled promise rejection");
+  invoke("appendApplicationLog", {
+    level: "error",
+    category: "WebUI",
+    message,
+  }).catch(() => {});
+});
 
 applyColorScheme(colorSchemeSetting());
 applyTranslations();
 onState(render);
+onTransientState(renderTransientState);
 invoke("bootstrap").catch(showError);
