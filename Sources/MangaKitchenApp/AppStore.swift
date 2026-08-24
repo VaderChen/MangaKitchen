@@ -75,6 +75,7 @@ final class AppStore: ObservableObject {
     /// 載入大型 MLX／Core ML 模型前的保守記憶體門檻。統一記憶體機種在
     /// 模型建立期間會短暫同時保留權重與工作 buffer，因此不能等到 100% 才清理。
     private static let modelLoadMemoryPressureThreshold = 0.80
+    private static let largeModelWeightThresholdBytes: UInt64 = 8 * 1_024 * 1_024 * 1_024
 
     init(
         dataDirectoryPath: String? = nil,
@@ -1306,9 +1307,31 @@ final class AppStore: ObservableObject {
         try? await Task.sleep(for: .milliseconds(120))
     }
 
-    private func shouldReleaseModelsBeforeLoad() -> Bool {
-        guard let usage = SystemMetricsReader.read().ramUsage else { return false }
-        return usage >= Self.modelLoadMemoryPressureThreshold
+    private func shouldReleaseModelsBeforeLoad(modelDirectoryURL: URL) -> Bool {
+        if let usage = SystemMetricsReader.read().ramUsage,
+           usage >= Self.modelLoadMemoryPressureThreshold {
+            return true
+        }
+
+        // Qwen3.8-27B 4-bit 等大型權重約 15 GiB。即使目前使用率尚未達 80%，
+        // 也先釋放其他 runtime，避免權重與 Metal 工作 buffer 疊加後才 OOM。
+        guard let enumerator = FileManager.default.enumerator(
+            at: modelDirectoryURL,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return false }
+        var totalWeightBytes: UInt64 = 0
+        for case let fileURL as URL in enumerator
+        where fileURL.pathExtension.lowercased() == "safetensors" {
+            guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let fileSize = values.fileSize else { continue }
+            totalWeightBytes += UInt64(max(fileSize, 0))
+            if totalWeightBytes >= Self.largeModelWeightThresholdBytes {
+                return true
+            }
+        }
+        return false
     }
 
     private func isLikelyMemoryLoadError(_ error: Error) -> Bool {
@@ -3261,6 +3284,10 @@ final class AppStore: ObservableObject {
         activeProjectCreatedAt = snapshot.createdAt
         var restoredOptions = snapshot.options
         restoredOptions.useImageToImageRestoration = false
+        // 舊專案會把當時的 `.center` 預設明確編碼；目前沒有可調整專案級
+        // 對齊預設的 UI，因此只遷移未來新建／重新偵測區域的預設值。
+        // 各既有 region 的明確對齊選擇保留不動。
+        restoredOptions.defaultStyle.textAlignment = .start
         let previousDefaultFont = restoredOptions.defaultStyle.fontName
         let normalizedDefaultFont = FontFamilyCatalog.normalizedFontName(
             previousDefaultFont,
@@ -3547,7 +3574,9 @@ final class AppStore: ObservableObject {
         statusMessage = "正在載入模型：\(displayName)…"
 
         do {
-            let shouldPrepareMemory = shouldReleaseModelsBeforeLoad()
+            let shouldPrepareMemory = shouldReleaseModelsBeforeLoad(
+                modelDirectoryURL: canonicalDirectoryURL
+            )
             if shouldPrepareMemory {
                 await releaseLoadedModelsForMemoryPressure(
                     models: models,

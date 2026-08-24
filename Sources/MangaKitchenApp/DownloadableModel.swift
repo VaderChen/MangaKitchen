@@ -53,6 +53,12 @@ enum DownloadableModelCatalog {
             capability: .imageToText
         ),
         DownloadableModelDescriptor(
+            id: "qwen3.8-27b-4bit",
+            displayName: "Qwen3.8-27B 4-bit (≈15 GB)",
+            repositoryID: "lmstudio-community/Qwen3.8-27B-MLX-4bit",
+            capability: .imageToText
+        ),
+        DownloadableModelDescriptor(
             id: "qwen3-vl-4b-4bit",
             displayName: "Qwen3-VL-4B 4-bit",
             repositoryID: "lmstudio-community/Qwen3-VL-4B-Instruct-MLX-4bit",

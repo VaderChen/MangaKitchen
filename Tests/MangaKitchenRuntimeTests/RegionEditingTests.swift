@@ -5,6 +5,16 @@ import MangaKitchenCore
 /// App 與 MCP 共用同一份「套用欄位 → 要不要重新精修」的判斷。
 /// 這些測試鎖住的就是那份判斷 —— 兩邊過去各有一份，漂移後同一張圖會得到不同遮罩。
 final class RegionEditingTests: XCTestCase {
+    func testDialogueStyleDefaultsToStartAlignment() throws {
+        XCTAssertEqual(DialogueStyle().textAlignment, .start)
+
+        let legacyStyle = try JSONDecoder().decode(
+            DialogueStyle.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertEqual(legacyStyle.textAlignment, .start)
+    }
+
     private func makeRegion() -> DialogueRegion {
         DialogueRegion(
             bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),

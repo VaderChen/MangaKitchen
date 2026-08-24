@@ -1702,7 +1702,7 @@ function renderRegions(page) {
       const option = document.createElement("option");
       option.value = value;
       option.textContent = t(labelKey);
-      option.selected = (region.style.textAlignment ?? "center") === value;
+      option.selected = (region.style.textAlignment ?? "start") === value;
       alignment.append(option);
     }
     const textColor = document.createElement("input");
@@ -2707,12 +2707,12 @@ function renderTranslationLayer(page) {
     text.style.fontSize = `${translationSourceFontSize(page, region) * resolutionScale}px`;
     text.style.fontWeight = region.style.fontWeight === "bold" ? "700" : "400";
     text.style.color = region.style.textColorHex;
-    text.style.textAlign = region.style.textAlignment ?? "center";
+    text.style.textAlign = region.style.textAlignment ?? "start";
     text.style.justifyContent = {
       start: "flex-start",
       end: "flex-end",
       center: "center",
-    }[region.style.textAlignment ?? "center"];
+    }[region.style.textAlignment ?? "start"];
     text.style.webkitTextStroke = `${Math.max(0, region.style.strokeWidth ?? 0) * resolutionScale}px ${region.style.strokeColorHex ?? "#FFFFFF"}`;
     text.style.paintOrder = "stroke fill";
     text.style.opacity = String(clamp(region.style.opacity ?? 1, 0, 1));

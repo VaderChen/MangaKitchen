@@ -169,7 +169,7 @@ public struct DialogueStyle: Codable, Hashable, Sendable {
         maximumFontSize: Double = 40,
         writingDirection: WritingDirection = .automatic,
         textColorHex: String = "#111111",
-        textAlignment: DialogueTextAlignment = .center,
+        textAlignment: DialogueTextAlignment = .start,
         strokeColorHex: String = "#FFFFFF",
         strokeWidth: Double = 0,
         opacity: Double = 1,
@@ -222,7 +222,7 @@ public struct DialogueStyle: Codable, Hashable, Sendable {
             fallback: "#111111"
         )
         textAlignment = try values.decodeIfPresent(DialogueTextAlignment.self, forKey: .textAlignment)
-            ?? .center
+            ?? .start
         strokeColorHex = Self.normalizedHexColor(
             try values.decodeIfPresent(String.self, forKey: .strokeColorHex) ?? "#FFFFFF",
             fallback: "#FFFFFF"

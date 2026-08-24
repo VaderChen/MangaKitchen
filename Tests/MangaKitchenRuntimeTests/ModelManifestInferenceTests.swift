@@ -32,6 +32,25 @@ final class ModelManifestInferenceTests: XCTestCase {
         XCTAssertEqual(manifest.backend, .mlxSwift)
     }
 
+    func testQwen38MultimodalModelIsInferredAsImageToText() throws {
+        let directory = try makeModelDirectory(config: [
+            "_name_or_path": "lmstudio-community/Qwen3.8-27B-MLX-4bit",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "vision_config": [
+                "model_type": "qwen3_5",
+                "hidden_size": 1152,
+                "out_hidden_size": 5120
+            ]
+        ])
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let manifest = try ModelManifest.load(from: directory)
+
+        XCTAssertEqual(manifest.capability, .imageToText)
+        XCTAssertEqual(manifest.backend, .mlxSwift)
+    }
+
     func testLoadedModelIdentityResolvesEquivalentSymlinkPaths() throws {
         let directory = try makeModelDirectory(config: [
             "_name_or_path": "mlx-community/Qwen3.5-4B-4bit",

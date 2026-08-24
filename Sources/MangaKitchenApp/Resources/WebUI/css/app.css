@@ -365,11 +365,11 @@ figcaption { margin-bottom: 7px; color: #c9cace; font-weight: 600; }
   z-index: 1;
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   padding: 3px;
   color: #111;
   line-height: 1.16;
-  text-align: center;
+  text-align: start;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   overflow: hidden;

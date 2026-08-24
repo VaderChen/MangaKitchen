@@ -88,11 +88,15 @@ actor MLXTextRuntime: TextGenerating {
         let container = try await loadContainer(progress: progress)
         try Task.checkCancellation()
         progress(0.48)
-        // Qwen3 的 chat template 在未指定時預設開啟 thinking。結構化翻譯不需要
-        // 思考內容，且小模型可能把整個 token 額度耗在 <think> 而沒有輸出 JSON。
+        // Qwen3 系列的 chat template 在未指定時預設開啟 thinking。結構化翻譯不需要
+        // 思考內容，且模型可能把整個 token 額度耗在 <think> 而沒有輸出 JSON；
+        // 使用者啟用時也只要求輕度思考。
         let input = UserInput(
             chat: [.user(trimmedPrompt)],
-            additionalContext: ["enable_thinking": thinkingEnabled]
+            additionalContext: [
+                "enable_thinking": thinkingEnabled,
+                "reasoning_effort": "low"
+            ]
         )
         let prepared = try await container.prepare(input: input)
         progress(0.55)

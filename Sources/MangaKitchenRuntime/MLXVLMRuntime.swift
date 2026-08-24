@@ -89,12 +89,15 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         try Task.checkCancellation()
         progress(0.48)
 
-        // Qwen3.5 的 chat template 預設會開啟 thinking，模型因而先輸出長篇
+        // Qwen3.5／3.8 的 chat template 預設會開啟 thinking，模型因而先輸出長篇
         // 分析文字而不是結構化 JSON。翻譯／OCR／定位都要求機器可解析回覆，
-        // 必須和純文字 runtime 一樣明確關閉 thinking。
+        // 必須和純文字 runtime 一樣明確控制 thinking；啟用時也只使用輕度思考。
         let input = UserInput(
             chat: [.user(prompt, images: [.url(preparedImage.url)])],
-            additionalContext: ["enable_thinking": thinkingEnabled]
+            additionalContext: [
+                "enable_thinking": thinkingEnabled,
+                "reasoning_effort": "low"
+            ]
         )
         let prepared = try await container.prepare(input: input)
         progress(0.55)

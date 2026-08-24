@@ -209,11 +209,11 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
               position: absolute;
               display: flex;
               align-items: center;
-              justify-content: center;
+              justify-content: flex-start;
               padding: 3px;
               color: #111;
               line-height: 1.16;
-              text-align: center;
+              text-align: start;
               white-space: pre-wrap;
               overflow-wrap: anywhere;
               overflow: hidden;
@@ -350,12 +350,12 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
                 element.style.fontSize = `${translationSourceFontSize(region)}px`;
                 element.style.fontWeight = region.style.fontWeight === "bold" ? "700" : "400";
                 element.style.color = region.style.textColorHex;
-                element.style.textAlign = region.style.textAlignment ?? "center";
+                element.style.textAlign = region.style.textAlignment ?? "start";
                 element.style.justifyContent = {
                   start: "flex-start",
                   end: "flex-end",
                   center: "center",
-                }[region.style.textAlignment ?? "center"];
+                }[region.style.textAlignment ?? "start"];
                 element.style.webkitTextStroke = `${Math.max(0, region.style.strokeWidth ?? 0) * renderScale}px ${region.style.strokeColorHex ?? "#FFFFFF"}`;
                 element.style.paintOrder = "stroke fill";
                 element.style.opacity = String(Math.min(1, Math.max(0, region.style.opacity ?? 1)));

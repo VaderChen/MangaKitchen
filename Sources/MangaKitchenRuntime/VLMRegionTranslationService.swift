@@ -218,12 +218,12 @@ public actor VLMRegionTranslationService: RegionTranslating {
             var translated = region
             if let item = reviewed[region.id], let rawDisplay = item.resolvedDisplayTranslation {
                 let display = Self.normalizedTranslation(
-                    rawDisplay,
+                    Self.removingEditorialAnnotations(rawDisplay),
                     targetLanguageCode: targetLanguageCode
                 )
                 let literal = item.literalTranslation.map {
                     Self.normalizedTranslation(
-                        $0.trimmingCharacters(in: .whitespacesAndNewlines),
+                        Self.removingEditorialAnnotations($0),
                         targetLanguageCode: targetLanguageCode
                     )
                 }
@@ -239,7 +239,10 @@ public actor VLMRegionTranslationService: RegionTranslating {
                 var flags = Set((item.qaFlags ?? []).compactMap(TranslationQAFlag.init(rawValue:)))
                 if qualityOptions.reviewPassEnabled,
                    drafts[region.id]?.resolvedDisplayTranslation.map({
-                       Self.normalizedTranslation($0, targetLanguageCode: targetLanguageCode)
+                       Self.normalizedTranslation(
+                           Self.removingEditorialAnnotations($0),
+                           targetLanguageCode: targetLanguageCode
+                       )
                    }) != display {
                     flags.insert(.reviewAdjusted)
                 }
@@ -435,6 +438,7 @@ public actor VLMRegionTranslationService: RegionTranslating {
         Keep the same speakerID for the same visible speaker. Use stable descriptive IDs when names are unknown.
         literalTranslation must preserve the complete meaning. displayTranslation must sound natural and fit
         approximateCharacterLimit without dropping plot facts, names, numbers, negation or emotional intent.
+        \(translationContentRule)
         Length strategy: \(qualityOptions.lengthMode.rawValue).
         Project style guide: \(qualityOptions.styleGuide.isEmpty ? "No additional style guide." : qualityOptions.styleGuide)
         Terminology is authoritative; whenever sourceTerm occurs, use preferredTranslation exactly:
@@ -470,6 +474,7 @@ public actor VLMRegionTranslationService: RegionTranslating {
         inconsistent speaker IDs, forms of address, register, tone and unnatural dialogue.
         Keep literalTranslation semantically complete. Make displayTranslation natural and concise for the balloon,
         but never shorten by deleting story information. Length strategy: \(qualityOptions.lengthMode.rawValue).
+        \(translationContentRule)
         Project style guide: \(qualityOptions.styleGuide.isEmpty ? "No additional style guide." : qualityOptions.styleGuide)
         Authoritative terminology:
         \(glossaryJSON)
@@ -479,6 +484,64 @@ public actor VLMRegionTranslationService: RegionTranslating {
         \(draftsJSON)
         Return only the complete corrected JSON array in the same shape as the drafts. Keep every UUID.
         """
+    }
+
+    private static let translationContentRule = """
+    Translation fields must contain only the words that will actually be printed in the comic.
+    Never prepend or append editorial annotations, role labels, speaker labels, delivery directions,
+    scene descriptions or content-type labels. Forbidden examples include 「主角驚呼」,
+    「旁白/內心獨白」, 「角色：…」, [Narrator], (inner monologue), "Speaker:", and "Tone:".
+    Put identity and delivery metadata only in speakerID and tone; never copy them into
+    literalTranslation or displayTranslation. Do not add explanations outside the JSON either.
+    """
+
+    /// 即使模型忽略 Prompt，也不能把編輯註記排進漫畫。只移除開頭、且內容
+    /// 明確符合角色／語氣／旁白 metadata 的括號標籤或冒號標籤；一般引號正文保留。
+    static func removingEditorialAnnotations(_ text: String) -> String {
+        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bracketPairs: [Character: Character] = [
+            "「": "」", "『": "』", "【": "】", "[": "]", "（": "）", "(": ")"
+        ]
+
+        for _ in 0..<3 {
+            guard let opening = value.first,
+                  let closing = bracketPairs[opening] else { break }
+            let contentStart = value.index(after: value.startIndex)
+            guard let closingIndex = value[contentStart...].firstIndex(of: closing) else { break }
+            let annotation = String(value[contentStart..<closingIndex])
+            guard annotation.count <= 48, isEditorialAnnotation(annotation) else { break }
+            value = String(value[value.index(after: closingIndex)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            while let first = value.first, "：:-—–".contains(first) {
+                value.removeFirst()
+                value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        if let separator = value.firstIndex(where: { $0 == ":" || $0 == "：" }),
+           value.distance(from: value.startIndex, to: separator) <= 48 {
+            let annotation = String(value[..<separator])
+            if isEditorialAnnotation(annotation) {
+                value = String(value[value.index(after: separator)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return value
+    }
+
+    private static func isEditorialAnnotation(_ text: String) -> Bool {
+        let normalized = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let keywords = [
+            "主角", "男主", "女主", "角色", "旁白", "內心", "内心", "獨白", "独白",
+            "心聲", "心声", "驚呼", "惊呼", "喊道", "大喊", "小聲", "小声", "低語", "低语",
+            "語氣", "语气", "主人公", "ナレーション", "モノローグ", "心の声", "叫ぶ",
+            "주인공", "내레이션", "독백", "속마음", "narrator", "narration", "protagonist",
+            "inner monologue", "inner thought", "speaker", "character", "tone", "exclaims",
+            "shouts", "whispers", "caption"
+        ]
+        return keywords.contains { normalized.contains($0) }
     }
 
     /// 模型即使收到 zh-Hant 仍可能混入簡體字；以 Foundation／ICU 在寫入專案前

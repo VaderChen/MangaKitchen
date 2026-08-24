@@ -120,6 +120,48 @@ final class TargetLanguageSafetyTests: XCTestCase {
         )
     }
 
+    func testTranslationRejectsEditorialAnnotationsButPreservesRealQuotation() async throws {
+        let regionID = UUID(uuidString: "00000000-0000-0000-0000-000000000124")!
+        let model = StubTranslationModel(response: """
+        [{"id":"\(regionID.uuidString)","literalTranslation":"「旁白/內心獨白」這裡是故鄉。","displayTranslation":"「主角驚呼」……唔……好臭！","speakerID":"hero","tone":"驚訝","confidence":0.9,"qaFlags":[]}]
+        """)
+        let service = VLMRegionTranslationService(model: model)
+        let region = DialogueRegion(
+            id: regionID,
+            bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+            sourceText: "故郷だ。うっ……くさい！",
+            confidence: 1
+        )
+
+        let translated = try await service.translate(
+            regions: [region],
+            pageURL: URL(fileURLWithPath: "/tmp/unused.png"),
+            targetLanguageCode: "zh-Hant",
+            glossaryTerms: [],
+            readingDirection: .rightToLeft,
+            qualityOptions: TranslationQualityOptions(
+                reviewPassEnabled: false,
+                qualityCheckEnabled: false
+            ),
+            regionProgress: { _, _ in },
+            progress: { _ in }
+        )
+
+        XCTAssertEqual(translated.first?.literalTranslatedText, "這裡是故鄉。")
+        XCTAssertEqual(translated.first?.translatedText, "……唔……好臭！")
+        XCTAssertEqual(
+            VLMRegionTranslationService.removingEditorialAnnotations("「這把劍」真的很重。"),
+            "「這把劍」真的很重。"
+        )
+        XCTAssertEqual(
+            VLMRegionTranslationService.removingEditorialAnnotations("旁白：夜幕降臨。"),
+            "夜幕降臨。"
+        )
+        let prompts = await model.prompts
+        XCTAssertTrue(prompts.first?.contains("Never prepend or append editorial annotations") == true)
+        XCTAssertTrue(prompts.first?.contains("「旁白/內心獨白」") == true)
+    }
+
     func testTraditionalTargetNormalizesModelResponseBeforeSaving() async throws {
         let regionID = UUID(uuidString: "00000000-0000-0000-0000-000000000123")!
         let model = StubTranslationModel(response: """
