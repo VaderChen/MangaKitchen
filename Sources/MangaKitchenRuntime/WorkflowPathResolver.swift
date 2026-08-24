@@ -44,6 +44,19 @@ public struct WorkflowPathResolver: Sendable {
         return baseURL.appendingPathExtension("png")
     }
 
+    public func colorizationOutputURL(
+        relativeSourcePath: String,
+        outputDirectoryURL: URL
+    ) throws -> URL {
+        let translationURL = try outputURL(
+            relativeSourcePath: relativeSourcePath,
+            outputDirectoryURL: outputDirectoryURL
+        )
+        return translationURL.deletingPathExtension()
+            .appendingPathComponent("-colorized")
+            .appendingPathExtension("png")
+    }
+
     private func validatedComponents(_ path: String) throws -> [String] {
         let components = path
             .split(separator: "/", omittingEmptySubsequences: true)

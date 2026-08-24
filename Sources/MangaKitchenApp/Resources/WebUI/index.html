@@ -19,7 +19,7 @@
       <button id="open-settings" class="secondary icon-button settings-button" data-i18n-title="settings" data-i18n-aria-label="settings" title="設定" aria-label="設定"><i class="fa-solid fa-gear" aria-hidden="true"></i></button>
     </header>
 
-    <nav class="workflow-bar" data-i18n-aria-label="fourStepWorkflow" aria-label="四步驟工作流">
+    <nav class="workflow-bar" data-i18n-aria-label="workflowBar" aria-label="工作流">
       <div class="project-switcher">
         <label for="project-selector" data-i18n="project">專案</label>
         <select id="project-selector" data-i18n-aria-label="currentProject" aria-label="目前專案"></select>
@@ -27,11 +27,21 @@
         <button id="delete-project" class="quiet icon-button danger-text" data-i18n-title="deleteProject" data-i18n-aria-label="deleteProject" title="刪除專案" aria-label="刪除專案" disabled><i class="fa-solid fa-trash-can" aria-hidden="true"></i></button>
       </div>
       <div class="workflow-center">
+        <div class="workflow-mode-switcher">
+          <select id="workflow-mode" data-i18n-aria-label="workflowMode" aria-label="流程">
+            <option value="translation" data-i18n="translationMode">翻譯</option>
+            <option value="colorization" data-i18n="colorizationMode">上色</option>
+          </select>
+        </div>
         <div class="workflow-steps">
-          <button class="workflow-step active" data-step="pages"><span>1</span><span class="step-label" data-i18n="pages">頁面</span></button>
-          <button id="detect-selected" class="workflow-step" data-step="mask"><span>2</span><span class="step-label" data-i18n="mask">遮罩</span></button>
-          <button id="translate-selected" class="workflow-step" data-step="translate"><span>3</span><span class="step-label" data-i18n="translate">翻譯</span></button>
-          <button id="compose-selected" class="workflow-step" data-step="compose"><span>4</span><span class="step-label" data-i18n="output">輸出</span></button>
+          <button class="workflow-step active" data-step="pages" data-workflow-mode="translation"><span>1</span><span class="step-label" data-i18n="pages">頁面</span></button>
+          <button id="detect-selected" class="workflow-step" data-step="mask" data-workflow-mode="translation"><span>2</span><span class="step-label" data-i18n="mask">遮罩</span></button>
+          <button id="translate-selected" class="workflow-step" data-step="translate" data-workflow-mode="translation"><span>3</span><span class="step-label" data-i18n="translate">翻譯</span></button>
+          <button id="compose-selected" class="workflow-step" data-step="compose" data-workflow-mode="translation"><span>4</span><span class="step-label" data-i18n="output">輸出</span></button>
+          <button class="workflow-step colorization-step" data-step="colorization-pages" data-workflow-mode="colorization"><span>1</span><span class="step-label" data-i18n="pages">頁面</span></button>
+          <button class="workflow-step colorization-step" data-step="colorization-mask" data-workflow-mode="colorization"><span>2</span><span class="step-label" data-i18n="mask">遮罩</span></button>
+          <button class="workflow-step colorization-step" data-step="colorization-3" data-workflow-mode="colorization"><span>3</span><span class="step-label" data-i18n="colorize">上色</span></button>
+          <button class="workflow-step colorization-step" data-step="colorization-4" data-workflow-mode="colorization"><span>4</span><span class="step-label" data-i18n="output">輸出</span></button>
         </div>
       </div>
       <div class="workflow-meta">
@@ -39,6 +49,7 @@
           <button id="process-selected" class="primary" data-i18n="processSelectedFull">完整處理選取頁</button>
           <button id="cancel-processing" class="danger" data-i18n="cancelJob" disabled>取消工作</button>
         </div>
+        <div id="workflow-mode-placeholder" class="workflow-mode-placeholder" data-i18n="colorizationWorkflowPlaceholder" hidden>上色流程：步驟一載入頁面，步驟二設定反對話框遮罩，步驟三上色，步驟四輸出。</div>
         <div class="selection-summary" id="selection-summary" data-i18n="noPageSelected">尚未選取頁面</div>
       </div>
     </nav>
@@ -118,6 +129,7 @@
             <button id="reveal-output" class="secondary" disabled>清除重來</button>
             <button id="reextract-text" class="secondary" data-i18n="reextractText" hidden disabled>重新抽字</button>
             <button id="retranslate" class="secondary" data-i18n="retranslate" hidden disabled>重新翻譯</button>
+            <button id="workflow-previous" type="button" class="secondary icon-button" data-i18n-title="previousWorkflowStep" data-i18n-aria-label="previousWorkflowStep" title="上一步" aria-label="上一步" hidden disabled><i class="fa-solid fa-arrow-left" aria-hidden="true"></i></button>
             <button id="workflow-next" type="button" class="primary icon-button" data-i18n-title="nextWorkflowStep" data-i18n-aria-label="nextWorkflowStep" title="下一步" aria-label="下一步" disabled><i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
           </header>
 
@@ -157,7 +169,13 @@
         </nav>
 
         <section id="inspector-panel-project" class="inspector-section" role="tabpanel" data-inspector-panel="project" aria-labelledby="inspector-tab-project">
-          <div class="panel-heading"><strong data-i18n="projectSettings">專案設定</strong></div>
+          <div class="panel-heading">
+            <strong id="project-settings-heading-translation" data-i18n="projectSettings">專案設定</strong>
+            <strong id="project-settings-heading-colorization" data-i18n="colorizationSettings" hidden>上色設定</strong>
+          </div>
+          <div id="translation-project-settings">
+          <details class="inspector-settings-card" open>
+            <summary data-i18n="translationPageSettings">頁面設定</summary>
           <label><span data-i18n="targetLanguage">目標語言</span>
             <select id="target-language">
               <option value="auto" data-i18n="targetLanguageAutomatic">AUTO（跟隨系統語系）</option>
@@ -191,6 +209,9 @@
               <option value="vertical" data-i18n="vertical">直排</option>
             </select>
           </label>
+          </details>
+          <details class="inspector-settings-card" open>
+            <summary data-i18n="translationProcessingSettings">翻譯處理</summary>
           <div class="erase-color-field">
             <span data-i18n="eraseBackgroundColor">抹除底色</span>
             <div class="erase-color-controls">
@@ -232,13 +253,10 @@
               <option value="ppocrv6MediumDet">PP-OCRv6 Medium Det</option>
             </select>
           </label>
-          <label><span data-i18n="translationModelMethod">文字翻譯方式</span>
-            <select id="translation-model-method">
-              <option value="" data-i18n="translationModelNotLoaded">尚未載入翻譯模型</option>
-            </select>
-          </label>
+          </details>
+          <details class="inspector-settings-card" open>
+            <summary data-i18n="translationQuality">翻譯品質</summary>
           <fieldset class="translation-quality-settings">
-            <legend data-i18n="translationQuality">翻譯品質</legend>
             <label class="checkbox-label"><input id="translation-page-context" type="checkbox"> <span data-i18n="translationPageContext">使用整頁語境</span></label>
             <label class="checkbox-label"><input id="translation-review-pass" type="checkbox"> <span data-i18n="translationReviewPass">執行二次校稿</span></label>
             <label class="checkbox-label"><input id="translation-quality-check" type="checkbox"> <span data-i18n="translationQualityCheck">執行翻譯品質檢查</span></label>
@@ -255,6 +273,51 @@
             </label>
           </fieldset>
           <label class="checkbox-label" hidden><input id="use-image-model" type="checkbox" disabled> <span data-i18n="useImageModel">使用圖生圖修補</span></label>
+          </details>
+          </div>
+          <div id="colorization-project-settings" hidden>
+            <details class="inspector-settings-card" open>
+              <summary>
+                <span class="settings-card-heading">
+                  <strong data-i18n="imageColorizationModel">上色模型</strong>
+                  <span id="colorization-model-status">尚未載入模型</span>
+                </span>
+              </summary>
+              <label class="settings-field">
+                <span data-i18n="imageColorizationModel">上色模型</span>
+                <select id="colorization-project-model-variant"></select>
+              </label>
+              <p class="section-help" data-i18n="colorizationSettingsHelp">上色會優先使用已輸出的翻譯頁面，並依第二步驟遮罩保護對話框區域。</p>
+              <div class="settings-actions">
+                <button id="open-colorization-model-settings" type="button" class="secondary" data-i18n="openColorizationModelSettings">設定上色模型</button>
+              </div>
+            </details>
+            <details class="inspector-settings-card settings-card-disabled" aria-disabled="true" open>
+              <summary data-i18n="colorizationColorRange">色彩範圍</summary>
+              <label class="settings-field">
+                <span data-i18n="colorizationColorRange">色彩範圍</span>
+                <select id="colorization-color-range" disabled>
+                  <option value="monochrome" data-i18n="colorizationColorRangeMonochrome">單色</option>
+                  <option value="fourColor" data-i18n="colorizationColorRangeFour">四色</option>
+                  <option value="eightColor" data-i18n="colorizationColorRangeEight">八色</option>
+                  <option value="unrestricted" data-i18n="colorizationColorRangeUnrestricted">無限制</option>
+                </select>
+              </label>
+            </details>
+            <details class="inspector-settings-card settings-card-disabled" aria-disabled="true" open>
+              <summary data-i18n="colorizationModeSetting">上色模式</summary>
+              <label class="settings-field">
+                <span data-i18n="colorizationModeSetting">上色模式</span>
+                <select id="colorization-mode" disabled>
+                  <option value="shadow" data-i18n="colorizationModeShadow">陰影模式</option>
+                  <option value="halftone" data-i18n="colorizationModeHalftone">彩色網點</option>
+                  <option value="cel" data-i18n="colorizationModeCel">賽璐珞模式</option>
+                  <option value="watercolor" data-i18n="colorizationModeWatercolor">水彩模式</option>
+                </select>
+              </label>
+              <small class="section-help" data-i18n="colorizationModeHelp">陰影模式只塗可能是陰影的部分；其他模式會控制上色風格。</small>
+            </details>
+          </div>
         </section>
 
         <section id="inspector-panel-glossary" class="inspector-section glossary-panel" role="tabpanel" data-inspector-panel="glossary" aria-labelledby="inspector-tab-glossary" hidden>
@@ -399,14 +462,18 @@
                 </span>
                 <input id="settings-model-thinking" type="checkbox" role="switch">
               </label>
+              <div class="model-tabs-navigation">
+              <button id="model-tab-previous" type="button" class="secondary icon-button" data-i18n-title="previousModelTab" data-i18n-aria-label="previousModelTab" title="上一個模型分類" aria-label="上一個模型分類"><i class="fa-solid fa-chevron-left" aria-hidden="true"></i></button>
               <nav class="model-tabs" data-i18n-aria-label="modelTabs" aria-label="模型分類" role="tablist">
                 <button type="button" class="model-tab" data-model-tab="imageToText" role="tab" aria-selected="false" aria-controls="model-page-image-to-text" data-i18n="modelTabImageToText">多模態</button>
                 <button type="button" class="model-tab" data-model-tab="textLocalization" role="tab" aria-selected="false" aria-controls="model-page-text-localization" data-i18n="modelTabTextLocalization">文字定位</button>
                 <button type="button" class="model-tab active" data-model-tab="ocr" role="tab" aria-selected="true" aria-controls="model-page-ocr" data-i18n="modelTabOCR">OCR</button>
-                <button type="button" class="model-tab" data-model-tab="textToText" role="tab" aria-selected="false" aria-controls="model-page-text-to-text" data-i18n="modelTabTextToText">文生文</button>
                 <button type="button" class="model-tab" data-model-tab="superResolution" role="tab" aria-selected="false" aria-controls="model-page-super-resolution" data-i18n="modelTabSuperResolution">超高解析度</button>
+                <button type="button" class="model-tab" data-model-tab="imageColorization" role="tab" aria-selected="false" aria-controls="model-page-image-colorization" data-i18n="modelTabImageColorization">上色</button>
                 <button type="button" class="model-tab" data-model-tab="imageToImage" role="tab" aria-selected="false" aria-controls="model-page-image-to-image" data-i18n="modelTabImageToImage">圖生圖</button>
               </nav>
+              <button id="model-tab-next" type="button" class="secondary icon-button" data-i18n-title="nextModelTab" data-i18n-aria-label="nextModelTab" title="下一個模型分類" aria-label="下一個模型分類"><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>
+              </div>
               <div class="model-pages">
               <section id="model-page-ocr" class="model-page active" data-model-page="ocr" role="tabpanel">
                 <div class="settings-path-group">
@@ -433,31 +500,6 @@
                   </div>
                   <p class="section-help" data-i18n="textLocalizationModelDescription">用途：在已確認的對話框內找出文字行或文字欄座標，供後續 OCR 抽字使用。只掃描框內文字，不處理框外狀聲字，也不改動步驟二遮罩。</p>
                 </div>
-              </section>
-              <section id="model-page-text-to-text" class="model-page" data-model-page="textToText" role="tabpanel" hidden>
-              <div class="settings-path-group">
-                <div class="settings-field">
-                  <label for="settings-text-to-text-model" data-i18n="textToTextModel">文生文模型</label>
-                  <div class="settings-directory-row">
-                    <input id="settings-text-to-text-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
-                    <button id="choose-text-to-text-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
-                  </div>
-                </div>
-                <label class="settings-field">
-                  <span data-i18n="modelVersion">模型版本</span>
-                  <select id="settings-text-to-text-model-variant"></select>
-                </label>
-                <div class="settings-actions">
-                  <button id="download-text-to-text-model" type="button" class="primary" data-i18n="downloadModel" disabled>下載</button>
-                  <button id="clear-text-to-text-model" type="button" class="quiet" data-i18n="clear">清除</button>
-                  <button id="delete-text-to-text-model" type="button" class="quiet danger-text" data-i18n="delete" hidden>刪除</button>
-                </div>
-                <div id="text-to-text-model-download-progress" class="model-download-progress" hidden>
-                  <progress id="text-to-text-model-download-progress-bar" value="0" max="1"></progress>
-                  <small id="text-to-text-model-download-status"></small>
-                </div>
-                <p class="section-help" data-i18n="textToTextModelDescription">用途：接收 OCR／VLM 已抽出的原文，執行翻譯、二次校稿與翻譯品質檢查；不讀取漫畫圖片。</p>
-              </div>
               </section>
               <section id="model-page-image-to-text" class="model-page" data-model-page="imageToText" role="tabpanel" hidden>
               <div class="settings-path-group">
@@ -520,6 +562,35 @@
                   <small id="super-resolution-model-download-status"></small>
                 </div>
                 <p class="section-help" data-i18n="superResolutionModelDescription">用途：放大步驟二完成的去字背景，再交給排版與輸出；不重新抽字、翻譯或重建遮罩。</p>
+              </div>
+              </section>
+              <section id="model-page-image-colorization" class="model-page" data-model-page="imageColorization" role="tabpanel" hidden>
+              <div class="settings-path-group">
+                <div class="settings-card-heading">
+                  <strong data-i18n="imageColorizationModel">上色模型</strong>
+                  <span data-i18n="downloadRequired">需下載</span>
+                </div>
+                <div class="settings-field">
+                  <label for="settings-image-colorization-model" data-i18n="imageColorizationModel">上色模型</label>
+                  <div class="settings-directory-row">
+                    <input id="settings-image-colorization-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+                    <button id="choose-image-colorization-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
+                  </div>
+                </div>
+                <label class="settings-field">
+                  <span data-i18n="modelVersion">模型版本</span>
+                  <select id="settings-image-colorization-model-variant"></select>
+                </label>
+                <div class="settings-actions">
+                  <button id="download-image-colorization-model" type="button" class="primary" data-i18n="downloadModel" disabled>下載</button>
+                  <button id="clear-image-colorization-model" type="button" class="quiet" data-i18n="clear">清除</button>
+                  <button id="delete-image-colorization-model" type="button" class="quiet danger-text" data-i18n="delete" hidden>刪除</button>
+                </div>
+                <div id="image-colorization-model-download-progress" class="model-download-progress" hidden>
+                  <progress id="image-colorization-model-download-progress-bar" value="0" max="1"></progress>
+                  <small id="image-colorization-model-download-status"></small>
+                </div>
+                <p class="section-help" data-i18n="imageColorizationModelDescription">DDColor 不隨 App 內建；選取儲存目錄並下載後才會載入。模型保留原始亮度與輸出尺寸，上色流程會依步驟二遮罩，只改變非對話框區域。</p>
               </div>
               </section>
               <section id="model-page-image-to-image" class="model-page" data-model-page="imageToImage" role="tabpanel" hidden>

@@ -29,6 +29,12 @@ final class AssetSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendabl
             if let outputURL = page.outputURL {
                 values["\(id)/output"] = outputURL
             }
+            if let colorizationPreviewURL = page.colorizationPreviewURL {
+                values["\(id)/colorization-preview"] = colorizationPreviewURL
+            }
+            if let colorizationOutputURL = page.colorizationOutputURL {
+                values["\(id)/colorization-output"] = colorizationOutputURL
+            }
         }
         lock.withLock {
             assetURLs = values

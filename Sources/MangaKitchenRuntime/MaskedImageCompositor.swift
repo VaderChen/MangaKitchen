@@ -2,14 +2,14 @@ import CoreImage
 import Foundation
 import MangaKitchenCore
 
-actor MaskedImageCompositor {
+public actor MaskedImageCompositor {
     private let metal: MetalContext
 
-    init(metal: MetalContext) {
+    public init(metal: MetalContext) {
         self.metal = metal
     }
 
-    func composite(
+    public func composite(
         sourceURL: URL,
         generatedURL: URL,
         maskURL: URL,

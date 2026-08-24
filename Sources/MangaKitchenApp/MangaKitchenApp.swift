@@ -51,10 +51,10 @@ private struct MangaKitchenApplication: App {
             dataDirectoryPath: settings.dataDirectoryPath,
             defaultOutputDirectoryPath: settings.defaultOutputDirectoryPath,
             imageCompositingBackend: settings.resolvedImageCompositingBackend,
-            textToTextModelPath: settings.textToTextModelPath,
             imageToTextModelPath: settings.imageToTextModelPath,
             modelThinkingEnabled: settings.modelThinkingEnabled,
             imageToImageModelPath: settings.imageToImageModelPath,
+            imageColorizationModelPath: settings.imageColorizationModelPath,
             automaticSuperResolutionEnabled: settings.automaticSuperResolutionEnabled,
             superResolutionModelPath: settings.superResolutionModelPath
         )

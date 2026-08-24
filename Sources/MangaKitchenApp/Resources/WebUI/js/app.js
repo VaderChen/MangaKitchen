@@ -19,6 +19,10 @@ let selectedTranslationRegionID = null;
 let pendingRegionSelectionID = null;
 let regionContextTarget = null;
 let pageContextTarget = null;
+const workflowModeStorageKey = "mangakitchen.workflow-mode";
+let workflowMode = localStorage.getItem(workflowModeStorageKey) === "colorization"
+  ? "colorization"
+  : "translation";
 let calculationDialogState = null;
 let calculationElapsedTimer = null;
 let dismissedModelLoadingFailureID = null;
@@ -47,6 +51,11 @@ const inspectorTabStorageKey = "mangakitchen.inspector-tab";
 const modelTabStorageKey = "mangakitchen.model-tab";
 
 const elements = {
+  workflowBar: document.querySelector(".workflow-bar"),
+  workflowMode: document.querySelector("#workflow-mode"),
+  workflowModePlaceholder: document.querySelector("#workflow-mode-placeholder"),
+  workflowActions: document.querySelector(".workflow-actions"),
+  processSelected: document.querySelector("#process-selected"),
   projectSelector: document.querySelector("#project-selector"),
   deleteProject: document.querySelector("#delete-project"),
   appendPages: document.querySelector("#append-pages"),
@@ -159,14 +168,6 @@ const elements = {
   dataDirectoryRestartNote: document.querySelector("#data-directory-restart-note"),
   settingsDefaultOutputDirectory: document.querySelector("#settings-default-output-directory"),
   settingsModelThinking: document.querySelector("#settings-model-thinking"),
-  settingsTextToTextModel: document.querySelector("#settings-text-to-text-model"),
-  settingsTextToTextModelVariant: document.querySelector("#settings-text-to-text-model-variant"),
-  settingsTextToTextModelDownload: document.querySelector("#download-text-to-text-model"),
-  settingsTextToTextModelClear: document.querySelector("#clear-text-to-text-model"),
-  settingsTextToTextModelDelete: document.querySelector("#delete-text-to-text-model"),
-  settingsTextToTextModelDownloadProgress: document.querySelector("#text-to-text-model-download-progress"),
-  settingsTextToTextModelDownloadProgressBar: document.querySelector("#text-to-text-model-download-progress-bar"),
-  settingsTextToTextModelDownloadStatus: document.querySelector("#text-to-text-model-download-status"),
   settingsImageToTextModel: document.querySelector("#settings-image-to-text-model"),
   settingsImageToTextModelVariant: document.querySelector("#settings-image-to-text-model-variant"),
   settingsImageToTextModelDownload: document.querySelector("#download-image-to-text-model"),
@@ -176,6 +177,14 @@ const elements = {
   settingsImageToTextModelDownloadProgressBar: document.querySelector("#image-to-text-model-download-progress-bar"),
   settingsImageToTextModelDownloadStatus: document.querySelector("#image-to-text-model-download-status"),
   settingsImageToImageModel: document.querySelector("#settings-image-to-image-model"),
+  settingsImageColorizationModel: document.querySelector("#settings-image-colorization-model"),
+  settingsImageColorizationModelVariant: document.querySelector("#settings-image-colorization-model-variant"),
+  settingsImageColorizationModelDownload: document.querySelector("#download-image-colorization-model"),
+  settingsImageColorizationModelClear: document.querySelector("#clear-image-colorization-model"),
+  settingsImageColorizationModelDelete: document.querySelector("#delete-image-colorization-model"),
+  settingsImageColorizationModelDownloadProgress: document.querySelector("#image-colorization-model-download-progress"),
+  settingsImageColorizationModelDownloadProgressBar: document.querySelector("#image-colorization-model-download-progress-bar"),
+  settingsImageColorizationModelDownloadStatus: document.querySelector("#image-colorization-model-download-status"),
   settingsAutomaticSuperResolution: document.querySelector("#settings-automatic-super-resolution"),
   settingsSuperResolutionModel: document.querySelector("#settings-super-resolution-model"),
   settingsSuperResolutionModelVariant: document.querySelector("#settings-super-resolution-model-variant"),
@@ -197,6 +206,15 @@ const elements = {
   aboutCheckUpdates: document.querySelector("#about-check-updates"),
   aboutCheckUpdatesLabel: document.querySelector("#about-check-updates-label"),
   aboutUpdateStatus: document.querySelector("#about-update-status"),
+  translationProjectSettings: document.querySelector("#translation-project-settings"),
+  colorizationProjectSettings: document.querySelector("#colorization-project-settings"),
+  translationProjectSettingsHeading: document.querySelector("#project-settings-heading-translation"),
+  colorizationProjectSettingsHeading: document.querySelector("#project-settings-heading-colorization"),
+  colorizationModelStatus: document.querySelector("#colorization-model-status"),
+  colorizationProjectModelVariant: document.querySelector("#colorization-project-model-variant"),
+  colorizationColorRange: document.querySelector("#colorization-color-range"),
+  colorizationMode: document.querySelector("#colorization-mode"),
+  openColorizationModelSettings: document.querySelector("#open-colorization-model-settings"),
   targetLanguage: document.querySelector("#target-language"),
   readingDirection: document.querySelector("#reading-direction"),
   writingDirection: document.querySelector("#writing-direction"),
@@ -211,7 +229,6 @@ const elements = {
   fontNameValue: document.querySelector("#font-name-value"),
   fontNameList: document.querySelector("#font-name-list"),
   textLocalizationMethod: document.querySelector("#text-localization-method"),
-  translationModelMethod: document.querySelector("#translation-model-method"),
   translationPageContext: document.querySelector("#translation-page-context"),
   translationReviewPass: document.querySelector("#translation-review-pass"),
   translationQualityCheck: document.querySelector("#translation-quality-check"),
@@ -229,6 +246,7 @@ const elements = {
   reveal: document.querySelector("#reveal-output"),
   superResolution: document.querySelector("#super-resolution"),
   canvasPixelPreview: document.querySelector("#canvas-pixel-preview"),
+  workflowPrevious: document.querySelector("#workflow-previous"),
   workflowNext: document.querySelector("#workflow-next"),
 };
 
@@ -285,6 +303,33 @@ const stageLabelKeys = {
   failed: "stageFailed",
 };
 
+const colorizationStageLabelKeys = {
+  pending: "colorizationStagePending",
+  maskReady: "colorizationStageMaskReady",
+  colorizing: "colorizationStageColorizing",
+  previewReady: "colorizationStagePreviewReady",
+  exporting: "colorizationStageExporting",
+  completed: "colorizationStageCompleted",
+  failed: "colorizationStageFailed",
+};
+
+function workflowPageState(page) {
+  if (workflowMode === "colorization") {
+    return {
+      stage: page.colorizationStage ?? "pending",
+      progress: page.colorizationProgress ?? 0,
+      errorMessage: page.colorizationErrorMessage ?? null,
+      labelKeys: colorizationStageLabelKeys,
+    };
+  }
+  return {
+    stage: page.stage,
+    progress: page.progress,
+    errorMessage: page.errorMessage,
+    labelKeys: stageLabelKeys,
+  };
+}
+
 const operationLabelKeys = {
   rescan: "operationRescan",
   detectMasks: "operationDetectMasks",
@@ -294,6 +339,8 @@ const operationLabelKeys = {
   extractRegion: "operationExtractRegion",
   superResolve: "operationSuperResolve",
   compose: "operationCompose",
+  colorize: "operationColorize",
+  colorizationCompose: "operationColorizationCompose",
   fullPage: "operationFullPage",
 };
 
@@ -331,34 +378,26 @@ function activePage() {
 function availableTranslationModels() {
   const settings = state?.globalSettings;
   const models = [];
-  const appendInstalled = (capability, options) => {
-    for (const model of options ?? []) {
-      if (!model.installed) continue;
-      models.push({
-        capability,
-        variantID: model.id,
-        displayName: model.displayName,
-      });
-    }
-  };
-  appendInstalled("textToText", settings?.textToTextModelOptions);
-  appendInstalled("imageToText", settings?.imageToTextModelOptions);
-
-  // 手動載入、未列在下載目錄 catalog 的模型仍可使用；若同類型已有已下載
-  // 清單，避免把同一個 runtime 以 manifest ID 再列一次。
-  for (const loaded of state?.loadedModels ?? []) {
-    if (!["textToText", "imageToText"].includes(loaded.capability)) continue;
-    if (models.some((model) => model.capability === loaded.capability)) continue;
+  for (const model of settings?.imageToTextModelOptions ?? []) {
+    if (!model.installed) continue;
     models.push({
-      capability: loaded.capability,
+      capability: "imageToText",
+      variantID: model.id,
+      displayName: model.displayName,
+    });
+  }
+
+  // 手動載入、未列在下載目錄 catalog 的多模態模型仍可使用。
+  for (const loaded of state?.loadedModels ?? []) {
+    if (loaded.capability !== "imageToText") continue;
+    if (models.some((model) => model.displayName === loaded.displayName)) continue;
+    models.push({
+      capability: "imageToText",
       variantID: null,
       displayName: loaded.displayName,
     });
   }
-  return models.sort((left, right) => {
-    if (left.capability === right.capability) return left.displayName.localeCompare(right.displayName);
-    return left.capability === "textToText" ? -1 : 1;
-  });
+  return models.sort((left, right) => left.displayName.localeCompare(right.displayName));
 }
 
 function availableTextLocalizationVLMs() {
@@ -390,46 +429,60 @@ function hasAvailableModelCapability(capability) {
   const settings = state?.globalSettings;
   const options = capability === "imageToText"
     ? settings?.imageToTextModelOptions
+    : capability === "imageColorization"
+      ? settings?.imageColorizationModelOptions
     : capability === "superResolution"
       ? settings?.superResolutionModelOptions
-      : capability === "textToText"
-        ? settings?.textToTextModelOptions
-        : [];
+      : [];
   return (options ?? []).some((model) => model.installed);
 }
 
-function translationModelOptionValue(model) {
-  return `${model.capability}::${model.variantID ?? ""}`;
-}
-
-function selectedTranslationModelValue() {
-  const method = state?.options?.translationModelMethod ?? "textToText";
-  const settings = state?.globalSettings;
-  const variantID = method === "textToText"
-    ? settings?.textToTextModelVariant
-    : settings?.imageToTextModelVariant;
-  const models = availableTranslationModels();
-  const exact = models.find(
-    (model) => model.capability === method && model.variantID === variantID
-  );
-  const sameMethod = models.find((model) => model.capability === method);
-  return translationModelOptionValue(exact ?? sameMethod ?? models[0] ?? {
-    capability: "",
-    variantID: null,
-  });
-}
-
-function parsedTranslationModelSelection() {
-  const [capability = "", variantID = ""] = elements.translationModelMethod.value.split("::", 2);
-  return { capability, variantID: variantID || null };
+function workflowStepForMode() {
+  return workflowMode === "colorization" ? "colorization-pages" : "pages";
 }
 
 function workflowStepForPage(page) {
+  if (workflowMode === "colorization") return workflowStepForMode();
   if (!page) return "pages";
   if (["detectingText", "recognizing", "masking", "restoringBackground", "maskReady"].includes(page.stage)) return "mask";
   if (["translating", "typesetting", "translationReady", "superResolving"].includes(page.stage)) return "translate";
   if (["composing", "completed"].includes(page.stage)) return "compose";
   return "pages";
+}
+
+function renderWorkflowMode() {
+  elements.workflowMode.value = workflowMode;
+  const colorizationMode = workflowMode === "colorization";
+  elements.workflowBar.classList.toggle("colorization-mode", colorizationMode);
+  const processLabelKey = colorizationMode ? "colorizeSelected" : "processSelectedFull";
+  elements.processSelected.hidden = false;
+  elements.processSelected.dataset.i18n = processLabelKey;
+  elements.processSelected.textContent = t(processLabelKey);
+  elements.cancel.hidden = false;
+  elements.workflowActions.hidden = false;
+  elements.workflowModePlaceholder.hidden = !colorizationMode;
+  elements.translationProjectSettings.hidden = colorizationMode;
+  elements.colorizationProjectSettings.hidden = !colorizationMode;
+  elements.translationProjectSettingsHeading.hidden = colorizationMode;
+  elements.colorizationProjectSettingsHeading.hidden = !colorizationMode;
+  for (const tab of document.querySelectorAll(".workflow-step[data-step]")) {
+    const tabMode = tab.dataset.workflowMode;
+    tab.hidden = tabMode !== workflowMode;
+  }
+}
+
+function setWorkflowMode(mode) {
+  workflowMode = mode === "colorization" ? "colorization" : "translation";
+  localStorage.setItem(workflowModeStorageKey, workflowMode);
+  workflowStepPinned = false;
+  activeWorkflowStep = workflowStepForPage(activePage());
+  renderWorkflowMode();
+  showInspectorTab("project");
+  if (state) {
+    renderPages();
+    renderPage();
+    renderSettings();
+  }
 }
 
 function syncWorkflowStep(page) {
@@ -442,6 +495,7 @@ function syncWorkflowStep(page) {
   } else if (!workflowStepPinned) {
     activeWorkflowStep = workflowStepForPage(page);
   }
+  renderWorkflowMode();
   for (const tab of document.querySelectorAll(".workflow-step[data-step]")) {
     const active = tab.dataset.step === activeWorkflowStep;
     tab.classList.toggle("active", active);
@@ -482,6 +536,9 @@ function hasWorkflowStepData(page, step) {
     return regionsComplete && Boolean(page.translationPreviewURL || page.outputPreviewURL);
   }
   if (step === "compose") return Boolean(page.outputPreviewURL);
+  if (step === "colorization-mask") return Boolean(page.maskPreviewURL);
+  if (step === "colorization-3") return Boolean(page.colorizationPreviewURL);
+  if (step === "colorization-4") return Boolean(page.colorizationOutputURL);
   return true;
 }
 
@@ -493,6 +550,45 @@ function incompleteTranslationRegionCount(pages) {
   return pages.reduce((count, page) => count + (page.regions ?? []).filter((region) => (
     !region.sourceText?.trim() || !region.translatedText?.trim()
   )).length, 0);
+}
+
+function colorizationMaskReady(page) {
+  return Boolean(page?.maskPreviewURL);
+}
+
+async function selectOrPrepareColorizationMask() {
+  const pages = selectedWorkflowPages();
+  if (!pages.length) {
+    showError(new Error(t("selectAtLeastOnePage")));
+    return;
+  }
+  selectWorkflowStep("colorization-mask");
+  const pendingPages = pages.filter((page) => !colorizationMaskReady(page));
+  if (!pendingPages.length) return;
+  await runBatchWithCalculationDialog(
+    "detectMasks",
+    pendingPages.map((page) => page.id)
+  );
+}
+
+async function resetColorizationWorkflow() {
+  const pages = selectedWorkflowPages();
+  if (!pages.length) {
+    showError(new Error(t("selectAtLeastOnePage")));
+    return;
+  }
+  const confirmed = await requestConfirmation(
+    t("resetColorizationPagesTitle"),
+    t("resetColorizationPagesConfirmation", { count: pages.length }),
+    t("resetColorizationPagesConfirm")
+  );
+  if (!confirmed) return;
+  await invoke("resetColorizationPages", { pageIDs: pages.map((page) => page.id) });
+  const page = activePage();
+  if (!page) return;
+  selectedMaskRegionID = null;
+  resetCanvasViewport(page.id);
+  selectWorkflowStep("colorization-pages");
 }
 
 function calculationStepLabel(operation) {
@@ -777,6 +873,8 @@ async function selectOrCalculateWorkflowStep(step, operation, force = false) {
   const prerequisiteStep = {
     translate: "mask",
     compose: "translate",
+    "colorization-3": "colorization-mask",
+    "colorization-4": "colorization-3",
   }[step];
   const allowsIncompleteTranslation = step === "compose"
     && prerequisiteStep === "translate"
@@ -801,7 +899,7 @@ async function selectOrCalculateWorkflowStep(step, operation, force = false) {
   const pendingPages = force ? pages : pages.filter((page) => !hasWorkflowStepData(page, step));
   if (!pendingPages.length) return;
   const pageIDs = pendingPages.map((page) => page.id);
-  if (operation === "compose") {
+  if (operation === "compose" || operation === "colorizationCompose") {
     await runBatch(operation, pageIDs);
     return;
   }
@@ -817,10 +915,17 @@ function advanceWorkflowStep() {
   const canLeaveIncompleteTranslation = activeWorkflowStep === "translate"
     && pages.every(hasTranslationPreview);
   if (activeWorkflowStep !== "pages"
+      && !["colorization-3", "colorization-4"].includes(activeWorkflowStep)
       && !canLeaveIncompleteTranslation
       && pages.some((page) => !hasWorkflowStepData(page, activeWorkflowStep))) {
     showError(new Error(t("completeCurrentStepFirst")));
     return Promise.resolve();
+  }
+  if (activeWorkflowStep === "colorization-3") {
+    return selectOrCalculateWorkflowStep("colorization-4", "colorizationCompose");
+  }
+  if (activeWorkflowStep === "colorization-4") {
+    return selectOrCalculateWorkflowStep("colorization-4", "colorizationCompose");
   }
   const destination = {
     pages: { step: "mask", operation: "detectMasks" },
@@ -854,10 +959,21 @@ async function runBatchWithCalculationDialog(
     await showNotice(
       t("translationModelRequiredTitle"),
       t("translationModelRequired"),
-      t("openTextToTextModels")
+      t("openMultimodalModels")
     );
     showSettingsPage("models");
-    showModelTab("textToText");
+    showModelTab("imageToText");
+    elements.settingsDialog.showModal();
+    return null;
+  }
+  if (operation === "colorize" && !hasAvailableModelCapability("imageColorization")) {
+    await showNotice(
+      t("imageColorizationModelRequiredTitle"),
+      t("imageColorizationModelRequired"),
+      t("openSettings")
+    );
+    showSettingsPage("models");
+    showModelTab("imageColorization");
     elements.settingsDialog.showModal();
     return null;
   }
@@ -884,10 +1000,10 @@ async function runRegionExtractionWithCalculationDialog(pageID, regionID) {
     await showNotice(
       t("translationModelRequiredTitle"),
       t("translationModelRequired"),
-      t("openTextToTextModels")
+      t("openMultimodalModels")
     );
     showSettingsPage("models");
-    showModelTab("textToText");
+    showModelTab("imageToText");
     elements.settingsDialog.showModal();
     return null;
   }
@@ -916,8 +1032,13 @@ function filteredPages() {
   const filter = elements.pageFilter.value;
   return state.pages.filter((page) => {
     const matchesText = !query || `${page.title} ${page.relativeSourcePath ?? ""}`.toLocaleLowerCase().includes(query);
-    let matchesStage = filter === "all" || page.stage === filter;
-    if (filter === "pending") matchesStage = ["pending", "scanned"].includes(page.stage);
+    const pageState = workflowPageState(page);
+    let matchesStage = filter === "all" || pageState.stage === filter;
+    if (filter === "pending") {
+      matchesStage = workflowMode === "colorization"
+        ? pageState.stage === "pending"
+        : ["pending", "scanned"].includes(pageState.stage);
+    }
     return matchesText && matchesStage;
   });
 }
@@ -1358,6 +1479,21 @@ function buildPageTree(pages, visiblePageIDs) {
   return root;
 }
 
+function colorizationPageInput(page) {
+  if (page?.outputPreviewURL) {
+    return {
+      url: page.outputPreviewURL,
+      caption: t("colorizationInputTranslated"),
+      isFallback: false,
+    };
+  }
+  return {
+    url: page?.sourcePreviewURL ?? "",
+    caption: t("colorizationInputFallback"),
+    isFallback: true,
+  };
+}
+
 function renderPageTreeFile(container, record, visiblePages, selected) {
   const { page } = record;
   const item = document.createElement("li");
@@ -1379,7 +1515,9 @@ function renderPageTreeFile(container, record, visiblePages, selected) {
   });
 
   const preview = document.createElement("img");
-  preview.src = page.sourcePreviewURL;
+  preview.src = workflowMode === "colorization"
+    ? colorizationPageInput(page).url
+    : page.sourcePreviewURL;
   preview.alt = "";
   preview.loading = "lazy";
 
@@ -1391,9 +1529,11 @@ function renderPageTreeFile(container, record, visiblePages, selected) {
   const path = document.createElement("small");
   path.textContent = record.fileName;
   const stage = document.createElement("span");
-  stage.className = `stage-badge stage-${page.stage}`;
-  const stageKey = stageLabelKeys[page.stage];
-  stage.textContent = page.errorMessage || `${stageKey ? t(stageKey) : page.stage} · ${Math.round(page.progress * 100)}%`;
+  const pageState = workflowPageState(page);
+  stage.className = `stage-badge stage-${pageState.stage}`;
+  const stageKey = pageState.labelKeys[pageState.stage];
+  stage.textContent = pageState.errorMessage
+    || `${stageKey ? t(stageKey) : pageState.stage} · ${Math.round(pageState.progress * 100)}%`;
   content.append(title, path, stage);
   item.append(checkbox, preview, content);
   container.append(item);
@@ -1506,18 +1646,17 @@ function renderPages() {
 
 function renderModels() {
   elements.modelList.replaceChildren();
-  if (!state.loadedModels.length) {
+  const supportedModels = state.loadedModels.filter((model) => model.capability !== "textToText");
+  if (!supportedModels.length) {
     const item = document.createElement("li");
     item.className = "muted";
     item.textContent = t("notLoaded");
     elements.modelList.append(item);
     return;
   }
-  for (const model of state.loadedModels) {
+  for (const model of supportedModels) {
     const item = document.createElement("li");
-    const capability = model.capability === "textToText"
-      ? t("textToText")
-      : model.capability === "imageToText"
+    const capability = model.capability === "imageToText"
         ? t("imageToText")
         : model.capability === "superResolution"
           ? t("superResolutionLoaded")
@@ -1911,12 +2050,54 @@ function drawMaskStroke(context, canvas, stroke) {
   context.restore();
 }
 
+function clearColorizationProtectedRegion(context, canvas, region) {
+  const polygons = region.bubbleMaskPolygons ?? [];
+  context.save();
+  context.globalCompositeOperation = "destination-out";
+  context.fillStyle = "black";
+  if (polygons.length) {
+    for (const polygon of polygons) {
+      if (polygon.length < 3) continue;
+      context.beginPath();
+      context.moveTo(polygon[0].x * canvas.width, polygon[0].y * canvas.height);
+      for (const point of polygon.slice(1)) {
+        context.lineTo(point.x * canvas.width, point.y * canvas.height);
+      }
+      context.closePath();
+      context.fill();
+    }
+  } else {
+    const bounds = region.bubbleBounds ?? region.bounds;
+    context.fillRect(
+      bounds.x * canvas.width,
+      bounds.y * canvas.height,
+      bounds.width * canvas.width,
+      bounds.height * canvas.height
+    );
+  }
+  context.restore();
+}
+
 function renderMaskCanvas(page) {
   const canvas = elements.maskLayer;
   const context = canvas.getContext("2d");
   if (!context) return;
   context.clearRect(0, 0, canvas.width, canvas.height);
   if (!page?.maskPreviewURL) return;
+  if (activeWorkflowStep === "colorization-mask") {
+    context.fillStyle = "rgb(239, 68, 68)";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    for (const region of page.regions ?? []) {
+      clearColorizationProtectedRegion(context, canvas, region);
+    }
+    for (const stroke of page.colorizationMaskStrokes ?? []) {
+      drawMaskStroke(context, canvas, stroke);
+    }
+    if (activeMaskStroke?.pageID === page.id && activeMaskStroke.workflowMode === "colorization") {
+      drawMaskStroke(context, canvas, activeMaskStroke);
+    }
+    return;
+  }
   const preview = maskPreviewState(page);
   if (preview.image) {
     context.drawImage(preview.image, 0, 0, canvas.width, canvas.height);
@@ -1951,13 +2132,17 @@ function requestMaskPreview(page) {
 }
 
 function renderMaskEditor(page) {
-  const maskMode = activeWorkflowStep === "mask";
+  const translationMaskMode = activeWorkflowStep === "mask";
+  const colorizationMaskMode = activeWorkflowStep === "colorization-mask";
+  const maskMode = translationMaskMode || colorizationMaskMode;
   const hasMask = Boolean(page?.maskPreviewURL);
   elements.workspace.classList.toggle("mask-mode", maskMode);
   elements.workspace.classList.toggle("mask-brush-tool", maskMode && maskTool === "add");
   elements.workspace.classList.toggle("mask-eraser-tool", maskMode && maskTool === "erase");
   elements.maskPrimaryTools.hidden = !maskMode;
-  elements.sourcePreviewCaption.textContent = t(maskMode ? "maskLayer" : "sourceImage");
+  elements.sourcePreviewCaption.textContent = t(
+    colorizationMaskMode ? "colorizationMask" : maskMode ? "maskLayer" : "sourceImage"
+  );
   elements.maskLayer.hidden = !maskMode || !hasMask;
   elements.maskDrawingLayer.hidden = !maskMode || !hasMask;
   if (!maskMode || !hasMask) hideMaskBrushCursor();
@@ -1970,7 +2155,9 @@ function renderMaskEditor(page) {
     if (elements.maskDrawingLayer.width !== width) elements.maskDrawingLayer.width = width;
     if (elements.maskDrawingLayer.height !== height) elements.maskDrawingLayer.height = height;
   }
-  if (hasMask) {
+  if (colorizationMaskMode && hasMask) {
+    renderMaskCanvas(page);
+  } else if (hasMask) {
     requestMaskPreview(page);
   } else {
     elements.maskLayer.getContext("2d")?.clearRect(0, 0, elements.maskLayer.width, elements.maskLayer.height);
@@ -1982,7 +2169,8 @@ function renderMaskEditor(page) {
     selectedMaskRegionID = null;
   }
   const region = selectedMaskRegion(page);
-  const disabled = !maskMode || !hasMask || !region || state.isProcessing;
+  const disabled = !maskMode || !hasMask || state.isProcessing
+    || (translationMaskMode && !region);
   for (const control of [
     elements.maskBrush,
     elements.maskEraser,
@@ -1991,8 +2179,12 @@ function renderMaskEditor(page) {
   const hasPendingStroke = page && region
     ? maskPreviewState(page).pendingStrokes.some((stroke) => stroke.regionID === region.id)
     : false;
-  elements.maskUndo.disabled = disabled || !(region.maskStrokes?.length || hasPendingStroke);
-  elements.maskRedo.disabled = disabled || !page.maskRedoRegionIDs?.includes(region.id);
+  elements.maskUndo.disabled = colorizationMaskMode
+    ? disabled || !(page?.colorizationMaskStrokes?.length)
+    : disabled || !(region?.maskStrokes?.length || hasPendingStroke);
+  elements.maskRedo.disabled = colorizationMaskMode
+    ? disabled || !page?.colorizationMaskRedoAvailable
+    : disabled || !page?.maskRedoRegionIDs?.includes(region?.id);
   elements.maskBrush.classList.toggle("active", maskTool === "add");
   elements.maskEraser.classList.toggle("active", maskTool === "erase");
   elements.maskBrushSizeValue.value = `${elements.maskBrushSize.value} px`;
@@ -2010,7 +2202,7 @@ function updateMaskBrushCursor(event) {
   if (!position) { cursor.hidden = true; return; }
   const page = activePage();
   const rect = elements.maskDrawingLayer.getBoundingClientRect();
-  if (activeWorkflowStep !== "mask" || !page?.maskPreviewURL
+  if (!["mask", "colorization-mask"].includes(activeWorkflowStep) || !page?.maskPreviewURL
       || !rect.width || !rect.height) {
     cursor.hidden = true;
     return;
@@ -2060,7 +2252,8 @@ function regionForMaskPoint(page, point, diameter) {
 
 function beginMaskStroke(event) {
   if (event.shiftKey && canvasViewport.scale > 1) return;
-  if (event.button !== 0 || activeWorkflowStep !== "mask") return;
+  const colorizationMaskMode = activeWorkflowStep === "colorization-mask";
+  if (event.button !== 0 || (!colorizationMaskMode && activeWorkflowStep !== "mask")) return;
   const page = activePage();
   const point = normalizedMaskPoint(event);
   if (!page?.maskPreviewURL || !point || state.isProcessing) {
@@ -2068,19 +2261,20 @@ function beginMaskStroke(event) {
     return;
   }
   const diameter = Number(elements.maskBrushSize.value) / Math.max(1, Math.min(page.pixelWidth, page.pixelHeight));
-  const region = regionForMaskPoint(page, point, diameter);
-  if (!region) {
+  const region = colorizationMaskMode ? null : regionForMaskPoint(page, point, diameter);
+  if (!colorizationMaskMode && !region) {
     showError(new Error(t("noMaskRegions")));
     return;
   }
-  selectMaskRegion(page, region.id);
+  if (region) selectMaskRegion(page, region.id);
   // 確定要開始畫了才暫停防抖更新；設在前面的話，上面任何一個 early return
   // 都會讓旗標卡在 true，譯文從此再也存不進去。
   maskStrokeSuspendsRegionUpdates = true;
   activeMaskStroke = {
     pointerID: event.pointerId,
     pageID: page.id,
-    regionID: region.id,
+    regionID: region?.id ?? null,
+    workflowMode: colorizationMaskMode ? "colorization" : "translation",
     mode: maskTool,
     diameter,
     points: [point],
@@ -2117,6 +2311,28 @@ function finishMaskStroke(event, cancelled = false) {
   }
   const page = state?.pages.find((item) => item.id === stroke.pageID);
   if (!page) return;
+  if (stroke.workflowMode === "colorization") {
+    stroke.localID = `${Date.now()}-${Math.random()}`;
+    page.colorizationMaskStrokes ??= [];
+    page.colorizationMaskStrokes.push(stroke);
+    renderMaskCanvas(page);
+    renderMaskEditor(page);
+    invoke("appendColorizationMaskStroke", {
+      pageID: stroke.pageID,
+      mode: stroke.mode,
+      diameter: stroke.diameter,
+      points: stroke.points,
+    }).catch((error) => {
+      page.colorizationMaskStrokes = page.colorizationMaskStrokes.filter(
+        (item) => item.localID !== stroke.localID
+      );
+      renderMaskCanvas(activePage());
+      renderMaskEditor(activePage());
+      showError(error);
+    });
+    event.preventDefault();
+    return;
+  }
   const preview = maskPreviewState(page);
   stroke.localID = `${Date.now()}-${Math.random()}`;
   preview.pendingBaseRevision ??= preview.revision ?? maskRevision(page);
@@ -2346,7 +2562,9 @@ function showNativePixelPreview() {
 function beginCanvasPan(event) {
   if (event.button !== 0 || canvasViewport.scale <= 1) return;
   if (event.target.closest?.(".translation-text")) return;
-  if (activeWorkflowStep === "mask" && event.target === elements.maskDrawingLayer && !event.shiftKey) return;
+  if (["mask", "colorization-mask"].includes(activeWorkflowStep)
+      && event.target === elements.maskDrawingLayer
+      && !event.shiftKey) return;
   const stage = event.currentTarget;
   canvasViewport.drag = {
     pointerID: event.pointerId,
@@ -2765,6 +2983,9 @@ function hideOutputPreview() {
 function renderPage() {
   const page = activePage();
   syncWorkflowStep(page);
+  const colorizationMode = workflowMode === "colorization";
+  const colorizationPagesActive = activeWorkflowStep === "colorization-pages";
+  const colorizationMaskActive = activeWorkflowStep === "colorization-mask";
   const hasProject = Boolean(state.activeProjectID);
   elements.appendPages.disabled = !hasProject || state.isProcessing || state.isSwitchingProject;
   elements.emptyState.hidden = hasProject && Boolean(page);
@@ -2777,20 +2998,33 @@ function renderPage() {
       || page?.translationPreviewURL
       || page?.outputPreviewURL
   );
+  const colorizationOutputStepActive = activeWorkflowStep === "colorization-4";
   elements.reveal.textContent = t(
-    outputStepActive
+    colorizationPagesActive
+      ? "clearAndRestart"
+      : outputStepActive || colorizationOutputStepActive
       ? "revealOutput"
       : activeWorkflowStep === "pages"
         ? "clearAndRestart"
         : "recalculate"
   );
-  elements.reveal.hidden = !page
-    || activeWorkflowStep === "translate"
-    || (activeWorkflowStep === "pages" && !hasCalculatedOutput);
-  elements.reveal.disabled = outputStepActive
-    ? !page?.outputPreviewURL
-    : !page || state.isProcessing;
-  elements.exportPSD.hidden = !outputStepActive;
+  elements.reveal.hidden = colorizationMode
+    ? !page
+    : !page
+      || activeWorkflowStep === "translate"
+      || (activeWorkflowStep === "pages" && !hasCalculatedOutput);
+  elements.reveal.disabled = colorizationPagesActive
+    ? !page || state.isProcessing
+    : outputStepActive || colorizationOutputStepActive
+      ? !page?.outputPreviewURL
+      : !page || state.isProcessing;
+  if (activeWorkflowStep === "colorization-3") {
+    elements.reveal.disabled = !page || state.isProcessing || !colorizationMaskReady(page);
+  }
+  if (colorizationOutputStepActive) {
+    elements.reveal.disabled = !page?.colorizationOutputURL || state.isProcessing;
+  }
+  elements.exportPSD.hidden = colorizationMode || !outputStepActive;
   elements.exportPSD.disabled = !outputStepActive || !page || state.isProcessing
     || !Boolean(page.outputPreviewURL || page.translationPreviewURL || page.maskAppliedPreviewURL);
   const canReextractText = Boolean(
@@ -2817,16 +3051,38 @@ function renderPage() {
       : t("superResolutionModelRequired");
   elements.superResolution.setAttribute("aria-label", elements.superResolution.title);
   elements.canvasPixelPreview.disabled = !page || state.isProcessing;
-  const nextPage = outputStepActive ? nextPageAfter(page) : null;
-  elements.workflowNext.hidden = !page;
+  const nextPage = outputStepActive || colorizationOutputStepActive ? nextPageAfter(page) : null;
+  const colorizationPreviewReady = selectedWorkflowPages().every(
+    (selectedPage) => hasWorkflowStepData(selectedPage, "colorization-3")
+  );
+  const outputStepReady = outputStepActive
+    ? Boolean(page?.outputPreviewURL)
+    : colorizationOutputStepActive
+      ? Boolean(page?.colorizationOutputURL)
+      : false;
+  const colorizationPreviousAvailable = colorizationMaskActive
+    || activeWorkflowStep === "colorization-3"
+    || colorizationOutputStepActive;
+  const colorizationNextAvailable = colorizationPagesActive
+    || colorizationMaskActive
+    || activeWorkflowStep === "colorization-3"
+    || colorizationOutputStepActive;
+  elements.workflowPrevious.hidden = !colorizationMode || !colorizationPreviousAvailable;
+  elements.workflowPrevious.disabled = !page || state.isProcessing;
+  elements.workflowNext.hidden = colorizationMode
+    ? !page || !colorizationNextAvailable
+    : !page;
   elements.workflowNext.disabled = !page || state.isProcessing
-    || (outputStepActive && !nextPage);
-  const workflowNextLabel = outputStepActive
+    || ((outputStepActive || colorizationOutputStepActive) && !nextPage && outputStepReady)
+    || (colorizationMaskActive && !colorizationMaskReady(page))
+    || (activeWorkflowStep === "colorization-3" && !colorizationPreviewReady)
+    || (colorizationOutputStepActive && !page?.colorizationOutputURL && state.isProcessing);
+  const workflowNextLabel = outputStepActive || colorizationOutputStepActive
     ? (nextPage ? t("nextPage") : t("lastPage"))
     : t("nextWorkflowStep");
   elements.workflowNext.title = workflowNextLabel;
   elements.workflowNext.setAttribute("aria-label", workflowNextLabel);
-  elements.progress.value = page?.progress ?? 0;
+  elements.progress.value = page ? workflowPageState(page).progress : 0;
   elements.projectPath.textContent = state.sourceDirectoryPath ?? "";
   renderCanvasInfo(page);
   if (!page) {
@@ -2842,12 +3098,44 @@ function renderPage() {
     resetCanvasViewport(page.id);
   }
 
-  if (elements.sourcePreview.dataset.source !== page.sourcePreviewURL) {
+  const sourcePreview = colorizationMode
+    ? colorizationPageInput(page)
+    : { url: page.sourcePreviewURL, caption: t("sourceImage") };
+  elements.sourcePreview.alt = colorizationMode && !sourcePreview.isFallback
+    ? t("translatedComicPage")
+    : t("sourceComicPage");
+  if (elements.sourcePreview.dataset.source !== sourcePreview.url) {
     resetCanvasStackLayout(elements.sourceImageStack, elements.sourcePreview);
-    elements.sourcePreview.dataset.source = page.sourcePreviewURL;
-    elements.sourcePreview.src = page.sourcePreviewURL;
+    elements.sourcePreview.dataset.source = sourcePreview.url;
+    elements.sourcePreview.src = sourcePreview.url;
   }
   renderMaskEditor(page);
+  if (colorizationMode) {
+    if (!colorizationMaskActive) {
+      elements.sourcePreviewCaption.textContent = sourcePreview.caption;
+    }
+    elements.resultPreviewCaption.textContent = t("colorizationWorkflowTitle");
+    if (colorizationMaskActive) {
+      hideOutputPreview();
+      elements.outputPlaceholder.textContent = t("colorizationMaskHelp");
+    } else if (activeWorkflowStep === "colorization-3" && page.colorizationPreviewURL) {
+      elements.resultPreviewCaption.textContent = t("colorizationPreview");
+      showOutputPreview(page.colorizationPreviewURL, t("colorizationPreview"));
+    } else if (colorizationOutputStepActive && page.colorizationOutputURL) {
+      elements.resultPreviewCaption.textContent = t("colorizationOutput");
+      showOutputPreview(page.colorizationOutputURL, t("colorizationOutput"));
+    } else {
+      hideOutputPreview();
+      elements.outputPlaceholder.textContent = t(
+        activeWorkflowStep === "colorization-3" ? "colorizationPreviewRequired" : "colorizationOutputRequired"
+      );
+    }
+    elements.outputPlaceholder.classList.remove("processing");
+    applyCanvasViewport();
+    renderTranslationLayer(page);
+    renderRegions(page);
+    return;
+  }
   const outputJob = state.batchJobs.find((job) =>
     ["compose", "fullPage"].includes(job.operation)
       && ["queued", "running"].includes(job.status)
@@ -2903,6 +3191,15 @@ function renderPage() {
 
 function renderSettings() {
   const options = state.options;
+  elements.colorizationModelStatus.textContent = t(
+    hasAvailableModelCapability("imageColorization")
+      ? "colorizationModelReady"
+      : "colorizationModelMissing"
+  );
+  elements.colorizationColorRange.value = options.colorizationColorRange ?? "unrestricted";
+  elements.colorizationMode.value = options.colorizationMode ?? "watercolor";
+  elements.colorizationColorRange.disabled = true;
+  elements.colorizationMode.disabled = true;
   if (document.activeElement !== elements.targetLanguage) elements.targetLanguage.value = options.targetLanguageCode;
   elements.readingDirection.value = options.readingDirection;
   elements.writingDirection.value = options.defaultStyle.writingDirection;
@@ -2984,28 +3281,6 @@ function renderSettings() {
     );
     if (selectedOption) selectedOption.selected = true;
   }
-  // 翻譯選單顯示所有已下載的模型版本；runtime 只會載入目前選取的版本，
-  // 因此不能以 state.loadedModels（每種 capability 最多一個）作為唯一來源。
-  const translationModels = availableTranslationModels();
-  const translationOptions = translationModels.map((model) => {
-    const option = document.createElement("option");
-    option.value = translationModelOptionValue(model);
-    option.textContent = `${model.displayName} · ${t(
-      model.capability === "textToText" ? "modelTabTextToText" : "modelTabImageToText"
-    )}`;
-    return option;
-  });
-  if (!translationOptions.length) {
-    const unavailable = document.createElement("option");
-    unavailable.value = "";
-    unavailable.textContent = t("translationModelNotLoaded");
-    unavailable.disabled = true;
-    translationOptions.push(unavailable);
-  }
-  elements.translationModelMethod.replaceChildren(...translationOptions);
-  elements.translationModelMethod.value = translationModels.length
-    ? selectedTranslationModelValue()
-    : "";
   const quality = options.translationQuality ?? {};
   elements.translationPageContext.checked = quality.usePageContext ?? true;
   elements.translationReviewPass.checked = quality.reviewPassEnabled ?? false;
@@ -3023,7 +3298,6 @@ function renderSettings() {
     elements.writingDirection,
     elements.fontName,
     elements.textLocalizationMethod,
-    elements.translationModelMethod,
     elements.translationPageContext,
     elements.translationReviewPass,
     elements.translationQualityCheck,
@@ -3034,9 +3308,6 @@ function renderSettings() {
     control.disabled = !state.activeProjectID;
   }
   elements.textLocalizationMethod.disabled = !state.activeProjectID || state.isProcessing;
-  elements.translationModelMethod.disabled = !state.activeProjectID
-    || state.isProcessing
-    || !translationModels.length;
   elements.eraseColorTrigger.disabled = !state.activeProjectID;
   elements.eraseColorEyedropper.disabled = activeWorkflowStep !== "pages"
     || !activePage()
@@ -3117,14 +3388,14 @@ function globalSettingsPayload(overrides = {}) {
     imageCompositingBackend: current.imageCompositingBackend,
     dataDirectoryPath: current.dataDirectoryPath,
     defaultOutputDirectoryPath: current.defaultOutputDirectoryPath,
-    textToTextModelPath: current.textToTextModelPath,
-    textToTextModelDownloadDirectoryPath: current.textToTextModelDownloadDirectoryPath,
-    textToTextModelVariant: current.textToTextModelVariant,
     imageToTextModelPath: current.imageToTextModelPath,
     imageToTextModelDownloadDirectoryPath: current.imageToTextModelDownloadDirectoryPath,
     imageToTextModelVariant: current.imageToTextModelVariant,
     modelThinkingEnabled: current.modelThinkingEnabled,
     imageToImageModelPath: current.imageToImageModelPath,
+    imageColorizationModelPath: current.imageColorizationModelPath,
+    imageColorizationModelDownloadDirectoryPath: current.imageColorizationModelDownloadDirectoryPath,
+    imageColorizationModelVariant: current.imageColorizationModelVariant,
     automaticSuperResolutionEnabled: current.automaticSuperResolutionEnabled,
     superResolutionModelPath: current.superResolutionModelPath,
     superResolutionModelDownloadDirectoryPath: current.superResolutionModelDownloadDirectoryPath,
@@ -3193,65 +3464,6 @@ function renderGlobalSettings() {
   elements.settingsModelThinking.checked = settings.modelThinkingEnabled ?? false;
   elements.settingsModelThinking.disabled = state.isProcessing;
   elements.dataDirectoryRestartNote.hidden = !settings.dataDirectoryRestartRequired;
-  elements.settingsTextToTextModel.value = settings.textToTextModelDownloadDirectoryPath ?? "";
-  const textToTextOptions = settings.textToTextModelOptions ?? [];
-  const textToTextSignature = textToTextOptions.map((model) => [
-    model.id,
-    model.displayName,
-    model.recommended,
-    model.installed,
-    t("recommended"),
-    t("modelDownloaded"),
-  ].join(":" )).join("\n");
-  if (elements.settingsTextToTextModelVariant.dataset.optionsSignature !== textToTextSignature) {
-    elements.settingsTextToTextModelVariant.replaceChildren(...textToTextOptions.map((model) => {
-      const option = document.createElement("option");
-      option.value = model.id;
-      const annotations = [];
-      if (model.recommended) annotations.push(t("recommended"));
-      if (model.installed) annotations.push(t("modelDownloaded"));
-      option.textContent = annotations.length > 0
-        ? `${model.displayName}（${annotations.join(" · ")}）`
-        : model.displayName;
-      return option;
-    }));
-    elements.settingsTextToTextModelVariant.dataset.optionsSignature = textToTextSignature;
-  }
-  elements.settingsTextToTextModelVariant.value = settings.textToTextModelVariant;
-  const textToTextDownload = settings.modelDownloadState?.capability === "textToText"
-    ? settings.modelDownloadState
-    : null;
-  const textToTextDownloading = Boolean(textToTextDownload);
-  const textToTextDirectorySelected = Boolean(settings.textToTextModelDownloadDirectoryPath);
-  elements.settingsTextToTextModelDownload.disabled = !textToTextDirectorySelected
-    || settings.textToTextModelInstalled
-    || textToTextDownloading;
-  elements.settingsTextToTextModelDownload.textContent = settings.textToTextModelInstalled
-    ? t("modelInstalled")
-    : textToTextDownloading ? t("downloadingModel") : t("downloadModel");
-  elements.settingsTextToTextModelVariant.disabled = textToTextDownloading;
-  elements.settingsTextToTextModelClear.disabled = !textToTextDownloading
-    && !settings.textToTextModelDownloadDirectoryPath
-    && !settings.textToTextModelPath;
-  elements.settingsTextToTextModelClear.textContent = textToTextDownloading
-    ? t("stopDownload") : t("clear");
-  elements.settingsTextToTextModelClear.classList.toggle("danger-text", textToTextDownloading);
-  elements.settingsTextToTextModelDelete.hidden = !settings.textToTextModelInstalled;
-  elements.settingsTextToTextModelDelete.disabled = textToTextDownloading || state.isProcessing;
-  elements.settingsTextToTextModelDownloadProgress.hidden = !textToTextDownloading;
-  if (textToTextDownload) {
-    const progress = Math.round(textToTextDownload.progress * 100);
-    elements.settingsTextToTextModelDownloadProgressBar.value = textToTextDownload.progress;
-    elements.settingsTextToTextModelDownloadStatus.textContent = textToTextDownload.totalByteCount > 0
-      ? t("modelDownloadProgressDetail", {
-          progress,
-          downloaded: formatByteCount(textToTextDownload.downloadedByteCount),
-          total: formatByteCount(textToTextDownload.totalByteCount),
-          speed: textToTextDownload.bytesPerSecond > 0
-            ? formatByteCount(textToTextDownload.bytesPerSecond) : "—",
-        })
-      : t("modelDownloadProgress", { progress });
-  }
   elements.settingsImageToTextModel.value = settings.imageToTextModelDownloadDirectoryPath ?? "";
   const modelOptions = settings.imageToTextModelOptions ?? [];
   const modelOptionsSignature = modelOptions
@@ -3318,6 +3530,95 @@ function renderGlobalSettings() {
       : t("modelDownloadProgress", { progress });
   }
   elements.settingsImageToImageModel.value = settings.imageToImageModelPath ?? "";
+  elements.settingsImageColorizationModel.value = settings.imageColorizationModelDownloadDirectoryPath ?? "";
+  const imageColorizationOptions = settings.imageColorizationModelOptions ?? [];
+  const imageColorizationSignature = imageColorizationOptions.map((model) => [
+    model.id,
+    model.displayName,
+    model.recommended,
+    model.installed,
+    t("recommended"),
+    t("modelDownloaded"),
+  ].join(":")).join("\n");
+  if (elements.settingsImageColorizationModelVariant.dataset.optionsSignature
+      !== imageColorizationSignature) {
+    elements.settingsImageColorizationModelVariant.replaceChildren(...imageColorizationOptions.map((model) => {
+      const option = document.createElement("option");
+      option.value = model.id;
+      const annotations = [];
+      if (model.recommended) annotations.push(t("recommended"));
+      if (model.installed) annotations.push(t("modelDownloaded"));
+      option.textContent = annotations.length > 0
+        ? `${model.displayName}（${annotations.join(" · ")}）`
+        : model.displayName;
+      return option;
+    }));
+    elements.settingsImageColorizationModelVariant.dataset.optionsSignature
+      = imageColorizationSignature;
+  }
+  elements.settingsImageColorizationModelVariant.value = settings.imageColorizationModelVariant;
+  if (elements.colorizationProjectModelVariant.dataset.optionsSignature
+      !== imageColorizationSignature) {
+    elements.colorizationProjectModelVariant.replaceChildren(...imageColorizationOptions.map((model) => {
+      const option = document.createElement("option");
+      option.value = model.id;
+      const annotations = [];
+      if (model.recommended) annotations.push(t("recommended"));
+      if (model.installed) annotations.push(t("modelDownloaded"));
+      option.textContent = annotations.length > 0
+        ? `${model.displayName}（${annotations.join(" · ")}）`
+        : model.displayName;
+      return option;
+    }));
+    elements.colorizationProjectModelVariant.dataset.optionsSignature
+      = imageColorizationSignature;
+  }
+  elements.colorizationProjectModelVariant.value = settings.imageColorizationModelVariant;
+  const imageColorizationDownload = settings.modelDownloadState?.capability === "imageColorization"
+    ? settings.modelDownloadState
+    : null;
+  const imageColorizationDownloading = Boolean(imageColorizationDownload);
+  const imageColorizationDirectorySelected = Boolean(
+    settings.imageColorizationModelDownloadDirectoryPath
+  );
+  elements.settingsImageColorizationModelDownload.disabled = !imageColorizationDirectorySelected
+    || settings.imageColorizationModelInstalled
+    || imageColorizationDownloading;
+  elements.settingsImageColorizationModelDownload.textContent = settings.imageColorizationModelInstalled
+    ? t("modelInstalled")
+    : imageColorizationDownloading ? t("downloadingModel") : t("downloadModel");
+  elements.settingsImageColorizationModelVariant.disabled = imageColorizationDownloading;
+  elements.colorizationProjectModelVariant.disabled = imageColorizationDownloading
+    || state.isProcessing
+    || !state.activeProjectID;
+  elements.settingsImageColorizationModelClear.disabled = !imageColorizationDownloading
+    && !settings.imageColorizationModelDownloadDirectoryPath
+    && !settings.imageColorizationModelPath;
+  elements.settingsImageColorizationModelClear.textContent = imageColorizationDownloading
+    ? t("stopDownload") : t("clear");
+  elements.settingsImageColorizationModelClear.classList.toggle(
+    "danger-text",
+    imageColorizationDownloading
+  );
+  elements.settingsImageColorizationModelDelete.hidden = !settings.imageColorizationModelInstalled;
+  elements.settingsImageColorizationModelDelete.disabled = imageColorizationDownloading
+    || state.isProcessing;
+  elements.settingsImageColorizationModelDownloadProgress.hidden = !imageColorizationDownloading;
+  if (imageColorizationDownload) {
+    const progress = Math.round(imageColorizationDownload.progress * 100);
+    elements.settingsImageColorizationModelDownloadProgressBar.value
+      = imageColorizationDownload.progress;
+    elements.settingsImageColorizationModelDownloadStatus.textContent
+      = imageColorizationDownload.totalByteCount > 0
+        ? t("modelDownloadProgressDetail", {
+            progress,
+            downloaded: formatByteCount(imageColorizationDownload.downloadedByteCount),
+            total: formatByteCount(imageColorizationDownload.totalByteCount),
+            speed: imageColorizationDownload.bytesPerSecond > 0
+              ? formatByteCount(imageColorizationDownload.bytesPerSecond) : "—",
+          })
+        : t("modelDownloadProgress", { progress });
+  }
   elements.settingsAutomaticSuperResolution.checked = settings.automaticSuperResolutionEnabled;
   elements.settingsSuperResolutionModel.value = settings.superResolutionModelDownloadDirectoryPath ?? "";
   const superResolutionOptions = settings.superResolutionModelOptions ?? [];
@@ -3738,6 +4039,7 @@ function showModelTab(name) {
     page.hidden = !active;
   }
   localStorage.setItem(modelTabStorageKey, selected);
+  revealModelTab(tabs.find((tab) => tab.dataset.modelTab === selected));
 }
 
 async function choosePreferenceDirectory(method, overrides) {
@@ -3755,9 +4057,10 @@ function updateSettings() {
   const selectedImageToTextVariant = nextLocalizationMethod === "vlm"
     ? selectedLocalizationOption?.dataset.modelVariantID || null
     : null;
-  const previousTranslationMethod = state?.options.translationModelMethod ?? "textToText";
-  const selectedTranslation = parsedTranslationModelSelection();
-  const nextTranslationMethod = selectedTranslation.capability || previousTranslationMethod;
+  const previousColorizationColorRange = state?.options.colorizationColorRange ?? "unrestricted";
+  const previousColorizationMode = state?.options.colorizationMode ?? "watercolor";
+  const nextColorizationColorRange = elements.colorizationColorRange.value || "unrestricted";
+  const nextColorizationMode = elements.colorizationMode.value || "watercolor";
   const previousRegionFonts = [];
   elements.fontName.style.fontFamily = elements.fontName.value;
   elements.fontNameValue.textContent = elements.fontName.value;
@@ -3774,7 +4077,9 @@ function updateSettings() {
     renderTranslationLayer(activePage());
   }
   if (state) state.options.textLocalizationMethod = nextLocalizationMethod;
-  if (state) state.options.translationModelMethod = nextTranslationMethod;
+  if (state) state.options.translationModelMethod = "imageToText";
+  if (state) state.options.colorizationColorRange = nextColorizationColorRange;
+  if (state) state.options.colorizationMode = nextColorizationMode;
   const persistLocalizationModel = selectedImageToTextVariant
     && selectedImageToTextVariant !== state?.globalSettings?.imageToTextModelVariant
     ? updateGlobalSettings({ imageToTextModelVariant: selectedImageToTextVariant })
@@ -3785,7 +4090,8 @@ function updateSettings() {
     writingDirection: elements.writingDirection.value,
     fontName: elements.fontName.value,
     textLocalizationMethod: nextLocalizationMethod,
-    translationModelMethod: nextTranslationMethod,
+    colorizationColorRange: nextColorizationColorRange,
+    colorizationMode: nextColorizationMode,
     eraseColorHex: elements.eraseColor.value,
     translationQuality: {
       usePageContext: elements.translationPageContext.checked,
@@ -3799,7 +4105,8 @@ function updateSettings() {
     imageToTextModelVariant: selectedImageToTextVariant,
   })).catch((error) => {
     if (state) state.options.textLocalizationMethod = previousLocalizationMethod;
-    if (state) state.options.translationModelMethod = previousTranslationMethod;
+    if (state) state.options.colorizationColorRange = previousColorizationColorRange;
+    if (state) state.options.colorizationMode = previousColorizationMode;
     if (state && previousDefaultFont !== nextDefaultFont) {
       state.options.defaultStyle.fontName = previousDefaultFont;
       for (const [region, fontName] of previousRegionFonts) region.style.fontName = fontName;
@@ -3808,20 +4115,6 @@ function updateSettings() {
     if (state) renderSettings();
     showError(error);
   });
-}
-
-async function handleTranslationModelChange() {
-  const selected = parsedTranslationModelSelection();
-  if (!selected.capability) return;
-  const variantKey = selected.capability === "textToText"
-    ? "textToTextModelVariant"
-    : "imageToTextModelVariant";
-  // 手動載入且不在下載目錄 catalog 的模型沒有 variant ID，只需切換流程類型。
-  if (selected.variantID) {
-    const updated = await updateGlobalSettings({ [variantKey]: selected.variantID });
-    if (!updated) return;
-  }
-  await updateSettings();
 }
 
 function closeFontPreviewList() {
@@ -4005,7 +4298,47 @@ elements.calculationReasoningToggle.addEventListener("click", () => {
 for (const tab of document.querySelectorAll("[data-settings-tab]")) {
   tab.addEventListener("click", () => showSettingsPage(tab.dataset.settingsTab));
 }
+elements.openColorizationModelSettings.addEventListener("click", () => {
+  showSettingsPage("models");
+  showModelTab("imageColorization");
+  elements.settingsDialog.showModal();
+});
 const modelTabs = [...document.querySelectorAll("[data-model-tab]")];
+const modelTabsViewport = document.querySelector(".model-tabs");
+const previousModelTabButton = document.querySelector("#model-tab-previous");
+const nextModelTabButton = document.querySelector("#model-tab-next");
+function updateModelTabsNavigation() {
+  const maxScroll = Math.max(modelTabsViewport.scrollWidth - modelTabsViewport.clientWidth, 0);
+  previousModelTabButton.disabled = maxScroll <= 1 || modelTabsViewport.scrollLeft <= 1;
+  nextModelTabButton.disabled = maxScroll <= 1 || modelTabsViewport.scrollLeft >= maxScroll - 1;
+}
+function revealModelTab(tab, behavior = "smooth") {
+  if (!tab || modelTabsViewport.clientWidth <= 0) {
+    updateModelTabsNavigation();
+    return;
+  }
+  const viewportBounds = modelTabsViewport.getBoundingClientRect();
+  const tabBounds = tab.getBoundingClientRect();
+  const leftOverflow = tabBounds.left - viewportBounds.left;
+  const rightOverflow = tabBounds.right - viewportBounds.right;
+  if (leftOverflow < 0) {
+    modelTabsViewport.scrollBy({ left: leftOverflow - 4, behavior });
+  } else if (rightOverflow > 0) {
+    modelTabsViewport.scrollBy({ left: rightOverflow + 4, behavior });
+  }
+  requestAnimationFrame(updateModelTabsNavigation);
+}
+function panModelTabs(direction) {
+  const distance = Math.max(modelTabsViewport.clientWidth * 0.75, 120);
+  modelTabsViewport.scrollBy({ left: direction * distance, behavior: "smooth" });
+}
+previousModelTabButton.addEventListener("click", () => panModelTabs(-1));
+nextModelTabButton.addEventListener("click", () => panModelTabs(1));
+modelTabsViewport.addEventListener("scroll", updateModelTabsNavigation, { passive: true });
+new ResizeObserver(() => {
+  revealModelTab(modelTabs.find((tab) => tab.classList.contains("active")), "auto");
+  updateModelTabsNavigation();
+}).observe(modelTabsViewport);
 for (const [index, tab] of modelTabs.entries()) {
   tab.addEventListener("click", () => showModelTab(tab.dataset.modelTab));
   tab.addEventListener("keydown", (event) => {
@@ -4048,6 +4381,7 @@ for (const [index, tab] of inspectorTabs.entries()) {
 }
 showInspectorTab(localStorage.getItem(inspectorTabStorageKey) ?? "project");
 document.querySelector("#empty-create-project").addEventListener("click", () => invoke("chooseSourceDirectory").catch(showError));
+elements.workflowMode.addEventListener("change", () => setWorkflowMode(elements.workflowMode.value));
 elements.appendPages.addEventListener("click", () => invoke("appendPages").catch(showError));
 document.querySelector("#rescan-source").addEventListener("click", () => invoke("rescanSourceDirectory").catch(showError));
 document.querySelector("#export-psd").addEventListener("click", async () => {
@@ -4060,9 +4394,22 @@ document.querySelector("#export-psd").addEventListener("click", async () => {
   }
 });
 document.querySelector("#process-selected").addEventListener("click", () => {
-  runBatchWithCalculationDialog("fullPage", state?.selectedPageIDs ?? []).catch(showError);
+  const operation = workflowMode === "colorization" ? "colorize" : "fullPage";
+  runBatchWithCalculationDialog(operation, state?.selectedPageIDs ?? []).catch(showError);
 });
 document.querySelector('.workflow-step[data-step="pages"]').addEventListener("click", () => selectWorkflowStep("pages"));
+document.querySelector('.workflow-step[data-step="colorization-pages"]').addEventListener("click", () => {
+  selectWorkflowStep("colorization-pages");
+});
+document.querySelector('.workflow-step[data-step="colorization-mask"]').addEventListener("click", () => {
+  selectOrPrepareColorizationMask().catch(showError);
+});
+document.querySelector('.workflow-step[data-step="colorization-3"]').addEventListener("click", () => {
+  selectOrCalculateWorkflowStep("colorization-3", "colorize").catch(showError);
+});
+document.querySelector('.workflow-step[data-step="colorization-4"]').addEventListener("click", () => {
+  selectWorkflowStep("colorization-4");
+});
 document.querySelector("#detect-selected").addEventListener("click", () => {
   selectOrCalculateWorkflowStep("mask", "detectMasks").catch(showError);
 });
@@ -4119,6 +4466,14 @@ document.querySelector("#reveal-output").addEventListener("click", () => {
   if (!page) return;
   if (activeWorkflowStep === "compose") {
     invoke("revealOutput", { pageID: page.id }).catch(showError);
+  } else if (activeWorkflowStep === "colorization-4") {
+    invoke("revealOutput", { pageID: page.id, preferColorization: true }).catch(showError);
+  } else if (activeWorkflowStep === "colorization-pages") {
+    resetColorizationWorkflow().catch(showError);
+  } else if (activeWorkflowStep === "colorization-mask") {
+    selectOrCalculateWorkflowStep("colorization-mask", "detectMasks", true).catch(showError);
+  } else if (activeWorkflowStep === "colorization-3") {
+    selectOrCalculateWorkflowStep("colorization-3", "colorize", true).catch(showError);
   } else if (activeWorkflowStep === "pages") {
     resetSelectedWorkflowPages().catch(showError);
   } else if (activeWorkflowStep === "mask") {
@@ -4127,7 +4482,37 @@ document.querySelector("#reveal-output").addEventListener("click", () => {
     selectOrCalculateWorkflowStep("translate", "translate", true).catch(showError);
   }
 });
+elements.workflowPrevious.addEventListener("click", () => {
+  if (activeWorkflowStep === "colorization-mask") {
+    selectWorkflowStep("colorization-pages");
+  } else if (activeWorkflowStep === "colorization-3") {
+    selectWorkflowStep("colorization-mask");
+  } else if (activeWorkflowStep === "colorization-4") {
+    selectWorkflowStep("colorization-3");
+  }
+});
 elements.workflowNext.addEventListener("click", () => {
+  if (activeWorkflowStep === "colorization-pages") {
+    selectOrPrepareColorizationMask().catch(showError);
+    return;
+  }
+  if (activeWorkflowStep === "colorization-mask") {
+    selectOrCalculateWorkflowStep("colorization-3", "colorize").catch(showError);
+    return;
+  }
+  if (activeWorkflowStep === "colorization-3") {
+    advanceWorkflowStep().catch(showError);
+    return;
+  }
+  if (activeWorkflowStep === "colorization-4") {
+    if (!activePage()?.colorizationOutputURL) {
+      advanceWorkflowStep().catch(showError);
+      return;
+    }
+    const nextPage = nextPageAfter(activePage());
+    if (nextPage) setSelection([nextPage.id], nextPage.id);
+    return;
+  }
   if (activeWorkflowStep === "compose") {
     const nextPage = nextPageAfter(activePage());
     if (nextPage) setSelection([nextPage.id], nextPage.id);
@@ -4178,6 +4563,10 @@ elements.translationRedo.addEventListener("click", () => {
 elements.translationFontIncrease.addEventListener("click", () => adjustSelectedTranslationFontSize(1));
 elements.maskUndo.addEventListener("click", () => {
   const page = activePage();
+  if (activeWorkflowStep === "colorization-mask") {
+    if (page) invoke("undoColorizationMaskStroke", { pageID: page.id }).catch(showError);
+    return;
+  }
   const region = selectedMaskRegion(page);
   if (!page || !region) return;
   const preview = maskPreviewState(page);
@@ -4195,6 +4584,10 @@ elements.maskUndo.addEventListener("click", () => {
 });
 elements.maskRedo.addEventListener("click", () => {
   const page = activePage();
+  if (activeWorkflowStep === "colorization-mask") {
+    if (page) invoke("redoColorizationMaskStroke", { pageID: page.id }).catch(showError);
+    return;
+  }
   const region = selectedMaskRegion(page);
   if (!page || !region) return;
   invoke("redoMaskStroke", { pageID: page.id, regionID: region.id }).catch(showError);
@@ -4300,55 +4693,6 @@ document.querySelector("#choose-default-output-directory").addEventListener("cli
 document.querySelector("#reset-default-output-directory").addEventListener("click", () => {
   updateGlobalSettings({ defaultOutputDirectoryPath: null });
 });
-document.querySelector("#choose-text-to-text-model").addEventListener("click", () => {
-  invoke("chooseModelDownloadDirectory", { capability: "textToText" })
-    .then((result) => {
-      if (!result?.path) return;
-      updateGlobalSettings({
-        textToTextModelDownloadDirectoryPath: result.path,
-        textToTextModelVariant: result.variant ?? state.globalSettings.textToTextModelVariant,
-      });
-    })
-    .catch(showError);
-});
-elements.settingsTextToTextModelVariant.addEventListener("change", () => {
-  updateGlobalSettings({
-    textToTextModelVariant: elements.settingsTextToTextModelVariant.value,
-  });
-});
-elements.settingsTextToTextModelDownload.addEventListener("click", () => {
-  invoke("downloadPreferredModel", {
-    capability: "textToText",
-    variantID: elements.settingsTextToTextModelVariant.value,
-  }).catch(showError);
-});
-elements.settingsTextToTextModelClear.addEventListener("click", () => {
-  if (state.globalSettings.modelDownloadState?.capability === "textToText") {
-    invoke("cancelModelDownload").catch(showError);
-    return;
-  }
-  updateGlobalSettings({
-    textToTextModelPath: null,
-    textToTextModelDownloadDirectoryPath: null,
-  });
-});
-elements.settingsTextToTextModelDelete.addEventListener("click", () => {
-  const settings = state.globalSettings;
-  if (!settings.textToTextModelInstalled) return;
-  const modelName = elements.settingsTextToTextModelVariant.selectedOptions[0]?.textContent
-    ?? settings.textToTextModelVariant;
-  requestConfirmation(
-    t("deleteInstalledModelTitle"),
-    t("deleteInstalledModelConfirmation", { name: modelName }),
-    t("delete")
-  ).then((confirmed) => {
-    if (!confirmed) return;
-    return invoke("deleteInstalledModel", {
-      capability: "textToText",
-      variantID: settings.textToTextModelVariant,
-    });
-  }).catch(showError);
-});
 document.querySelector("#choose-image-to-text-model").addEventListener("click", () => {
   invoke("chooseModelDownloadDirectory", { capability: "imageToText" })
     .then((result) => {
@@ -4406,6 +4750,61 @@ document.querySelector("#choose-image-to-image-model").addEventListener("click",
 });
 document.querySelector("#clear-image-to-image-model").addEventListener("click", () => {
   updateGlobalSettings({ imageToImageModelPath: null });
+});
+document.querySelector("#choose-image-colorization-model").addEventListener("click", () => {
+  invoke("chooseModelDownloadDirectory", { capability: "imageColorization" })
+    .then((result) => {
+      if (!result?.path) return;
+      updateGlobalSettings({
+        imageColorizationModelDownloadDirectoryPath: result.path,
+        imageColorizationModelVariant: result.variant
+          ?? state.globalSettings.imageColorizationModelVariant,
+      });
+    })
+    .catch(showError);
+});
+elements.settingsImageColorizationModelVariant.addEventListener("change", () => {
+  updateGlobalSettings({
+    imageColorizationModelVariant: elements.settingsImageColorizationModelVariant.value,
+  });
+});
+elements.colorizationProjectModelVariant.addEventListener("change", () => {
+  updateGlobalSettings({
+    imageColorizationModelVariant: elements.colorizationProjectModelVariant.value,
+  });
+});
+elements.settingsImageColorizationModelDownload.addEventListener("click", () => {
+  invoke("downloadPreferredModel", {
+    capability: "imageColorization",
+    variantID: elements.settingsImageColorizationModelVariant.value,
+  }).catch(showError);
+});
+elements.settingsImageColorizationModelClear.addEventListener("click", () => {
+  if (state.globalSettings.modelDownloadState?.capability === "imageColorization") {
+    invoke("cancelModelDownload").catch(showError);
+    return;
+  }
+  updateGlobalSettings({
+    imageColorizationModelPath: null,
+    imageColorizationModelDownloadDirectoryPath: null,
+  });
+});
+elements.settingsImageColorizationModelDelete.addEventListener("click", () => {
+  const settings = state.globalSettings;
+  if (!settings.imageColorizationModelInstalled) return;
+  const modelName = elements.settingsImageColorizationModelVariant.selectedOptions[0]?.textContent
+    ?? settings.imageColorizationModelVariant;
+  requestConfirmation(
+    t("deleteInstalledModelTitle"),
+    t("deleteInstalledModelConfirmation", { name: modelName }),
+    t("delete")
+  ).then((confirmed) => {
+    if (!confirmed) return;
+    return invoke("deleteInstalledModel", {
+      capability: "imageColorization",
+      variantID: settings.imageColorizationModelVariant,
+    });
+  }).catch(showError);
 });
 document.querySelector("#choose-super-resolution-model").addEventListener("click", () => {
   invoke("chooseModelDownloadDirectory", { capability: "superResolution" })
@@ -4566,9 +4965,6 @@ for (const control of [
   control.addEventListener("change", updateSettings);
 }
 elements.translationStyleGuide.addEventListener("change", updateSettings);
-elements.translationModelMethod.addEventListener("change", () => {
-  handleTranslationModelChange().catch(showError);
-});
 
 window.addEventListener("error", (event) => {
   invoke("appendApplicationLog", {
@@ -4587,6 +4983,7 @@ window.addEventListener("unhandledrejection", (event) => {
 });
 
 applyColorScheme(colorSchemeSetting());
+renderWorkflowMode();
 applyTranslations();
 onState(render);
 onTransientState(renderTransientState);

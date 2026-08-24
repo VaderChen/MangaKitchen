@@ -1,5 +1,19 @@
 # 第三方模型與授權聲明
 
+## DDColor Tiny Core ML（下載式）
+
+MangaKitchen 的模型下載頁可取得
+[`mlboydaisuke/DDColor-Tiny-CoreML`](https://huggingface.co/mlboydaisuke/DDColor-Tiny-CoreML)，
+用於本機灰階漫畫上色。模型不隨 MangaKitchen repository 或 App 預先發佈，只有使用者明確下載後才保存到選定的模型目錄。
+
+- 上游專案：[`piddnad/DDColor`](https://github.com/piddnad/DDColor)
+- Core ML 轉換：[`mlboydaisuke/DDColor-Tiny-CoreML`](https://huggingface.co/mlboydaisuke/DDColor-Tiny-CoreML)
+- 上游與轉換模型授權：Apache License 2.0
+- 使用內容：`DDColor_Tiny.mlpackage`，512×512 灰階 RGB 輸入與 Lab `ab_channels` 輸出
+- 執行方式：Core ML `computeUnits = .all`；輸出色度會縮放回原頁，再以反對話框遮罩限制可改寫像素
+
+下載模型及其衍生檔仍受上游 Apache-2.0 條款約束；MangaKitchen 的 GPL／商業雙授權不會取代模型本身的授權。
+
 ## Medium 模型轉換工具
 
 Medium Core ML artifact 的離線轉換使用

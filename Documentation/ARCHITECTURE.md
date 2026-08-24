@@ -28,9 +28,11 @@ Project
 
 既有專案可繼續追加上述來源；頁面名稱與順序屬於專案 metadata，不改寫來源檔。從專案移除頁面時只保存排除的相對路徑，不刪除託管或外部來源，因此重掃後也不會把已移除頁面自動加回。
 
-翻譯階段先以 `targetLanguageCode` 解析詞條，再依本頁 `sourceText` 篩選實際出現的專有名詞，最後只把命中的 `ResolvedGlossaryTerm` 注入所選文生文／多模態模型 Prompt。這可避免大型專案將無關詞條全部送進模型，同時讓 GUI、批次流程與 MCP 使用同一套語言選擇規則。
+翻譯階段先以 `targetLanguageCode` 解析詞條，再依本頁 `sourceText` 篩選實際出現的專有名詞，最後只把命中的 `ResolvedGlossaryTerm` 注入 GUI 多模態模型或 MCP 多模態 Agent 的 Prompt。這可避免大型專案將無關詞條全部送進模型，同時讓 GUI、批次流程與 MCP 使用同一套語言選擇規則。GUI 不再提供文生文模型選項；舊專案讀到 `textToText` 時會遷移為 `imageToText`。
 
-## 四階段處理資料流
+## 翻譯與上色資料流
+
+### 翻譯四步驟
 
 ```text
 1. ComicDirectoryScanner
@@ -43,10 +45,10 @@ Project
    ├─ Otsu／連通元件把搜尋結果縮減成字形級像素遮罩，並將文字 bounds 同步縮到字形外框
    └─ 像素層膨脹 + add/erase 畫筆 → 二值 `dialogue-mask.png` + 指定底紙色／CPU／GPU 去字背景 + 專案文字狀態；MCP 直接提供這些完成產物給 Agent
 
-3. OCRRegionTextRecognitionService／TextGenerating／ImageToTextGenerating／外部 MCP Agent + ImageSuperResolving（選用）+ HTMLDialogueTypesetter
+3. OCRRegionTextRecognitionService／ImageToTextGenerating／外部多模態 MCP Agent + ImageSuperResolving（選用）+ HTMLDialogueTypesetter
    ├─ 內建 PP-OCRv6 直接辨識步驟二已建立的文字區域，分開保存每模型 `ocrResults`；`sourceText` 空白時採用預設 OCR 原文，已確認原文、座標與遮罩不覆寫
    ├─ AppStore 支援整頁重新抽字、重新翻譯與單區重新抽取／翻譯；重新抽字不重建步驟二產物
-   ├─ GUI 依 `translationModelMethod` 使用文生文或多模態 Adapter 產生整頁草稿、可選校稿與 QA；MCP 以單頁工作包一次提供原圖、品質參數與遮罩 JSON，Agent 一次回傳全部區域
+   ├─ GUI 固定使用 `imageToText` 多模態 Adapter 產生整頁草稿、可選校稿與 QA；MCP 以單頁工作包一次提供原圖、品質參數與遮罩 JSON，能讀圖的 Agent 一次回傳全部區域
    ├─ MLX Real-ESRGAN 2×／Core ML Anime 4× 寫入獨立 SR 背景，並保護步驟二已去字的遮罩像素
    └─ 依實際背景尺寸應用 HTML/CSS 固定或自動字級、橫排／直排 → `translated.png` 步驟三預覽／分層 PSD
 
@@ -54,30 +56,52 @@ Project
    └─ 只將已確認的步驟三 `translated.png` 原子寫入輸出目錄；不重跑任何模型、遮罩、去字、SR 或排字
 ```
 
+### 上色四步驟
+
+```text
+1. Select Colorization Pages
+   └─ 優先選用既有翻譯輸出作為輸入；沒有翻譯輸出時才回退原圖，不修改翻譯產物
+
+2. ColorizationMaskGenerator
+   ├─ 依既有對話區域、氣泡形狀與人工 add／erase 筆劃建立 `colorization-mask.png`
+   └─ 白色像素允許上色；黑色像素保護對話框與人工擦除區，不能由模型改寫
+
+3. CoreMLDDColorRuntime／外部多模態 MCP Agent
+   ├─ 本機路徑延遲載入下載式 DDColor Tiny Core ML，以原尺寸亮度與模型色度建立 `colorized.png` 預覽
+   ├─ Agent 路徑一次取得實際輸入與反對話框遮罩，回寫同像素尺寸的完整頁面
+   └─ 兩條路徑都再次以遮罩合成，黑色保護區強制取回輸入像素；本步只建立預覽，不寫最終輸出
+
+4. Save Colorization Output
+   └─ 只將既有 `colorized.png` 預覽原子寫入上色輸出；不重跑 DDColor、Agent 或遮罩
+```
+
+上色使用獨立的 `ColorizationPageState`、`colorizationMaskStrokes`、`colorizationPreviewURL` 與 `colorizationOutputURL`，不借用或覆寫翻譯的頁面階段、進度、預覽與輸出。`colorizationColorRange` 與 `colorizationMode` 目前只是保留的介面設定，DDColor Tiny 不接受這兩項推論參數，因此 UI 停用且契約不宣稱它們已生效。
+
 編輯器對文字區域保存每頁最多 50 份記憶體內 undo／redo 快照；文字圖層可調整順序、顯示、透明度、旋轉、對齊、文字顏色與 CSS 描邊，每次成功修改仍會寫回 `.str` 與專案快照。中央畫布的檢視座標與原圖座標分離：可雙軸平移，滾輪縮放以可視畫布中心為錨點，適合視窗與 `1:1` 只改變檢視倍率，不改動區域正規化座標。PSD 匯出不另建 Core Text 排版器：合併預覽與每個文字圖層都由同一份 HTML/CSS 逐層渲染，再封裝為 PSD Raster Layer，並在尺寸一致時附加乾淨背景與隱藏原圖。
 
 翻譯 Provider 不直接擴張為 App 內建清單。MangaKitchen 將 MCP 工作包、細緻排版欄位、進度與可恢復狀態視為主要擴充邊界；外部 Agent 可自行使用其支援的本機或雲端 Provider，再透過穩定 MCP 契約回寫結果。
 
-每個步驟只透過 Swift protocol 交換 `URL`、`DialogueRegion` 與進度，因此可單獨替換與除錯。
-原本的一鍵模式保留，但只負責依序組合步驟二至四。
+每個步驟只透過 Swift protocol 交換 `URL`、`DialogueRegion`、`MaskStroke` 與進度，因此可單獨替換與除錯。翻譯的一鍵模式只依序組合翻譯步驟二至四；上色仍遵循自身的遮罩、預覽、輸出邊界。
 
 ## Target 責任
 
 ### MangaKitchenCore
 
 - 不依賴 AppKit、Metal 或 WebKit。
-- 定義 `ComicPage`、`DialogueRegion`、`ProcessingOptions`、`ProjectGlossary` 與 `GlossaryEntry`。
-- 定義推論、區域偵測、翻譯、遮罩、修補與排版 protocol。
+- 定義 `ComicPage`、`DialogueRegion`、`ProcessingOptions`、`ColorizationPageState`、`ProjectGlossary` 與 `GlossaryEntry`。
+- 定義推論、區域偵測、翻譯、上色、遮罩、修補與排版 protocol。
 - 適合未來供 CLI、測試工具或其他 macOS App 重用。
 
 ### MangaKitchenRuntime
 
-- `ModelRuntimeHub`：每個 capability 同時只保留一個 protocol-based Runtime，分別管理 `textToText`、`imageToText`、`imageToImage` 與 `superResolution`。載入前比對模型 ID、capability 與解析 symlink 後的 canonical path；同一 capability 的並行載入會序列化，第一筆完成後若身分相同即共用 runtime。
+- `ModelRuntimeHub`：每個 capability 同時只保留一個 protocol-based Runtime，分別管理 `textToText`、`imageToText`、`imageToImage`、`imageColorization` 與 `superResolution`。載入前比對模型 ID、capability 與解析 symlink 後的 canonical path；同一 capability 的並行載入會序列化，第一筆完成後若身分相同即共用 runtime。`textToText` 只保留底層相容能力，GUI 與公開翻譯工作流固定使用 `imageToText`。
 - `CoreMLModelRuntime`：讀取 manifest、編譯模型並透過 `MLModelConfiguration` 指定 CPU + Metal GPU。
-- `MLXTextRuntime`／`MLXVLMRuntime`：分別載入本機 Hugging Face 文生文與多模態模型；container 跨頁重用。兩者共用結構化回覆規則與 Think Mode：短 reasoning 第一段沒有完整 final JSON 時，沿用同一 container，以 `enable_thinking = false`、`temperature = 0` 執行第二段收尾。
+- `MLXVLMRuntime`：載入本機 Hugging Face 多模態模型並跨頁重用 container。結構化回覆與 Think Mode 在短 reasoning 第一段沒有完整 final JSON 時，沿用同一 container，以 `enable_thinking = false`、`temperature = 0` 執行第二段收尾。`MLXTextRuntime` 仍是底層相容 runtime，但不出現在 App 模型頁或公開翻譯流程。
 - `VLMStructuredResponseDecoder`：只接受 reasoning 結束後的完整 JSON，不會把 `<think>` 內的片段誤認為答案；reasoning 串流只送往記憶體內 UI store，不寫入 Application LOG 或專案資料。
 - `CoreMLSuperResolutionRuntime`：讀取模型原生輸入／輸出尺寸決定倍率；目前 Anime 512 模型為獨立 4× 權重，不再固定縮回 2×。
 - `MLXRealESRGANSuperResolutionRuntime`：載入 `mlx-community/Real-ESRGAN-x2plus` 的獨立 FP16 RRDBNet 權重，執行原生 2× 超解析；不載入、不重用也不降採樣 4× Anime 模型。
+- `CoreMLDDColorRuntime`：載入下載式 `DDColor_Tiny.mlpackage`，以 512×512 灰階 RGB 輸入預測 Lab `ab_channels`，再把色度高品質縮放回原頁並結合原尺寸亮度；若提供反對話框遮罩，最後交由 `MaskedImageCompositor` 強制保護黑色區域。
+- `ColorizationMaskGenerator`：依既有對話區域、氣泡形狀與上色專用畫筆建立原尺寸反對話框遮罩；白色允許模型輸出、黑色保留輸入，不與翻譯的 `dialogue-mask.png` 混用。
 - `QwenExternalImageEditRuntime`：以 JSONL 監看獨立 Swift/MLX worker，傳遞進度、錯誤與取消訊號。
 - `MaskedImageCompositor`：將生成候選圖縮放回原頁，再只採用 mask 白區，避免生成模型改動未授權區域。
 - `MangaBubbleSegmentationCoreMLRuntime`：內建由 `manga109-segmentation-bubble` 匯出的 Core ML YOLO 分割模型。模型依 image constraint 進行方形 letterbox，優先採用 `cpuAndNeuralEngine`；輸出反算回原圖座標並經 NMS 產生 BBOX，若有 prototype 則同步解出 `bubbleMaskPolygons` 與 `bubbleLayoutBounds`。模型無法載入或推論失敗時，才由 `MangaBubbleCandidateDetector` 的封閉白色連通區演算法後備。
@@ -87,20 +111,20 @@ Project
 - `PPOCRTextDetectionRuntime`／`PPOCRTextRegionDetector`：內建 PP-OCRv6 Medium Det 的原生 Swift／Core ML 文字行定位 runtime，固定輸入使用白底 letterbox，優先採用 `cpuAndNeuralEngine`。它與步驟二遮罩管線隔離，不建立或改寫 `DialogueRegion` 遮罩。
 - `VLMBubbleTextRegionDetector`：只處理已確認對話框裁切並回傳 0...1000 文字座標；不轉錄、不翻譯，也不掃描框外畫面。這個 runtime 同樣不參與步驟二遮罩產生。
 - `SoundEffectRegionDetecting`：預留給未來狀聲字流程的獨立契約，只能掃描既有對話區域之外的畫面；目前 `ComicTranslationPipeline` 不持有、不呼叫，也不把結果混入對話遮罩。
-- 外部 MCP Agent：`prepare_agent_task` 只在 App 步驟二的區域、遮罩與去字背景均完成時，一次傳送指定頁原圖與完整遮罩 JSON；Agent 依既有 `region_id` 抽取原文、翻譯及排版，再由 `submit_agent_result` 建立步驟三預覽。只有使用者要求輸出時才以 `page.render` 執行步驟四。Agent 不新增、刪除、合併或重建區域與遮罩。
+- 外部 MCP Agent：翻譯的 `prepare_agent_task` 只在 App 步驟二區域、遮罩與去字背景均完成時，一次傳送指定頁原圖與完整遮罩 JSON；Agent 依既有 `region_id` 抽取原文、翻譯及排版，再由 `submit_agent_result` 建立步驟三預覽。上色的 `prepare_colorization_task` 則一次傳送實際上色輸入與反對話框遮罩，`submit_colorization_result` 驗證尺寸、正規化 PNG 並重新套用保護遮罩。兩條流程都只有在使用者要求輸出時才呼叫各自的 render 工具。
 - `MangaTextMaskRefiner`：先分析 Core ML BBOX 或 Agent 粗框；若已知 `bubbleMaskPolygons`，會先以氣泡形狀篩選元件。搜尋範圍不會直接成為遮罩，最後以 Otsu 閾值及八鄰域連通元件取得字形像素，並在像素層執行抗鋸齒遲滯與固定像素膨脹，再合併成二值遮罩矩形，避免向量描邊造成灰階毛邊；`bounds` 同步縮到未膨脹的字形外框。暗色背景上的亮字由系統覆蓋檢查回報，必要時由使用者在 App 內以畫筆修正。
-- `VLMRegionTranslationService`：同一翻譯服務可接多模態 runtime 或 `TextOnlyImageToTextAdapter` 包裝的純文字 runtime。預設將整頁已確認的來源文字依閱讀順序送入所選模型；若回覆遺漏 UUID，只執行一次有界補翻並保留已成功結果，避免 timeout／fallback 重複翻譯。二次整頁校稿為可選且預設關閉，UI 會明確標示校稿階段；取消例外向外拋出以停止整體工作。
+- `VLMRegionTranslationService`：GUI 固定接多模態 `imageToText` runtime，將整頁已確認的來源文字與圖片語境依閱讀順序送入模型；若回覆遺漏 UUID，只執行一次有界補翻並保留已成功結果，避免 timeout／fallback 重複翻譯。`TextOnlyImageToTextAdapter` 僅保留底層相容用途，不是可選 GUI 路徑。二次整頁校稿為可選且預設關閉，UI 會明確標示校稿階段；取消例外向外拋出以停止整體工作。
 - `TranslationQualityOptions`：專案級控制整頁語境、可選二次校稿、QA、直譯稿保存、忠實／平衡／精簡長度策略與 4,000 字元風格指南。結果保存 `literalTranslatedText`、`speakerID`、`tone`、`translationConfidence` 與 `translationQAFlags`，人工改寫顯示譯文時會清除已過期的信心與 QA。
 - `CPUBubbleCleaner`／`MetalBubbleCleaner`：步驟二的傳統去字後端。`eraseColorHex == AUTO` 時由修補器估算底紙色；指定固定底紙色時由 CPU 精確填色，並清除遮罩外兩像素內的近底色 JPEG／掃描 halo。同一文字區域的斷開筆畫共用單一底色，避免紙紋取樣變成字形斑點。
 - `HTMLDialogueTypesetter`：將步驟三保存的 `translationBounds`、`translationAnchor`、字型、固定／自動字級、粗細及橫排／直排設定交給 WebKit；自動方向優先採用字形排列偵測結果，氣泡排版優先使用完全位於 `bubbleMaskPolygons` 內的 `bubbleLayoutBounds`。使用與 WebUI 相同的 HTML/CSS 與自動縮字演算法渲染背景及文字層，再輸出原圖像素尺寸的 PNG。GUI、批次與 MCP 共用此排版器，不再存在另一套 Core Text 輸出規則。
-- `ComicTranslationPipeline`：固定遵循「找氣泡 → 原圖像素遮罩 → OCR／VLM 原文 → 文生文／多模態／Agent 翻譯 → 排版 → 輸出」。步驟二永遠固定使用氣泡 detector 與像素精修；步驟三才依專案選項使用逐欄 OCR 或 VLM 整區轉錄，並以 `translationModelMethod` 選擇翻譯器。後續階段不得回頭重做或改寫前一步。氣泡外狀聲字屬於另一條尚未接入的流程。`PageRegionProgress` 與 `PagePipelineProgress` 分別回報區域與頁面進度。
+- `ComicTranslationPipeline`：翻譯固定遵循「找氣泡 → 原圖像素遮罩 → OCR／VLM 原文 → 多模態／Agent 翻譯 → 排版預覽 → 輸出」；步驟二永遠使用氣泡 detector 與像素精修，步驟三才依專案選項使用逐欄 OCR 或 VLM 整區轉錄，翻譯器固定為 `imageToText`。上色另遵循「選擇翻譯輸出或原圖 → 反對話框遮罩 → DDColor／Agent 預覽 → 輸出」。後續階段不得隱式重做或改寫前一步。氣泡外狀聲字屬於另一條尚未接入的流程。`PageRegionProgress`、`PagePipelineProgress` 與 `ColorizationPageState` 分別回報區域、翻譯頁面與上色頁面進度。
 
 ### MangaKitchenApp
 
-- `AppStore`：多專案切換、作用中頁面、頁面複選及單一 GPU 批次工作佇列；保存偏好模型路徑但不在啟動階段建立 runtime，實際推論前才延遲載入。大型模型載入前讀取 RAM 使用率，必要時釋放其他 capability；步驟二不因文字模型缺席而改用全黑遮罩。
+- `AppStore`：多專案切換、作用中頁面、頁面複選及單一 GPU 批次工作佇列；分開維護翻譯與上色的步驟、預覽、輸出、遮罩畫筆與清除重來狀態。偏好模型只保存路徑，實際推論前才延遲載入；大型模型載入前讀取 RAM 使用率，必要時釋放其他 capability。步驟二不因文字模型缺席而改用全黑遮罩。
 - `ApplicationLogStore`／`ModelReasoningStreamStore`：分開保存一般診斷與 transient reasoning。前者只存在記憶體且可清除；後者不進 LOG、不持久化，透過 `HybridBridgeController` 的 transient state 單獨更新 THINK 節點。
 - `SystemMetricsReader`：週期讀取 GPU 與 unified-memory 使用率；和畫布解析度／倍率一起只更新狀態列節點，不觸發 `AppStore.objectWillChange` 或重建編輯器 DOM。
-- `AppPreferencesController`：保存全域介面、色系、畫布框選顏色、資料位置、預設輸出根目錄、偏好模型與 MCP 網路設定；不寫入個別漫畫專案。
+- `AppPreferencesController`：保存全域介面、色系、畫布框選顏色、資料位置、預設輸出根目錄、`imageToText`／`imageColorization`／`superResolution` 偏好模型與 MCP 網路設定；不寫入個別漫畫專案。
 - `WorkspaceRepository`／`ProjectLibraryRepository`：分別保存專案快照與專案索引；以原子寫入更新並保留 `.bak`。
 - `ManagedImportService`：把圖片、資料夾、ZIP／CBZ、RAR／CBR 與 PDF 正規化到受管理來源目錄；PDF 先點陣化，壓縮檔先解包，再交給同一掃描器建立頁面。
 - `FontFamilyCatalog`：列出系統已安裝字型並提供 WebUI 預覽；專案預設字型變更時只同步仍使用舊預設值的區域，不覆蓋人工選字。
@@ -119,7 +143,8 @@ Project
 
 - 使用官方 Swift MCP SDK 與標準 Streamable HTTP transport，監聽 `0.0.0.0`；預設 port 為 `12080`。
 - 每個 HTTP request 都以 TCP socket 的實際來源 IP 檢查 IPv4／IPv6／CIDR 白名單，不採信可偽造的轉送標頭；空白名單拒絕所有連線。
-- Tools 對應多工作區管理與單頁 Agent 工作包；`prepare_agent_task` 提供原圖與步驟二遮罩 JSON，`submit_agent_result` 一次回寫全部區域並建立步驟三預覽，`page.render` 才儲存步驟四輸出。Resources 提供工作區列表、目前工作區、頁面、原圖、系統遮罩與輸出供診斷；Agent 不需讀取 sidecar。
+- Tools 對應多工作區管理與單頁 Agent 工作包；翻譯以 `prepare_agent_task`／`submit_agent_result` 建立步驟三預覽，上色以 `prepare_colorization_task`／`submit_colorization_result` 建立獨立預覽，各自只有 `page.render`／`page.render_colorization` 才儲存步驟四輸出。Resources 提供工作區列表、目前工作區、頁面、原圖、系統遮罩、翻譯與上色產物供診斷；Agent 不需讀取 sidecar。
+- 上色回寫只接受 PNG／JPEG／HEIC／TIFF／WebP，Base64 解碼後最多 20 MiB；結果像素尺寸必須與工作包輸入完全一致。App 會正規化為 PNG 並重新套用反對話框遮罩，黑色區域強制保留輸入像素。
 - MCP 契約以 `mangakitchen.contract.describe` 與 `mangakitchen://contract/current` 公開；寫入使用 opaque page revision 做 optimistic concurrency，區域 partial patch 可透過 `region.batch_update` 先整批驗證再原子提交。
 - 不建立第二個 executable；`MangaKitchen` 永遠啟動 GUI，MCP 開關、port 與白名單由全域設定管理，`--mcp=on|off` 與 `--mcp-port` 可覆寫本次啟動。
 - MCP 開啟時建立 macOS menu bar 狀態項目。主視窗關閉後 process 與 MCP 繼續運作，並可從 menu bar 重新開啟視窗或完整結束 App。
@@ -135,12 +160,14 @@ Project
 
 ```text
 CoreMLModelRuntime : ImageToTextGenerating + ImageToImageGenerating
-MLXTextRuntime : TextGenerating
 MLXVLMRuntime : ImageToTextGenerating
 QwenExternalImageEditRuntime : ImageToImageGenerating
+CoreMLDDColorRuntime : ImageColorizing
 CoreMLSuperResolutionRuntime : ImageSuperResolving（原生 4×）
 MLXRealESRGANSuperResolutionRuntime : ImageSuperResolving（獨立原生 2×）
 ```
+
+`MLXTextRuntime : TextGenerating` 仍存在於底層作為相容擴充點，但 App 已移除文生文模型頁面，GUI 翻譯與公開 MCP 翻譯契約都要求能讀取頁面圖片的多模態路徑。
 
 Qwen Image Edit 的主套件要求 macOS 26，因此以 `RuntimeSupport/QwenImageEditWorker` 隔離，不改變主 App 的 macOS 14 deployment target。`ModelRuntimeHub` 已使用 protocol existential 並依 manifest 的 `backend` 建立 Adapter，因此 `ComicTranslationPipeline`、AppStore 與 WebUI 不需因模型切換而更動。
 

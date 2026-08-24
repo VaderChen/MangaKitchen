@@ -4,6 +4,7 @@ public enum ModelCapability: String, Codable, CaseIterable, Hashable, Sendable {
     case textToText
     case imageToText
     case imageToImage
+    case imageColorization
     case superResolution
 }
 
@@ -28,10 +29,24 @@ public enum TextLocalizationMethod: String, Codable, CaseIterable, Hashable, Sen
 
 /// 步驟三翻譯使用的本機模型類型。
 public enum TranslationModelMethod: String, Codable, CaseIterable, Hashable, Sendable {
-    /// 純文字 MLX LLM；預設選項，不需要頁面圖片。
+    /// 舊專案解碼相容值；目前 App 會自動遷移為 `imageToText`。
     case textToText
-    /// 圖生文 VLM；可利用人物、表情與畫面語境。
+    /// 多模態 VLM；利用人物、表情與畫面語境進行翻譯。
     case imageToText
+}
+
+public enum ColorizationColorRange: String, Codable, CaseIterable, Hashable, Sendable {
+    case monochrome
+    case fourColor
+    case eightColor
+    case unrestricted
+}
+
+public enum ColorizationMode: String, Codable, CaseIterable, Hashable, Sendable {
+    case shadow
+    case halftone
+    case cel
+    case watercolor
 }
 
 public struct LoadedModelInfo: Codable, Hashable, Sendable, Identifiable {
@@ -100,6 +115,32 @@ public enum PageProcessingStage: String, Codable, CaseIterable, Hashable, Sendab
     case typesetting
     case completed
     case failed
+}
+
+public enum ColorizationProcessingStage: String, Codable, CaseIterable, Hashable, Sendable {
+    case pending
+    case maskReady
+    case colorizing
+    case previewReady
+    case exporting
+    case completed
+    case failed
+}
+
+public struct ColorizationPageState: Codable, Hashable, Sendable {
+    public var stage: ColorizationProcessingStage
+    public var progress: Double
+    public var errorMessage: String?
+
+    public init(
+        stage: ColorizationProcessingStage = .pending,
+        progress: Double = 0,
+        errorMessage: String? = nil
+    ) {
+        self.stage = stage
+        self.progress = min(max(progress, 0), 1)
+        self.errorMessage = errorMessage
+    }
 }
 
 public enum PageProcessingActivity: String, Codable, CaseIterable, Hashable, Sendable {
@@ -571,6 +612,16 @@ public struct ComicPage: Identifiable, Codable, Hashable, Sendable {
     public var stringTableURL: URL?
     public var translationPreviewURL: URL?
     public var outputURL: URL?
+    /// 上色流程步驟三的 DDColor 預覽；不覆蓋翻譯輸出。
+    public var colorizationPreviewURL: URL?
+    /// 上色流程步驟四的最終輸出；與翻譯輸出使用不同檔名。
+    public var colorizationOutputURL: URL?
+    /// 上色流程的頁面級遮罩修正；基底由反對話框遮罩衍生，不與文字遮罩共用。
+    /// Optional 用於向後相容尚未包含此欄位的既有專案快照。
+    public var colorizationMaskStrokes: [MaskStroke]?
+    /// 上色流程獨立狀態；不可與翻譯流程的 `stage`／`progress` 共用。
+    /// Optional 用於向後相容既有專案快照，nil 代表尚未開始上色。
+    public var colorizationState: ColorizationPageState?
     public var pixelWidth: Int
     public var pixelHeight: Int
     public var regions: [DialogueRegion]
@@ -601,6 +652,10 @@ public struct ComicPage: Identifiable, Codable, Hashable, Sendable {
         self.stringTableURL = nil
         self.translationPreviewURL = nil
         self.outputURL = nil
+        self.colorizationPreviewURL = nil
+        self.colorizationOutputURL = nil
+        self.colorizationMaskStrokes = nil
+        self.colorizationState = nil
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
         self.regions = regions
@@ -632,26 +687,32 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
     /// 額外以網格逐塊送給圖生文模型辨識。會顯著增加每頁推論次數。
     public var fineScanEnabled: Bool
     public var translationQuality: TranslationQualityOptions
+    public var colorizationColorRange: ColorizationColorRange
+    public var colorizationMode: ColorizationMode
 
     public init(
         sourceLanguageCodes: [String] = ["ja-JP", "zh-Hans", "zh-Hant", "en-US"],
         targetLanguageCode: String = TargetLanguageResolver.automaticCode,
         readingDirection: ReadingDirection = .rightToLeft,
         textLocalizationMethod: TextLocalizationMethod = .ppocrv6MediumDet,
-        translationModelMethod: TranslationModelMethod = .textToText,
+        translationModelMethod: TranslationModelMethod = .imageToText,
         defaultStyle: DialogueStyle = DialogueStyle(),
         maskExpansion: Double = 0.035,
         eraseColorHex: String = ProcessingOptions.automaticEraseColor,
         useImageToImageRestoration: Bool = false,
         preserveUntranslatedRegions: Bool = false,
         fineScanEnabled: Bool = false,
-        translationQuality: TranslationQualityOptions = TranslationQualityOptions()
+        translationQuality: TranslationQualityOptions = TranslationQualityOptions(),
+        colorizationColorRange: ColorizationColorRange = .unrestricted,
+        colorizationMode: ColorizationMode = .watercolor
     ) {
         self.sourceLanguageCodes = sourceLanguageCodes
         self.targetLanguageCode = targetLanguageCode
         self.readingDirection = readingDirection
         self.textLocalizationMethod = textLocalizationMethod
-        self.translationModelMethod = translationModelMethod
+        self.translationModelMethod = translationModelMethod == .textToText
+            ? .imageToText
+            : translationModelMethod
         self.defaultStyle = defaultStyle
         self.maskExpansion = maskExpansion
         self.eraseColorHex = Self.normalizedEraseColor(
@@ -662,6 +723,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.preserveUntranslatedRegions = preserveUntranslatedRegions
         self.fineScanEnabled = fineScanEnabled
         self.translationQuality = translationQuality
+        self.colorizationColorRange = colorizationColorRange
+        self.colorizationMode = colorizationMode
     }
 
     /// 實際交給翻譯器、詞表與 Agent 的目標語言；手動選擇時維持原值。
@@ -691,6 +754,8 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         case preserveUntranslatedRegions
         case fineScanEnabled
         case translationQuality
+        case colorizationColorRange
+        case colorizationMode
     }
 
     public init(from decoder: any Decoder) throws {
@@ -709,9 +774,12 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         textLocalizationMethod = try values.decodeIfPresent(
             TextLocalizationMethod.self, forKey: .textLocalizationMethod
         ) ?? defaults.textLocalizationMethod
-        translationModelMethod = try values.decodeIfPresent(
+        let decodedTranslationModelMethod = try values.decodeIfPresent(
             TranslationModelMethod.self, forKey: .translationModelMethod
         ) ?? defaults.translationModelMethod
+        translationModelMethod = decodedTranslationModelMethod == .textToText
+            ? .imageToText
+            : decodedTranslationModelMethod
         defaultStyle = try values.decodeIfPresent(
             DialogueStyle.self, forKey: .defaultStyle
         ) ?? defaults.defaultStyle
@@ -737,6 +805,14 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
             TranslationQualityOptions.self,
             forKey: .translationQuality
         ) ?? defaults.translationQuality
+        colorizationColorRange = try values.decodeIfPresent(
+            ColorizationColorRange.self,
+            forKey: .colorizationColorRange
+        ) ?? defaults.colorizationColorRange
+        colorizationMode = try values.decodeIfPresent(
+            ColorizationMode.self,
+            forKey: .colorizationMode
+        ) ?? defaults.colorizationMode
     }
 }
 

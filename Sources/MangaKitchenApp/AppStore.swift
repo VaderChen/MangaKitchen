@@ -67,6 +67,7 @@ final class AppStore: ObservableObject {
     private var maskRegenerationTasks: [UUID: Task<Void, Never>] = [:]
     private var translationPreviewTasks: [UUID: Task<Void, Never>] = [:]
     private var undoneMaskStrokes: [UUID: [UUID: [MaskStroke]]] = [:]
+    private var undoneColorizationMaskStrokes: [UUID: [MaskStroke]] = [:]
     private var maskRevisions: [UUID: UInt64] = [:]
     private var regionUndoHistory: [UUID: [[DialogueRegion]]] = [:]
     private var regionRedoHistory: [UUID: [[DialogueRegion]]] = [:]
@@ -81,10 +82,10 @@ final class AppStore: ObservableObject {
         dataDirectoryPath: String? = nil,
         defaultOutputDirectoryPath: String? = nil,
         imageCompositingBackend: ImageCompositingBackend = .cpu,
-        textToTextModelPath: String? = nil,
         imageToTextModelPath: String? = nil,
         modelThinkingEnabled: Bool = false,
         imageToImageModelPath: String? = nil,
+        imageColorizationModelPath: String? = nil,
         automaticSuperResolutionEnabled: Bool = false,
         superResolutionModelPath: String? = nil
     ) {
@@ -135,11 +136,6 @@ final class AppStore: ObservableObject {
             // 步驟三依專案選項使用，不能寫回或重建步驟二產物。
             let vlmTextRecognizer = VLMRegionTranscriptionService(model: models)
             let imageTranslator = VLMRegionTranslationService(model: models, log: runtimeLog)
-            let textTranslator = VLMRegionTranslationService(
-                model: TextOnlyImageToTextAdapter(model: models),
-                usesImageContext: false,
-                log: runtimeLog
-            )
             let pipeline = ComicTranslationPipeline(
                 // 步驟二永遠固定為氣泡偵測→像素內縮；OCR／VLM
                 // 選項只能在後續原文抽取使用，不得改變遮罩。
@@ -152,16 +148,16 @@ final class AppStore: ObservableObject {
                     .vlm: vlmTextRecognizer
                 ],
                 maskRefiner: MangaTextMaskRefiner(),
-                translator: textTranslator,
+                translator: imageTranslator,
                 translators: [
-                    .textToText: textTranslator,
                     .imageToText: imageTranslator
                 ],
                 maskGenerator: DialogueMaskGenerator(),
                 backgroundRestorer: backgroundRestorer,
                 typesetter: htmlTypesetter,
                 outputRoot: artifactsRoot,
-                superResolver: models
+                superResolver: models,
+                colorizer: models
             )
             self.models = models
             self.pipeline = pipeline
@@ -197,9 +193,9 @@ final class AppStore: ObservableObject {
             guard let self else { return }
             await self.restoreProjectLibrary()
             await self.applyPreferredModelsNow(
-                textToTextPath: textToTextModelPath,
                 imageToTextPath: imageToTextModelPath,
                 imageToImagePath: imageToImageModelPath,
+                imageColorizationPath: imageColorizationModelPath,
                 superResolutionPath: superResolutionModelPath
             )
         }
@@ -884,6 +880,7 @@ final class AppStore: ObservableObject {
             maskRegenerationTasks[page.id]?.cancel()
             translationPreviewTasks[page.id]?.cancel()
             undoneMaskStrokes[page.id] = nil
+            undoneColorizationMaskStrokes[page.id] = nil
             regionUndoHistory[page.id] = nil
             regionRedoHistory[page.id] = nil
         }
@@ -907,6 +904,7 @@ final class AppStore: ObservableObject {
         cancelMaskRegeneration()
         cancelTranslationPreviewRegeneration()
         undoneMaskStrokes = [:]
+        undoneColorizationMaskStrokes = [:]
         excludedSourceRelativePaths.formUnion(pages.compactMap(\.relativeSourcePath))
         pages = []
         selectedPageID = nil
@@ -936,6 +934,7 @@ final class AppStore: ObservableObject {
             translationPreviewTasks[page.id]?.cancel()
             translationPreviewTasks[page.id] = nil
             undoneMaskStrokes[page.id] = nil
+            undoneColorizationMaskStrokes[page.id] = nil
 
             do {
                 try removeGeneratedFiles(for: page)
@@ -946,6 +945,10 @@ final class AppStore: ObservableObject {
                 pages[pageIndex].stringTableURL = nil
                 pages[pageIndex].translationPreviewURL = nil
                 pages[pageIndex].outputURL = nil
+                pages[pageIndex].colorizationPreviewURL = nil
+                pages[pageIndex].colorizationOutputURL = nil
+                pages[pageIndex].colorizationMaskStrokes = nil
+                pages[pageIndex].colorizationState = nil
                 pages[pageIndex].stage = .scanned
                 pages[pageIndex].progress = Self.totalProgress(stage: .scanned, fraction: 1)
                 pages[pageIndex].errorMessage = nil
@@ -985,6 +988,8 @@ final class AppStore: ObservableObject {
             page.stringTableURL?.appendingPathExtension("bak"),
             page.translationPreviewURL,
             page.outputURL,
+            page.colorizationPreviewURL,
+            page.colorizationOutputURL,
         ].compactMap { $0 }.forEach { generatedURLs.insert($0.standardizedFileURL) }
 
         if let outputDirectoryURL,
@@ -1046,6 +1051,14 @@ final class AppStore: ObservableObject {
         enqueueSelected(operation: .superResolve)
     }
 
+    func colorizeSelectedPage() {
+        enqueueSelected(operation: .colorize)
+    }
+
+    func composeColorizationSelectedPage() {
+        enqueueSelected(operation: .colorizationCompose)
+    }
+
     func processAllPages() {
         enqueueBatch(operation: .fullPage, pageIDs: pages.map(\.id))
     }
@@ -1091,13 +1104,18 @@ final class AppStore: ObservableObject {
             statusMessage = "請先在設定中下載超解析模型。"
             return nil
         }
+        if operation == .colorize,
+           !hasConfiguredModel(.imageColorization) {
+            statusMessage = "請先在設定中下載上色模型。"
+            return nil
+        }
         let orderedPageIDs = Array(orderedIDs)
         if requiresTranslationModel(
             for: operation,
             pageIDs: orderedPageIDs,
             forceRecalculation: forceRecalculation
         ), effectiveTranslationModelMethod() == nil {
-            statusMessage = "請先在設定中下載並載入文生文或圖生文模型，才能翻譯文字。"
+            statusMessage = "請先在設定中下載並載入多模態模型，才能翻譯文字。"
             return nil
         }
         if requiresVLMTextExtraction(
@@ -1154,12 +1172,12 @@ final class AppStore: ObservableObject {
                       let page = pages.first(where: { $0.id == pageID }) else { return true }
                 return !page.regions.isEmpty && !hasTranslatedRegions(page)
             }
-        case .detectMasks, .superResolve, .compose:
+        case .detectMasks, .superResolve, .compose, .colorize, .colorizationCompose:
             return false
         }
     }
 
-    /// VLM 只在使用者明確選為原文抽取方式時才是必要條件；翻譯模型可獨立選擇文生文。
+    /// 多模態模型永遠負責翻譯；此處只判斷原文抽取是否也選用 VLM。
     private func requiresVLMTextExtraction(
         for operation: BatchOperation,
         pageIDs: [UUID],
@@ -1183,7 +1201,7 @@ final class AppStore: ObservableObject {
                       let page = pages.first(where: { $0.id == pageID }) else { return true }
                 return !page.regions.isEmpty && !hasTranslatedRegions(page)
             }
-        case .retranslate, .detectMasks, .superResolve, .compose:
+        case .retranslate, .detectMasks, .superResolve, .compose, .colorize, .colorizationCompose:
             return false
         }
     }
@@ -1193,31 +1211,16 @@ final class AppStore: ObservableObject {
             || preferredModelPaths[capability] != nil
     }
 
-    /// 優先採用專案指定的翻譯模型。文生文只要已有經驗證的偏好路徑即可，
-    /// 不要求啟動時常駐記憶體；真正翻譯前才由 `ensureTranslationModelLoaded` 載入。
+    /// 翻譯只支援多模態模型；模型不在啟動時常駐，真正翻譯前才延遲載入。
     private func effectiveTranslationModelMethod() -> TranslationModelMethod? {
-        let loadedCapabilities = Set(loadedModels.map(\.capability))
-        let preferredCapability: ModelCapability = options.translationModelMethod == .textToText
-            ? .textToText
-            : .imageToText
-        if loadedCapabilities.contains(preferredCapability)
-            || preferredModelPaths[preferredCapability] != nil {
-            return options.translationModelMethod
-        }
-        if loadedCapabilities.contains(.textToText) || preferredModelPaths[.textToText] != nil {
-            return .textToText
-        }
-        if loadedCapabilities.contains(.imageToText) || preferredModelPaths[.imageToText] != nil {
+        if hasConfiguredModel(.imageToText) {
             return .imageToText
         }
         return nil
     }
 
-    private func ensureTranslationModelLoaded(
-        _ method: TranslationModelMethod
-    ) async throws {
-        let capability: ModelCapability = method == .textToText ? .textToText : .imageToText
-        try await ensureModelLoaded(capability, purpose: "translation")
+    private func ensureTranslationModelLoaded() async throws {
+        try await ensureModelLoaded(.imageToText, purpose: "translation")
     }
 
     private func ensureTextLocalizationModelLoaded() async throws {
@@ -1344,8 +1347,9 @@ final class AppStore: ObservableObject {
 
     func cancelProcessing() {
         regionRecognitionTask?.cancel()
-        let cancelledPageIDs = batchJobs.compactMap { job in
-            job.status == .running ? job.currentPageID : nil
+        let cancelledPages = batchJobs.compactMap { job -> (UUID, BatchOperation)? in
+            guard job.status == .running, let pageID = job.currentPageID else { return nil }
+            return (pageID, job.operation)
         }
         let now = Date()
         for index in batchJobs.indices where [.queued, .running].contains(batchJobs[index].status) {
@@ -1354,9 +1358,9 @@ final class AppStore: ObservableObject {
             batchJobs[index].finishedAt = now
         }
         processingTask?.cancel()
-        cancelledPageIDs.forEach { processingActivities[$0] = nil }
-        cancelledPageIDs.forEach { processingRegionProgress[$0] = nil }
-        cancelledPageIDs.forEach(restoreStablePageStateAfterCancellation)
+        cancelledPages.forEach { processingActivities[$0.0] = nil }
+        cancelledPages.forEach { processingRegionProgress[$0.0] = nil }
+        cancelledPages.forEach { restoreStablePageStateAfterCancellation($0.0, operation: $0.1) }
         statusMessage = processingTask == nil
             ? "目前沒有執行中的工作。"
             : "工作已取消，正在停止目前運算…"
@@ -1474,7 +1478,11 @@ final class AppStore: ObservableObject {
                         self.batchJobs[resultIndex].failures.append(
                             BatchPageFailure(pageID: pageID, message: error.localizedDescription)
                         )
-                        self.markFailed(pageID: pageID, message: error.localizedDescription)
+                        self.markFailed(
+                            pageID: pageID,
+                            operation: operation,
+                            message: error.localizedDescription
+                        )
                     }
                     self.processingActivities[pageID] = nil
                     self.processingRegionProgress[pageID] = nil
@@ -1657,6 +1665,130 @@ final class AppStore: ObservableObject {
         } ?? []
     }
 
+    func appendColorizationMaskStroke(
+        pageID: UUID,
+        mode: MaskStrokeMode,
+        points: [NormalizedPoint],
+        diameter: Double
+    ) {
+        guard !points.isEmpty,
+              let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            statusMessage = "找不到要修改的上色遮罩頁面，或畫筆軌跡為空。"
+            return
+        }
+        var strokes = pages[pageIndex].colorizationMaskStrokes ?? []
+        strokes.append(MaskStroke(mode: mode, points: points, diameter: diameter))
+        try? removeColorizationGeneratedFiles(for: pages[pageIndex])
+        pages[pageIndex].colorizationMaskStrokes = strokes
+        pages[pageIndex].colorizationPreviewURL = nil
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].colorizationState = ColorizationPageState(
+            stage: .maskReady,
+            progress: 0.25
+        )
+        undoneColorizationMaskStrokes[pageID] = nil
+        statusMessage = "已更新第 \(pages[pageIndex].index) 頁的上色遮罩。"
+        schedulePersistence()
+    }
+
+    func undoColorizationMaskStroke(pageID: UUID) {
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
+              var strokes = pages[pageIndex].colorizationMaskStrokes,
+              let stroke = strokes.popLast() else {
+            statusMessage = "這一頁沒有可復原的上色遮罩筆劃。"
+            return
+        }
+        pages[pageIndex].colorizationMaskStrokes = strokes.isEmpty ? nil : strokes
+        try? removeColorizationGeneratedFiles(for: pages[pageIndex])
+        pages[pageIndex].colorizationPreviewURL = nil
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].colorizationState = ColorizationPageState(
+            stage: .maskReady,
+            progress: 0.25
+        )
+        undoneColorizationMaskStrokes[pageID, default: []].append(stroke)
+        schedulePersistence()
+    }
+
+    func redoColorizationMaskStroke(pageID: UUID) {
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
+              var history = undoneColorizationMaskStrokes[pageID],
+              let stroke = history.popLast() else {
+            statusMessage = "這一頁沒有可重做的上色遮罩筆劃。"
+            return
+        }
+        var strokes = pages[pageIndex].colorizationMaskStrokes ?? []
+        strokes.append(stroke)
+        try? removeColorizationGeneratedFiles(for: pages[pageIndex])
+        pages[pageIndex].colorizationMaskStrokes = strokes
+        pages[pageIndex].colorizationPreviewURL = nil
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].colorizationState = ColorizationPageState(
+            stage: .maskReady,
+            progress: 0.25
+        )
+        undoneColorizationMaskStrokes[pageID] = history.isEmpty ? nil : history
+        schedulePersistence()
+    }
+
+    func colorizationMaskRedoAvailable(pageID: UUID) -> Bool {
+        !(undoneColorizationMaskStrokes[pageID]?.isEmpty ?? true)
+    }
+
+    func resetColorizationPages(_ pageIDs: [UUID]) {
+        guard !isProcessing, !isSwitchingProject else {
+            statusMessage = "請等待目前工作完成或先取消工作。"
+            return
+        }
+        let requested = Set(pageIDs)
+        var resetCount = 0
+        var failures: [String] = []
+        for pageIndex in pages.indices where requested.contains(pages[pageIndex].id) {
+            let pageID = pages[pageIndex].id
+            do {
+                try removeColorizationGeneratedFiles(for: pages[pageIndex])
+            } catch {
+                failures.append("\(pages[pageIndex].title)：\(error.localizedDescription)")
+            }
+            pages[pageIndex].colorizationMaskStrokes = nil
+            pages[pageIndex].colorizationPreviewURL = nil
+            pages[pageIndex].colorizationOutputURL = nil
+            pages[pageIndex].colorizationState = nil
+            processingActivities[pageID] = nil
+            processingRegionProgress[pageID] = nil
+            undoneColorizationMaskStrokes[pageID] = nil
+            resetCount += 1
+        }
+        guard resetCount > 0 else {
+            statusMessage = "請先選取至少一張漫畫頁面。"
+            return
+        }
+        statusMessage = failures.isEmpty
+            ? "已清除 \(resetCount) 頁的上色流程資料；翻譯輸出不受影響。"
+            : "已清除 \(resetCount) 頁；部分上色資料無法清除：\n" + failures.joined(separator: "\n")
+        schedulePersistence()
+    }
+
+    private func removeColorizationGeneratedFiles(for page: ComicPage) throws {
+        let fileManager = FileManager.default
+        let urls = [page.colorizationPreviewURL, page.colorizationOutputURL].compactMap { $0 }
+        for url in urls where fileManager.fileExists(atPath: url.path) {
+            try fileManager.removeItem(at: url)
+        }
+        let artifactDirectoryURL = applicationRoot?
+            .appendingPathComponent("Artifacts", isDirectory: true)
+            .appendingPathComponent(page.id.uuidString, isDirectory: true)
+        if let artifactDirectoryURL,
+           fileManager.fileExists(atPath: artifactDirectoryURL.path) {
+            let colorizationFiles = ["colorization-mask.png", "colorized.png"].map {
+                artifactDirectoryURL.appendingPathComponent($0)
+            }
+            for url in colorizationFiles where fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
+            }
+        }
+    }
+
     func maskRevision(pageID: UUID) -> UInt64 {
         maskRevisions[pageID] ?? 0
     }
@@ -1794,7 +1926,7 @@ final class AppStore: ObservableObject {
             return false
         }
         guard let translationModelMethod = effectiveTranslationModelMethod() else {
-            statusMessage = "請先載入文生文或圖生文模型，才能重新抽取並翻譯文字。"
+            statusMessage = "請先載入多模態模型，才能重新抽取並翻譯文字。"
             return false
         }
         if options.textLocalizationMethod == .vlm,
@@ -1837,7 +1969,7 @@ final class AppStore: ObservableObject {
                     page: page,
                     region: region,
                     options: processingOptions,
-                    regionProgress: { current, total in
+                    regionProgress: { [weak self] current, total in
                         Task { @MainActor [weak self] in
                             self?.processingRegionProgress[pageID] = ProcessingRegionProgress(
                                 current: current,
@@ -1845,7 +1977,7 @@ final class AppStore: ObservableObject {
                             )
                         }
                     },
-                    progress: { value in
+                    progress: { [weak self] value in
                         Task { @MainActor [weak self] in
                             guard let self,
                                   let index = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
@@ -1867,7 +1999,7 @@ final class AppStore: ObservableObject {
                     return
                 }
 
-                try await self.ensureTranslationModelLoaded(translationModelMethod)
+                try await self.ensureTranslationModelLoaded()
                 try Task.checkCancellation()
                 self.processingActivities[pageID] = .translatingRegions
                 self.processingRegionProgress[pageID] = ProcessingRegionProgress(current: 0, total: 1)
@@ -1877,12 +2009,12 @@ final class AppStore: ObservableObject {
                     options: processingOptions,
                     glossary: self.glossary,
                     recognizeText: false,
-                    activity: { activity in
+                    activity: { [weak self] activity in
                         Task { @MainActor [weak self] in
                             self?.processingActivities[pageID] = activity
                         }
                     },
-                    regionProgress: { current, total in
+                    regionProgress: { [weak self] current, total in
                         Task { @MainActor [weak self] in
                             self?.processingRegionProgress[pageID] = ProcessingRegionProgress(
                                 current: current,
@@ -1890,7 +2022,7 @@ final class AppStore: ObservableObject {
                             )
                         }
                     },
-                    progress: { stage, fraction in
+                    progress: { [weak self] stage, fraction in
                         Task { @MainActor [weak self] in
                             guard let self,
                                   let index = self.pages.firstIndex(where: { $0.id == pageID }) else { return }
@@ -2082,16 +2214,16 @@ final class AppStore: ObservableObject {
     }
 
     func applyPreferredModels(
-        textToTextPath: String? = nil,
         imageToTextPath: String?,
         imageToImagePath: String?,
+        imageColorizationPath: String? = nil,
         superResolutionPath: String? = nil
     ) {
         Task {
             await applyPreferredModelsNow(
-                textToTextPath: textToTextPath,
                 imageToTextPath: imageToTextPath,
                 imageToImagePath: imageToImagePath,
+                imageColorizationPath: imageColorizationPath,
                 superResolutionPath: superResolutionPath
             )
         }
@@ -2126,6 +2258,8 @@ final class AppStore: ObservableObject {
         let previousDefaultFont = options.defaultStyle.fontName
         let nextDefaultFont = supportedValue.defaultStyle.fontName
         let eraseColorChanged = options.eraseColorHex != supportedValue.eraseColorHex
+        let colorizationSettingsChanged = options.colorizationColorRange != supportedValue.colorizationColorRange
+            || options.colorizationMode != supportedValue.colorizationMode
         var fontUpdatedPageIDs: [UUID] = []
         if previousDefaultFont != nextDefaultFont {
             for pageIndex in pages.indices {
@@ -2156,6 +2290,14 @@ final class AppStore: ObservableObject {
                 pages[pageIndex].outputURL = nil
                 pages[pageIndex].stage = .maskReady
                 pages[pageIndex].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
+            }
+        }
+        if colorizationSettingsChanged {
+            for pageIndex in pages.indices where pages[pageIndex].colorizationPreviewURL != nil
+                || pages[pageIndex].colorizationOutputURL != nil {
+                try? removeColorizationGeneratedFiles(for: pages[pageIndex])
+                pages[pageIndex].colorizationPreviewURL = nil
+                pages[pageIndex].colorizationOutputURL = nil
             }
         }
         for pageID in fontUpdatedPageIDs where !eraseColorUpdatedPageIDs.contains(pageID) {
@@ -2248,6 +2390,10 @@ final class AppStore: ObservableObject {
             try await runSuperResolution(pageID: pageID)
         case .compose:
             try await runComposition(pageID: pageID)
+        case .colorize:
+            try await runColorization(pageID: pageID)
+        case .colorizationCompose:
+            try await runColorizationComposition(pageID: pageID)
         case .fullPage:
             if !hasMaskData(pageID: pageID) {
                 try await runDetection(pageID: pageID)
@@ -2261,6 +2407,18 @@ final class AppStore: ObservableObject {
                 try await runComposition(pageID: pageID)
             }
         }
+    }
+
+    private func hasColorizationData(pageID: UUID) -> Bool {
+        guard let page = pages.first(where: { $0.id == pageID }),
+              let previewURL = page.colorizationPreviewURL else { return false }
+        return FileManager.default.fileExists(atPath: previewURL.path)
+    }
+
+    private func hasCompletedColorizationOutput(pageID: UUID) -> Bool {
+        guard let page = pages.first(where: { $0.id == pageID }),
+              let outputURL = page.colorizationOutputURL else { return false }
+        return FileManager.default.fileExists(atPath: outputURL.path)
     }
 
     private func hasMaskData(pageID: UUID) -> Bool {
@@ -2304,6 +2462,14 @@ final class AppStore: ObservableObject {
 
     private static func completedArtifactStage(for page: ComicPage) -> PageProcessingStage {
         let fileManager = FileManager.default
+        if let outputURL = page.colorizationOutputURL,
+           fileManager.fileExists(atPath: outputURL.path) {
+            return .completed
+        }
+        if let previewURL = page.colorizationPreviewURL,
+           fileManager.fileExists(atPath: previewURL.path) {
+            return .translationReady
+        }
         if let outputURL = page.outputURL,
            fileManager.fileExists(atPath: outputURL.path) {
             return .completed
@@ -2350,6 +2516,8 @@ final class AppStore: ObservableObject {
         advanceMaskRevision(pageID: pageID)
         pages[index].translationPreviewURL = nil
         pages[index].outputURL = nil
+        pages[index].colorizationPreviewURL = nil
+        pages[index].colorizationOutputURL = nil
         pages[index].stage = .maskReady
         pages[index].progress = Self.totalProgress(stage: .maskReady, fraction: 1)
         pages[index].errorMessage = nil
@@ -2381,6 +2549,8 @@ final class AppStore: ObservableObject {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         pages[index].translationPreviewURL = nil
         pages[index].outputURL = nil
+        pages[index].colorizationPreviewURL = nil
+        pages[index].colorizationOutputURL = nil
         pages[index].stage = .translating
         pages[index].progress = Self.totalProgress(stage: .translating, fraction: 0)
         pages[index].errorMessage = nil
@@ -2432,6 +2602,8 @@ final class AppStore: ObservableObject {
         }
         pages[updatedIndex].translationPreviewURL = nil
         pages[updatedIndex].outputURL = nil
+        pages[updatedIndex].colorizationPreviewURL = nil
+        pages[updatedIndex].colorizationOutputURL = nil
         pages[updatedIndex].stage = .translating
         pages[updatedIndex].progress = Self.totalProgress(stage: .translating, fraction: 1)
         pages[updatedIndex].errorMessage = nil
@@ -2463,6 +2635,8 @@ final class AppStore: ObservableObject {
         if let index = pages.firstIndex(where: { $0.id == pageID }) {
             pages[index].translationPreviewURL = nil
             pages[index].outputURL = nil
+            pages[index].colorizationPreviewURL = nil
+            pages[index].colorizationOutputURL = nil
         }
         let regions: [DialogueRegion]
         if page.regions.isEmpty {
@@ -2471,13 +2645,13 @@ final class AppStore: ObservableObject {
             regions = page.regions
         } else {
             guard let translationModelMethod = effectiveTranslationModelMethod() else {
-                throw ModelRuntimeError.capabilityNotLoaded(.textToText)
+                throw ModelRuntimeError.capabilityNotLoaded(.imageToText)
             }
             if recognizeText {
                 try await ensureTextLocalizationModelLoaded()
                 try Task.checkCancellation()
             }
-            try await ensureTranslationModelLoaded(translationModelMethod)
+            try await ensureTranslationModelLoaded()
             try Task.checkCancellation()
             var processingOptions = options
             processingOptions.translationModelMethod = translationModelMethod
@@ -2525,6 +2699,8 @@ final class AppStore: ObservableObject {
         pages[typesettingIndex].regions = regions
         pages[typesettingIndex].translationPreviewURL = nil
         pages[typesettingIndex].outputURL = nil
+        pages[typesettingIndex].colorizationPreviewURL = nil
+        pages[typesettingIndex].colorizationOutputURL = nil
         pages[typesettingIndex].stage = .typesetting
         pages[typesettingIndex].errorMessage = nil
         let previewURL = try await pipeline.renderTranslationPreview(
@@ -2539,6 +2715,8 @@ final class AppStore: ObservableObject {
         pages[index].superResolvedBackgroundURL = superResolvedBackgroundURL
         pages[index].translationPreviewURL = previewURL
         pages[index].outputURL = nil
+        pages[index].colorizationPreviewURL = nil
+        pages[index].colorizationOutputURL = nil
         pages[index].stage = .translationReady
         pages[index].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
         pages[index].errorMessage = nil
@@ -2600,6 +2778,8 @@ final class AppStore: ObservableObject {
         // 否則步驟三會顯示 2x SR 背景，步驟四卻繼續讀取 SR 前的 1x 檔案。
         pages[index].translationPreviewURL = nil
         pages[index].outputURL = nil
+        pages[index].colorizationPreviewURL = nil
+        pages[index].colorizationOutputURL = nil
         let previewURL = try await pipeline.renderTranslationPreview(
             page: pages[index],
             backgroundURL: resolvedURL,
@@ -2611,6 +2791,57 @@ final class AppStore: ObservableObject {
         pages[index].errorMessage = nil
         statusMessage = "第 \(pages[index].index) 頁已完成超解析與重新排版。"
         try await persistStringTableNow(pageID: pageID)
+        schedulePersistence()
+    }
+
+    private func runColorization(pageID: UUID) async throws {
+        guard let pipeline,
+              let page = pages.first(where: { $0.id == pageID }) else {
+            throw AppWorkflowError.pageNotFound
+        }
+        let inputURL = page.outputURL.flatMap {
+            FileManager.default.fileExists(atPath: $0.path) ? $0 : nil
+        } ?? page.sourceURL
+        guard FileManager.default.fileExists(atPath: inputURL.path) else {
+            throw ImageProcessingError.unreadableImage(inputURL)
+        }
+        guard hasMaskData(pageID: pageID) else {
+            throw AppWorkflowError.maskRequired
+        }
+        try await ensureModelLoaded(.imageColorization, purpose: "image colorization")
+        try Task.checkCancellation()
+        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[index].colorizationOutputURL = nil
+        pages[index].colorizationState = ColorizationPageState(
+            stage: .colorizing,
+            progress: 0.25
+        )
+        processingActivities[pageID] = .typesettingTranslation
+        statusMessage = "第 \(page.index) 頁正在執行上色…"
+        let previewURL = try await pipeline.colorize(
+            page: page,
+            inputURL: inputURL,
+            regions: page.regions,
+            strokes: page.colorizationMaskStrokes ?? [],
+            progress: { [weak self] value in
+                Task { @MainActor [weak self] in
+                    self?.updateColorizationProgress(
+                        pageID: pageID,
+                        fraction: value
+                    )
+                }
+            }
+        )
+        try Task.checkCancellation()
+        guard let updatedIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[updatedIndex].colorizationPreviewURL = previewURL
+        pages[updatedIndex].colorizationOutputURL = nil
+        pages[updatedIndex].colorizationState = ColorizationPageState(
+            stage: .previewReady,
+            progress: 0.75
+        )
+        processingActivities[pageID] = nil
+        statusMessage = "第 \(pages[updatedIndex].index) 頁上色預覽完成。"
         schedulePersistence()
     }
 
@@ -2637,9 +2868,10 @@ final class AppStore: ObservableObject {
         guard let initialIndex = pages.firstIndex(where: { $0.id == pageID }) else {
             throw AppWorkflowError.pageNotFound
         }
-        pages[initialIndex].stage = .composing
-        pages[initialIndex].progress = Self.totalProgress(stage: .composing, fraction: 0)
-        pages[initialIndex].errorMessage = nil
+        pages[initialIndex].colorizationState = ColorizationPageState(
+            stage: .exporting,
+            progress: 0.85
+        )
         processingActivities[pageID] = .savingOutput
         statusMessage = "第 \(pages[initialIndex].index) 頁正在儲存輸出…"
         schedulePersistence()
@@ -2672,6 +2904,47 @@ final class AppStore: ObservableObject {
         pages[index].errorMessage = nil
         try await persistStringTableNow(pageID: pageID)
         statusMessage = "第 \(pages[index].index) 頁已確認並儲存至輸出目錄。"
+        schedulePersistence()
+    }
+
+    private func runColorizationComposition(pageID: UUID) async throws {
+        guard let outputDirectoryURL else {
+            throw AppWorkflowError.outputDirectoryRequired
+        }
+        try Task.checkCancellation()
+        guard let page = pages.first(where: { $0.id == pageID }),
+              let previewURL = page.colorizationPreviewURL,
+              FileManager.default.fileExists(atPath: previewURL.path) else {
+            throw AppWorkflowError.colorizationPreviewRequired
+        }
+        let outputURL = try pathResolver.colorizationOutputURL(
+            relativeSourcePath: page.relativeSourcePath ?? page.sourceURL.lastPathComponent,
+            outputDirectoryURL: outputDirectoryURL
+        )
+        guard outputURL.standardizedFileURL != page.sourceURL.standardizedFileURL else {
+            throw AppWorkflowError.outputWouldOverwriteSource
+        }
+        guard let initialIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw AppWorkflowError.pageNotFound
+        }
+        pages[initialIndex].stage = .composing
+        pages[initialIndex].progress = Self.totalProgress(stage: .composing, fraction: 0)
+        pages[initialIndex].errorMessage = nil
+        processingActivities[pageID] = .savingOutput
+        statusMessage = "第 \(pages[initialIndex].index) 頁正在儲存上色輸出…"
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(contentsOf: previewURL).write(to: outputURL, options: .atomic)
+        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[index].colorizationOutputURL = outputURL
+        pages[index].colorizationState = ColorizationPageState(
+            stage: .completed,
+            progress: 1
+        )
+        try await persistStringTableNow(pageID: pageID)
+        statusMessage = "第 \(pages[index].index) 頁上色已輸出至輸出目錄。"
         schedulePersistence()
     }
 
@@ -2729,12 +3002,46 @@ final class AppStore: ObservableObject {
         pages[index].errorMessage = nil
     }
 
-    private func restoreStablePageStateAfterCancellation(_ pageID: UUID) {
+    private func updateColorizationProgress(pageID: UUID, fraction: Double) {
+        guard batchJobs.contains(where: {
+            $0.status == .running && $0.currentPageID == pageID && $0.operation == .colorize
+        }) else { return }
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        pages[index].colorizationState = ColorizationPageState(
+            stage: .colorizing,
+            progress: 0.25 + min(max(fraction, 0), 1) * 0.5
+        )
+    }
+
+    private func restoreStablePageStateAfterCancellation(
+        _ pageID: UUID,
+        operation: BatchOperation
+    ) {
+        guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
+        if operation.isColorization {
+            pages[index].colorizationState = Self.stableColorizationState(for: pages[index])
+            return
+        }
         let stage = Self.completedArtifactStage(for: pages[index])
         pages[index].stage = stage
         pages[index].progress = Self.totalProgress(stage: stage, fraction: 1)
         pages[index].errorMessage = nil
+    }
+
+    private static func stableColorizationState(for page: ComicPage) -> ColorizationPageState? {
+        let fileManager = FileManager.default
+        if let outputURL = page.colorizationOutputURL,
+           fileManager.fileExists(atPath: outputURL.path) {
+            return ColorizationPageState(stage: .completed, progress: 1)
+        }
+        if let previewURL = page.colorizationPreviewURL,
+           fileManager.fileExists(atPath: previewURL.path) {
+            return ColorizationPageState(stage: .previewReady, progress: 0.75)
+        }
+        if !(page.colorizationMaskStrokes?.isEmpty ?? true) {
+            return ColorizationPageState(stage: .maskReady, progress: 0.25)
+        }
+        return nil
     }
 
     private func markPageEdited(at pageIndex: Int) {
@@ -2742,6 +3049,8 @@ final class AppStore: ObservableObject {
         // 任何遮罩、文字或樣式修改都會讓舊輸出失效；保留檔案供復原，
         // 但不再讓 UI 把舊圖誤當成本次編輯後的結果。
         pages[pageIndex].outputURL = nil
+        pages[pageIndex].colorizationPreviewURL = nil
+        pages[pageIndex].colorizationOutputURL = nil
         pages[pageIndex].stage = hasTranslation ? .typesetting : .maskReady
         pages[pageIndex].progress = Self.totalProgress(stage: pages[pageIndex].stage, fraction: 1)
         pages[pageIndex].errorMessage = nil
@@ -2763,6 +3072,8 @@ final class AppStore: ObservableObject {
             pages[index].translationPreviewURL = nil
             pages[index].superResolvedBackgroundURL = nil
             pages[index].outputURL = nil
+            pages[index].colorizationPreviewURL = nil
+            pages[index].colorizationOutputURL = nil
             pages[index].stage = .masking
             pages[index].progress = Self.totalProgress(stage: .masking, fraction: 0)
         }
@@ -3236,6 +3547,17 @@ final class AppStore: ObservableObject {
                     page.stage = Self.completedArtifactStage(for: page)
                 }
             }
+            if let previewURL = page.colorizationPreviewURL,
+               !fileManager.fileExists(atPath: previewURL.path) {
+                page.colorizationPreviewURL = nil
+            }
+            if let outputURL = page.colorizationOutputURL,
+               !fileManager.fileExists(atPath: outputURL.path) {
+                page.colorizationOutputURL = nil
+            }
+            if page.colorizationState?.stage != .failed {
+                page.colorizationState = Self.stableColorizationState(for: page)
+            }
             if let outputURL = page.outputURL,
                let previewURL = page.translationPreviewURL,
                let outputModifiedAt = modificationDate(outputURL),
@@ -3273,6 +3595,9 @@ final class AppStore: ObservableObject {
         value.selectedPageIDs.formIntersection(validIDs)
         value.selectedPageID = value.selectedPageID.flatMap { validIDs.contains($0) ? $0 : nil }
             ?? value.pages.first?.id
+        value.modelDirectories.removeAll { directoryURL in
+            (try? ModelManifest.load(from: directoryURL).capability) == .textToText
+        }
         return value
     }
 
@@ -3280,10 +3605,12 @@ final class AppStore: ObservableObject {
         cancelMaskRegeneration()
         cancelTranslationPreviewRegeneration()
         undoneMaskStrokes = [:]
+        undoneColorizationMaskStrokes = [:]
         activeProjectID = snapshot.projectID
         activeProjectCreatedAt = snapshot.createdAt
         var restoredOptions = snapshot.options
         restoredOptions.useImageToImageRestoration = false
+        restoredOptions.translationModelMethod = .imageToText
         // 舊專案會把當時的 `.center` 預設明確編碼；目前沒有可調整專案級
         // 對齊預設的 UI，因此只遷移未來新建／重新偵測區域的預設值。
         // 各既有 region 的明確對齊選擇保留不動。
@@ -3318,6 +3645,7 @@ final class AppStore: ObservableObject {
         cancelMaskRegeneration()
         cancelTranslationPreviewRegeneration()
         undoneMaskStrokes = [:]
+        undoneColorizationMaskStrokes = [:]
         activeProjectID = nil
         activeProjectCreatedAt = Date()
         pages = []
@@ -3425,7 +3753,8 @@ final class AppStore: ObservableObject {
         // 專案復原只登記上次使用的模型路徑，不在啟動階段建立 runtime。
         // 需要模型的工作會在對應步驟透過 ensureModelLoaded() 延遲載入。
         for directoryURL in directories where fileManager.fileExists(atPath: directoryURL.path) {
-            guard let manifest = try? ModelManifest.load(from: directoryURL) else { continue }
+            guard let manifest = try? ModelManifest.load(from: directoryURL),
+                  manifest.capability != .textToText else { continue }
             _ = await configureLazyPreferredModel(
                 capability: manifest.capability,
                 path: directoryURL.path
@@ -3434,16 +3763,12 @@ final class AppStore: ObservableObject {
     }
 
     private func applyPreferredModelsNow(
-        textToTextPath: String?,
         imageToTextPath: String?,
         imageToImagePath: String?,
+        imageColorizationPath: String?,
         superResolutionPath: String?
     ) async {
         guard let models else { return }
-        _ = await configureLazyPreferredModel(
-            capability: .textToText,
-            path: textToTextPath
-        )
         _ = await configureLazyPreferredModel(
             capability: .imageToText,
             path: imageToTextPath
@@ -3451,6 +3776,10 @@ final class AppStore: ObservableObject {
         _ = await configureLazyPreferredModel(
             capability: .imageToImage,
             path: imageToImagePath
+        )
+        _ = await configureLazyPreferredModel(
+            capability: .imageColorization,
+            path: imageColorizationPath
         )
         _ = await configureLazyPreferredModel(
             capability: .superResolution,
@@ -3546,6 +3875,9 @@ final class AppStore: ObservableObject {
         let safeCurrentIndex = min(max(1, currentIndex), safeTotalCount)
         let canonicalDirectoryURL = directoryURL.standardizedFileURL.resolvingSymlinksInPath()
         let manifest = try ModelManifest.load(from: canonicalDirectoryURL)
+        guard manifest.capability != .textToText else {
+            throw AppWorkflowError.textToTextUnsupported
+        }
         let displayName = manifest.displayName
         if let loaded = await models.loadedModels().first(where: {
             $0.matchesModel(
@@ -3629,12 +3961,20 @@ final class AppStore: ObservableObject {
         }
     }
 
-    private func markFailed(pageID: UUID, message: String) {
+    private func markFailed(pageID: UUID, operation: BatchOperation, message: String) {
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         processingActivities[pageID] = nil
         processingRegionProgress[pageID] = nil
-        pages[index].stage = .failed
-        pages[index].errorMessage = message
+        if operation.isColorization {
+            pages[index].colorizationState = ColorizationPageState(
+                stage: .failed,
+                progress: pages[index].colorizationState?.progress ?? 0,
+                errorMessage: message
+            )
+        } else {
+            pages[index].stage = .failed
+            pages[index].errorMessage = message
+        }
         statusMessage = "第 \(pages[index].index) 頁失敗：\(message)"
         schedulePersistence()
     }
@@ -3713,8 +4053,12 @@ private enum ModelDeletionError: LocalizedError {
 }
 
 private extension BatchOperation {
+    var isColorization: Bool {
+        self == .colorize || self == .colorizationCompose
+    }
+
     var requiresOutputDirectory: Bool {
-        self == .compose || self == .fullPage
+        self == .compose || self == .fullPage || self == .colorizationCompose
     }
 }
 
@@ -3726,6 +4070,8 @@ private enum AppWorkflowError: LocalizedError {
     case outputInsideSource
     case outputWouldOverwriteSource
     case translationPreviewRequired
+    case colorizationPreviewRequired
+    case textToTextUnsupported
     case runtimeUnavailable
 
     var errorDescription: String? {
@@ -3737,6 +4083,8 @@ private enum AppWorkflowError: LocalizedError {
         case .outputInsideSource: "輸出目錄不可等於來源目錄或位於來源目錄內，以免重新掃描到輸出檔。"
         case .outputWouldOverwriteSource: "輸出路徑會覆寫來源圖片，已中止輸出。"
         case .translationPreviewRequired: "步驟三的原文、譯文或自動排版預覽尚未完成，請先補齊後再輸出。"
+        case .colorizationPreviewRequired: "上色預覽尚未完成，請先執行步驟三。"
+        case .textToTextUnsupported: "目前只支援多模態模型，無法載入文生文模型。"
         case .runtimeUnavailable: "漫畫處理 Runtime 尚未就緒。"
         }
     }

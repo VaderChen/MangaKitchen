@@ -88,6 +88,15 @@ public protocol ImageToImageGenerating: Sendable {
     ) async throws
 }
 
+public protocol ImageColorizing: Sendable {
+    func colorize(
+        inputURL: URL,
+        maskURL: URL?,
+        outputURL: URL,
+        progress: @escaping InferenceProgress
+    ) async throws
+}
+
 public protocol ImageSuperResolving: Sendable {
     func superResolve(
         inputURL: URL,

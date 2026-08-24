@@ -20,10 +20,17 @@ struct WebPage: Encodable {
     var superResolutionPixelHeight: Int?
     var translationPreviewURL: String?
     var outputPreviewURL: String?
+    var colorizationPreviewURL: String?
+    var colorizationOutputURL: String?
+    var colorizationStage: ColorizationProcessingStage
+    var colorizationProgress: Double
+    var colorizationErrorMessage: String?
     var relativeSourcePath: String?
     var stringTablePath: String?
     var regions: [DialogueRegion]
     var maskRedoRegionIDs: [UUID]
+    var colorizationMaskStrokes: [MaskStroke]
+    var colorizationMaskRedoAvailable: Bool
     var stage: PageProcessingStage
     var progress: Double
     var processingActivity: PageProcessingActivity?
@@ -35,6 +42,7 @@ struct WebPage: Encodable {
         page: ComicPage,
         maskRevision: UInt64 = 0,
         maskRedoRegionIDs: [UUID] = [],
+        colorizationMaskRedoAvailable: Bool = false,
         processingActivity: PageProcessingActivity? = nil,
         processingRegionProgress: ProcessingRegionProgress? = nil
     ) {
@@ -44,6 +52,13 @@ struct WebPage: Encodable {
         let superResolvedDimensions = superResolvedBackgroundURL.flatMap(Self.pixelDimensions)
         let translationPreviewFileURL = Self.existingFileURL(page.translationPreviewURL)
         let outputURL = Self.existingFileURL(page.outputURL)
+        let colorizationPreviewFileURL = Self.existingFileURL(page.colorizationPreviewURL)
+        let colorizationOutputFileURL = Self.existingFileURL(page.colorizationOutputURL)
+        let colorizationState = Self.resolvedColorizationState(
+            page: page,
+            previewURL: colorizationPreviewFileURL,
+            outputURL: colorizationOutputFileURL
+        )
         id = page.id
         index = page.index
         title = page.title
@@ -78,10 +93,23 @@ struct WebPage: Encodable {
             let revision = Self.modificationTimestamp(for: $0) ?? 0
             return "mangakitchen-asset://\(page.id.uuidString.lowercased())/output?updated=\(revision)"
         }
+        colorizationPreviewURL = colorizationPreviewFileURL.map {
+            let revision = Self.modificationTimestamp(for: $0) ?? 0
+            return "mangakitchen-asset://\(page.id.uuidString.lowercased())/colorization-preview?updated=\(revision)"
+        }
+        colorizationOutputURL = colorizationOutputFileURL.map {
+            let revision = Self.modificationTimestamp(for: $0) ?? 0
+            return "mangakitchen-asset://\(page.id.uuidString.lowercased())/colorization-output?updated=\(revision)"
+        }
+        colorizationStage = colorizationState.stage
+        colorizationProgress = colorizationState.progress
+        colorizationErrorMessage = colorizationState.errorMessage
         relativeSourcePath = page.relativeSourcePath
         stringTablePath = page.stringTableURL?.path
         regions = page.regions
         self.maskRedoRegionIDs = maskRedoRegionIDs
+        colorizationMaskStrokes = page.colorizationMaskStrokes ?? []
+        self.colorizationMaskRedoAvailable = colorizationMaskRedoAvailable
         stage = page.stage
         progress = page.progress
         self.processingActivity = processingActivity
@@ -96,6 +124,28 @@ struct WebPage: Encodable {
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
               !isDirectory.boolValue else { return nil }
         return url
+    }
+
+    private static func resolvedColorizationState(
+        page: ComicPage,
+        previewURL: URL?,
+        outputURL: URL?
+    ) -> ColorizationPageState {
+        if outputURL != nil {
+            return ColorizationPageState(stage: .completed, progress: 1)
+        }
+        if previewURL != nil {
+            return ColorizationPageState(stage: .previewReady, progress: 0.75)
+        }
+        if let state = page.colorizationState,
+           [.colorizing, .exporting, .failed].contains(state.stage) {
+            return state
+        }
+        if !(page.colorizationMaskStrokes?.isEmpty ?? true)
+            || page.colorizationState?.stage == .maskReady {
+            return ColorizationPageState(stage: .maskReady, progress: 0.25)
+        }
+        return ColorizationPageState()
     }
 
     private static func modificationTimestamp(for url: URL?) -> TimeInterval? {
@@ -216,11 +266,6 @@ struct WebGlobalSettings: Encodable {
     var activeDataDirectoryPath: String?
     var dataDirectoryRestartRequired: Bool
     var imageCompositingBackend: ImageCompositingBackend
-    var textToTextModelPath: String?
-    var textToTextModelDownloadDirectoryPath: String?
-    var textToTextModelVariant: String
-    var textToTextModelOptions: [ModelOption]
-    var textToTextModelInstalled: Bool
     var imageToTextModelPath: String?
     var imageToTextModelDownloadDirectoryPath: String?
     var imageToTextModelVariant: String
@@ -229,6 +274,11 @@ struct WebGlobalSettings: Encodable {
     var modelThinkingEnabled: Bool
     var modelDownloadState: ModelDownloadState?
     var imageToImageModelPath: String?
+    var imageColorizationModelPath: String?
+    var imageColorizationModelDownloadDirectoryPath: String?
+    var imageColorizationModelVariant: String
+    var imageColorizationModelOptions: [ModelOption]
+    var imageColorizationModelInstalled: Bool
     var automaticSuperResolutionEnabled: Bool
     var superResolutionModelPath: String?
     var superResolutionModelDownloadDirectoryPath: String?
@@ -261,29 +311,6 @@ struct WebGlobalSettings: Encodable {
         dataDirectoryRestartRequired = configuredDataDirectoryPath != store.applicationDataDirectoryPath
         defaultOutputDirectoryPath = preferences.defaultOutputDirectoryPath
         imageCompositingBackend = preferences.resolvedImageCompositingBackend
-        textToTextModelPath = preferences.textToTextModelPath
-        textToTextModelDownloadDirectoryPath = preferences.textToTextModelDownloadDirectoryPath
-        let selectedTextToTextModelVariant = preferences.resolvedTextToTextModelVariant
-        textToTextModelVariant = selectedTextToTextModelVariant
-        let textToTextStorageDirectoryURL = preferences.textToTextModelDownloadDirectoryPath.map {
-            URL(fileURLWithPath: $0).standardizedFileURL
-        }
-        textToTextModelOptions = DownloadableModelCatalog.textToTextModels.map { model in
-            ModelOption(
-                id: model.id,
-                displayName: model.displayName,
-                recommended: model.recommended,
-                installed: textToTextStorageDirectoryURL.flatMap {
-                    DownloadableModelCatalog.installedModelDirectory(
-                        storageDirectoryURL: $0,
-                        model: model
-                    )
-                } != nil
-            )
-        }
-        textToTextModelInstalled = textToTextModelOptions.first {
-            $0.id == selectedTextToTextModelVariant
-        }?.installed ?? false
         imageToTextModelPath = preferences.imageToTextModelPath
         imageToTextModelDownloadDirectoryPath = preferences.imageToTextModelDownloadDirectoryPath
         let selectedImageToTextModelVariant = preferences.resolvedImageToTextModelVariant
@@ -310,6 +337,29 @@ struct WebGlobalSettings: Encodable {
         modelThinkingEnabled = preferences.modelThinkingEnabled
         modelDownloadState = store.modelDownloadState
         imageToImageModelPath = preferences.imageToImageModelPath
+        imageColorizationModelPath = preferences.imageColorizationModelPath
+        imageColorizationModelDownloadDirectoryPath = preferences.imageColorizationModelDownloadDirectoryPath
+        let selectedImageColorizationModelVariant = preferences.resolvedImageColorizationModelVariant
+        imageColorizationModelVariant = selectedImageColorizationModelVariant
+        let imageColorizationStorageURL = preferences.imageColorizationModelDownloadDirectoryPath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        }
+        imageColorizationModelOptions = DownloadableModelCatalog.imageColorizationModels.map { model in
+            ModelOption(
+                id: model.id,
+                displayName: model.displayName,
+                recommended: model.recommended,
+                installed: imageColorizationStorageURL.flatMap {
+                    DownloadableModelCatalog.installedModelDirectory(
+                        storageDirectoryURL: $0,
+                        model: model
+                    )
+                } != nil
+            )
+        }
+        imageColorizationModelInstalled = imageColorizationModelOptions.first {
+            $0.id == selectedImageColorizationModelVariant
+        }?.installed ?? false
         automaticSuperResolutionEnabled = preferences.automaticSuperResolutionEnabled
         superResolutionModelPath = preferences.superResolutionModelPath
         superResolutionModelDownloadDirectoryPath = preferences.superResolutionModelDownloadDirectoryPath
@@ -419,6 +469,7 @@ struct WebAppState: Encodable {
                 page: $0,
                 maskRevision: store.maskRevision(pageID: $0.id),
                 maskRedoRegionIDs: store.maskRedoRegionIDs(pageID: $0.id),
+                colorizationMaskRedoAvailable: store.colorizationMaskRedoAvailable(pageID: $0.id),
                 processingActivity: store.processingActivities[$0.id],
                 processingRegionProgress: store.processingRegionProgress[$0.id]
             )

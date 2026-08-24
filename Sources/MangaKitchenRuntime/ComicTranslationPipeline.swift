@@ -14,6 +14,8 @@ public actor ComicTranslationPipeline {
     private let backgroundRestorer: any PageBackgroundRestoring
     private let typesetter: any DialogueTypesetting
     private let superResolver: (any ImageSuperResolving)?
+    private let colorizer: (any ImageColorizing)?
+    private let colorizationMaskGenerator: ColorizationMaskGenerator
     private let outputRoot: URL
 
     public init(
@@ -27,7 +29,9 @@ public actor ComicTranslationPipeline {
         backgroundRestorer: any PageBackgroundRestoring,
         typesetter: any DialogueTypesetting,
         outputRoot: URL,
-        superResolver: (any ImageSuperResolving)? = nil
+        superResolver: (any ImageSuperResolving)? = nil,
+        colorizer: (any ImageColorizing)? = nil,
+        colorizationMaskGenerator: ColorizationMaskGenerator = ColorizationMaskGenerator()
     ) {
         self.regionDetector = regionDetector
         self.textRecognizer = textRecognizer
@@ -39,6 +43,8 @@ public actor ComicTranslationPipeline {
         self.backgroundRestorer = backgroundRestorer
         self.typesetter = typesetter
         self.superResolver = superResolver
+        self.colorizer = colorizer
+        self.colorizationMaskGenerator = colorizationMaskGenerator
         self.outputRoot = outputRoot
     }
 
@@ -409,6 +415,56 @@ public actor ComicTranslationPipeline {
         return urls.superResolvedBackground
     }
 
+    public func colorize(
+        page: ComicPage,
+        inputURL: URL,
+        regions: [DialogueRegion],
+        strokes: [MaskStroke],
+        progress: @escaping InferenceProgress
+    ) async throws -> URL {
+        guard let colorizer else {
+            throw ModelRuntimeError.capabilityNotLoaded(.imageColorization)
+        }
+        try Task.checkCancellation()
+        let maskURL = try prepareColorizationMask(
+            page: page,
+            sourceURL: inputURL,
+            regions: regions,
+            strokes: strokes
+        )
+        let previewURL = try colorizationPreviewURL(for: page)
+        progress(0.15)
+        try await colorizer.colorize(
+            inputURL: inputURL,
+            maskURL: maskURL,
+            outputURL: previewURL,
+            progress: { value in
+                progress(0.15 + min(max(value, 0), 1) * 0.85)
+            }
+        )
+        return previewURL
+    }
+
+    public func prepareColorizationMask(
+        page: ComicPage,
+        sourceURL: URL,
+        regions: [DialogueRegion],
+        strokes: [MaskStroke]
+    ) throws -> URL {
+        let maskURL = try artifactURLs(for: page).colorizationMask
+        try colorizationMaskGenerator.generateMask(
+            sourceURL: sourceURL,
+            regions: regions,
+            strokes: strokes,
+            outputURL: maskURL
+        )
+        return maskURL
+    }
+
+    public func colorizationPreviewURL(for page: ComicPage) throws -> URL {
+        try artifactURLs(for: page).colorizationPreview
+    }
+
     /// 保護已完成去字的遮罩區，避免 SR 把極淡殘影重新銳化成原文。
     ///
     /// 遮罩外沿用模型輸出；遮罩內使用去字背景的高品質縮放像素。遮罩再向外
@@ -548,7 +604,9 @@ public actor ComicTranslationPipeline {
         mask: URL,
         background: URL,
         superResolvedBackground: URL,
-        output: URL
+        output: URL,
+        colorizationMask: URL,
+        colorizationPreview: URL
     ) {
         let pageDirectory = outputRoot.appendingPathComponent(page.id.uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: pageDirectory, withIntermediateDirectories: true)
@@ -556,7 +614,9 @@ public actor ComicTranslationPipeline {
             pageDirectory.appendingPathComponent("dialogue-mask.png"),
             pageDirectory.appendingPathComponent("background.png"),
             pageDirectory.appendingPathComponent("background-sr.png"),
-            pageDirectory.appendingPathComponent("translated.png")
+            pageDirectory.appendingPathComponent("translated.png"),
+            pageDirectory.appendingPathComponent("colorization-mask.png"),
+            pageDirectory.appendingPathComponent("colorized.png")
         )
     }
 

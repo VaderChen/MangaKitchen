@@ -19,10 +19,26 @@ public struct ModelManifest: Codable, Hashable, Sendable {
     public struct Outputs: Codable, Hashable, Sendable {
         public var text: String?
         public var image: String?
+        public var chroma: String?
 
-        public init(text: String? = nil, image: String? = nil) {
+        public init(text: String? = nil, image: String? = nil, chroma: String? = nil) {
             self.text = text
             self.image = image
+            self.chroma = chroma
+        }
+    }
+
+    public struct Colorization: Codable, Hashable, Sendable {
+        public enum Kind: String, Codable, Hashable, Sendable {
+            case ddcolor
+        }
+
+        public var kind: Kind
+        public var inputSize: Int
+
+        public init(kind: Kind = .ddcolor, inputSize: Int = 512) {
+            self.kind = kind
+            self.inputSize = inputSize
         }
     }
 
@@ -94,6 +110,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
     public var modelFile: String?
     public var inputs: Inputs?
     public var outputs: Outputs?
+    public var colorization: Colorization?
     public var superResolutionScale: Int?
     public var generation: Generation?
     public var externalRuntime: ExternalRuntime?
@@ -107,6 +124,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         modelFile: String? = nil,
         inputs: Inputs? = nil,
         outputs: Outputs? = nil,
+        colorization: Colorization? = nil,
         superResolutionScale: Int? = nil,
         generation: Generation? = nil,
         externalRuntime: ExternalRuntime? = nil
@@ -119,6 +137,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         self.modelFile = modelFile
         self.inputs = inputs
         self.outputs = outputs
+        self.colorization = colorization
         self.superResolutionScale = superResolutionScale
         self.generation = generation
         self.externalRuntime = externalRuntime

@@ -132,6 +132,8 @@ public enum BatchOperation: String, Codable, CaseIterable, Hashable, Sendable {
     case superResolve
     case compose
     case fullPage
+    case colorize
+    case colorizationCompose
 }
 
 public enum BatchJobStatus: String, Codable, CaseIterable, Hashable, Sendable {

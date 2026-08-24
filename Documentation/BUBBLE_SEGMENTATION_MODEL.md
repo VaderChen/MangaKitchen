@@ -10,6 +10,8 @@ MangaKitchen 內建 `manga109-segmentation-bubble` 的 Core ML 版本，作為�
 
 `MangaTextMaskRefiner` 仍在 BBOX 內依原始像素尋找文字筆畫，但遮罩外擴改在像素層進行：先以亮度遲滯收進抗鋸齒邊緣，再作固定像素膨脹，最後合併成二值矩形集合。這取代逐一多邊形的向量描邊，避免斜筆畫產生灰階或扇貝狀毛邊。文字排列方向也由實際字形 BBOX 的相鄰位置判定，HTML 排版在自動模式下優先採用該結果。
 
+上色流程不重新執行氣泡分割。`ColorizationMaskGenerator` 會沿用本模型保存的 `bubbleMaskPolygons`、既有對話區域與上色專用畫筆，建立反對話框遮罩：白色區域允許 DDColor 或外部 Agent 上色，黑色區域強制保留輸入頁面的對話框像素。這個 `colorization-mask.png` 與翻譯去字使用的 `dialogue-mask.png` 是不同產物，不能互相覆寫。
+
 ## 重新產生模型
 
 先下載原始 `best.pt`，並安裝相容的 `ultralytics` 與 `coremltools`。接著於專案根目錄執行：

@@ -1,6 +1,8 @@
 import Foundation
+import ImageIO
 import MangaKitchenCore
 import MangaKitchenRuntime
+import UniformTypeIdentifiers
 
 struct MCPWorkspaceState: Codable, Sendable {
     var workspaceID: UUID?
@@ -50,6 +52,10 @@ struct MCPPageTask: Codable, Sendable {
     var hasBackground: Bool
     var hasTranslationPreview: Bool
     var hasOutput: Bool
+    var colorizationStage: ColorizationProcessingStage
+    var colorizationProgress: Double
+    var hasColorizationPreview: Bool
+    var hasColorizationOutput: Bool
     /// 目前缺少的產物類型，並非強制執行命令。
     var nextAction: MCPPageNextAction
     /// 非強制性的狀態提示。
@@ -58,6 +64,7 @@ struct MCPPageTask: Codable, Sendable {
     var pageURI: String
     var revision: String
     var errorMessage: String?
+    var colorizationErrorMessage: String?
 }
 
 /// 工作流只有這幾種待辦狀態；Agent 可直接依此分派，不必自行推導。
@@ -72,12 +79,19 @@ enum MCPPageNextAction: String, Codable, Sendable {
     case writeTranslation
     /// 步驟三預覽齊全但尚未輸出：執行 page.render。
     case compose
+    /// 上色步驟二需要 App 先建立對話框保護遮罩。
+    case prepareColorizationMask
+    /// 上色遮罩已完成，可執行 DDColor。
+    case colorize
+    /// 上色預覽已完成，可儲存上色輸出。
+    case exportColorization
     /// 已輸出，無待辦。
     case done
 }
 
 struct MCPWorkspacePageList: Codable, Sendable {
     var workspaceID: UUID
+    var workflow: MCPWorkflowKind
     var name: String
     var sourceDirectoryURL: URL
     var outputDirectoryURL: URL?
@@ -138,6 +152,27 @@ struct MCPAgentTaskPayload: Sendable {
     var sourceImageMIMEType: String
 }
 
+struct MCPAgentColorizationBundle: Codable, Sendable {
+    var workspaceID: UUID
+    var pageID: UUID
+    var revision: String
+    var title: String
+    var pixelWidth: Int
+    var pixelHeight: Int
+    var inputSource: MCPColorizationInputSource
+    var inputURI: String
+    var maskSemantics: String
+    var maximumResultBytes: Int
+    var instruction: String
+}
+
+struct MCPAgentColorizationTaskPayload: Sendable {
+    var bundle: MCPAgentColorizationBundle
+    var inputImageData: Data
+    var inputImageMIMEType: String
+    var maskImageData: Data
+}
+
 struct MCPAgentRegionResult: Sendable {
     var regionID: UUID
     var sourceText: String
@@ -181,6 +216,7 @@ actor MCPWorkflowService {
     typealias StateProvider = @MainActor @Sendable (URL) async -> WorkspaceSnapshot?
 
     private let models: ModelRuntimeHub
+    private let colorizationCompositor: MaskedImageCompositor
     /// 用來產生本機氣泡形狀，或把相容模式的 Agent 粗框對齊到原圖。
     private let bubbleSegmenter: MangaBubbleSegmentationCoreMLRuntime?
     /// 區域編輯的唯一實作，與 App 端共用。
@@ -224,6 +260,7 @@ actor MCPWorkflowService {
         let models = ModelRuntimeHub(metal: metal)
         let root = try Self.makeWorkspaceRoot(dataDirectoryPath: dataDirectoryPath)
         self.models = models
+        self.colorizationCompositor = MaskedImageCompositor(metal: metal)
         self.workspaceRoot = root
         self.stateChangeHandler = stateChangeHandler
         self.stateProvider = stateProvider
@@ -246,7 +283,8 @@ actor MCPWorkflowService {
             maskGenerator: maskGenerator,
             backgroundRestorer: backgroundRestorer,
             typesetter: typesetter,
-            outputRoot: artifactsRoot
+            outputRoot: artifactsRoot,
+            colorizer: models
         )
         self.localDetectionPipeline = ComicTranslationPipeline(
             // MCP 與 App 的步驟二共用同一語意：先找氣泡，再以
@@ -263,7 +301,8 @@ actor MCPWorkflowService {
                 compositingBackend: imageCompositingBackend
             ),
             typesetter: HTMLDialogueTypesetter(),
-            outputRoot: root.appendingPathComponent("Artifacts", isDirectory: true)
+            outputRoot: root.appendingPathComponent("Artifacts", isDirectory: true),
+            colorizer: models
         )
     }
 
@@ -642,18 +681,20 @@ actor MCPWorkflowService {
     /// `pendingOnly` 預設為 true，只回傳還有待辦的頁面。
     func pageTasks(
         workspaceID: UUID,
-        pendingOnly: Bool
+        pendingOnly: Bool,
+        workflow: MCPWorkflowKind = .translation
     ) async throws -> MCPWorkspacePageList {
         try await requireWorkspace(workspaceID)
         guard let context = workspaces[workspaceID] else {
             throw MCPServiceError.workspaceNotFound
         }
         let allTasks = context.pages.map {
-            Self.makePageTask($0, regionSource: context.regionSource)
+            Self.makePageTask($0, regionSource: context.regionSource, workflow: workflow)
         }
         let pending = allTasks.filter { $0.nextAction != .done }
         return MCPWorkspacePageList(
             workspaceID: workspaceID,
+            workflow: workflow,
             name: context.name,
             sourceDirectoryURL: context.sourceDirectoryURL,
             outputDirectoryURL: context.outputDirectoryURL,
@@ -673,12 +714,17 @@ actor MCPWorkflowService {
             workspaceID: workspaceID,
             contractVersion: MCPContractDescription.current.contractVersion,
             regionSource: regionSource,
-            providerPolicy: "provider-agnostic-agent",
+            providerPolicy: "provider-agnostic-multimodal-agent",
             tools: MCPContractDescription.current.publicTools,
             styleFields: MCPContractDescription.current.styleFields,
             supportsOptimisticConcurrency: true,
             supportsAtomicRegionBatchUpdate: true,
-            supportsHTMLBasedPSD: true
+            supportsHTMLBasedPSD: true,
+            requiresMultimodalTranslationAgent: true,
+            supportsColorization: true,
+            colorizationModelCapability: .imageColorization,
+            supportsColorizationTuning: false,
+            supportsAgentColorization: true
         )
     }
 
@@ -761,7 +807,7 @@ actor MCPWorkflowService {
             defaultWritingDirection: options.defaultStyle.writingDirection,
             translationQuality: options.translationQuality,
             glossary: glossary,
-            instruction: "原圖已附在本次 tool result 的 image content，全部區域與遮罩資料已內嵌於 regionData.entries。請依 readingDirection 以整頁語境處理，先建立忠實直譯稿，再依 translationQuality 的長度策略與 styleGuide 完成自然譯文；reviewPassEnabled 時需執行整頁二次校稿，qualityCheckEnabled 時回傳信心與 QA flags。entries 中既有的 sourceText 與 translatedText 都是待校稿草稿，正確時保留，不正確或空白時修正。請同時檢查排版欄位，必要時調整以符合氣泡內的 HTML 排版。不要搜尋、讀取或建立 .str 檔案，也不要額外讀取 page resource。請依既有 region id 逐區處理，不要刪除、合併或重建區域與遮罩。完成全部區域後，以 submit_agent_result 一次回寫並完成步驟三翻譯排字預覽；只有使用者要求輸出時才另外呼叫 page.render 執行步驟四。"
+            instruction: "你必須是可讀取圖片的多模態 Agent。原圖已附在本次 tool result 的 image content，全部區域與遮罩資料已內嵌於 regionData.entries；請實際檢視原圖，不得降級成只讀文字欄位的文生文流程。請依 readingDirection 以整頁語境處理，先建立忠實直譯稿，再依 translationQuality 的長度策略與 styleGuide 完成自然譯文；reviewPassEnabled 時需執行整頁二次校稿，qualityCheckEnabled 時回傳信心與 QA flags。entries 中既有的 sourceText 與 translatedText 都是待校稿草稿，正確時保留，不正確或空白時修正。請同時檢查排版欄位，必要時調整以符合氣泡內的 HTML 排版。不要搜尋、讀取或建立 .str 檔案，也不要額外讀取 page resource。請依既有 region id 逐區處理，不要刪除、合併或重建區域與遮罩。完成全部區域後，以 submit_agent_result 一次回寫並完成步驟三翻譯排字預覽；只有使用者要求輸出時才另外呼叫 page.render 執行步驟四。"
         )
         progress(1, "單頁 Agent 工作包已準備完成：\(page.title)")
         return MCPAgentTaskPayload(
@@ -861,6 +907,7 @@ actor MCPWorkflowService {
         pages[pageIndex].regions = updatedRegions
         pages[pageIndex].translationPreviewURL = previewURL
         pages[pageIndex].outputURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         pages[pageIndex].stage = .translationReady
         pages[pageIndex].progress = 0.65
         pages[pageIndex].errorMessage = nil
@@ -878,7 +925,8 @@ actor MCPWorkflowService {
 
     private static func makePageTask(
         _ page: ComicPage,
-        regionSource: MCPRegionSource
+        regionSource: MCPRegionSource,
+        workflow: MCPWorkflowKind
     ) -> MCPPageTask {
         let missingSourceText = page.regions.reduce(into: 0) { count, region in
             let text = region.sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -904,22 +952,47 @@ actor MCPWorkflowService {
         let hasOutput = page.outputURL.map {
             FileManager.default.fileExists(atPath: $0.path)
         } ?? false
+        let hasColorizationPreview = page.colorizationPreviewURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
+        let hasColorizationOutput = page.colorizationOutputURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
+        let colorizationState = resolvedColorizationState(
+            for: page,
+            hasMaskData: hasMask && hasBackground,
+            hasPreview: hasColorizationPreview,
+            hasOutput: hasColorizationOutput
+        )
         let identifier = page.id.uuidString.lowercased()
         let hasCompleteMaskData = hasMask && hasBackground
 
         let nextAction: MCPPageNextAction
-        if page.regions.isEmpty {
-            nextAction = regionSource == .local ? .detectMasks : .submitRegions
-        } else if !hasCompleteMaskData {
-            nextAction = .detectMasks
-        } else if missingSourceText > 0 {
-            nextAction = .writeSourceText
-        } else if missingTranslation > 0 || !hasTranslationPreview {
-            nextAction = .writeTranslation
-        } else if !hasOutput {
-            nextAction = .compose
-        } else {
-            nextAction = .done
+        switch workflow {
+        case .translation:
+            if page.regions.isEmpty {
+                nextAction = regionSource == .local ? .detectMasks : .submitRegions
+            } else if !hasCompleteMaskData {
+                nextAction = .detectMasks
+            } else if missingSourceText > 0 {
+                nextAction = .writeSourceText
+            } else if missingTranslation > 0 || !hasTranslationPreview {
+                nextAction = .writeTranslation
+            } else if !hasOutput {
+                nextAction = .compose
+            } else {
+                nextAction = .done
+            }
+        case .colorization:
+            if page.regions.isEmpty || !hasCompleteMaskData {
+                nextAction = .prepareColorizationMask
+            } else if !hasColorizationPreview {
+                nextAction = .colorize
+            } else if !hasColorizationOutput {
+                nextAction = .exportColorization
+            } else {
+                nextAction = .done
+            }
         }
 
         return MCPPageTask(
@@ -938,12 +1011,17 @@ actor MCPWorkflowService {
             hasBackground: hasBackground,
             hasTranslationPreview: hasTranslationPreview,
             hasOutput: hasOutput,
+            colorizationStage: colorizationState.stage,
+            colorizationProgress: colorizationState.progress,
+            hasColorizationPreview: hasColorizationPreview,
+            hasColorizationOutput: hasColorizationOutput,
             nextAction: nextAction,
             nextActionInstruction: Self.nextActionInstruction(for: nextAction),
             sourceURI: "mangakitchen://page/\(identifier)/source",
             pageURI: "mangakitchen://page/\(identifier)",
             revision: (try? Self.revision(for: page)) ?? "unavailable",
-            errorMessage: page.errorMessage
+            errorMessage: page.errorMessage,
+            colorizationErrorMessage: colorizationState.errorMessage
         )
     }
 
@@ -959,9 +1037,37 @@ actor MCPWorkflowService {
             "狀態提示：步驟三的原文、譯文或排字預覽尚未完成；請使用單頁 Agent 工作包一次處理。"
         case .compose:
             "狀態提示：步驟三預覽已完成；只有使用者要求輸出時才呼叫 page.render 儲存。"
+        case .prepareColorizationMask:
+            "狀態提示：上色步驟二尚未完成；請先在 App 建立並確認反對話框遮罩。"
+        case .colorize:
+            "狀態提示：上色遮罩已完成；可呼叫 page.prepare_colorization_task 交由 Agent 上色並以 page.submit_colorization_result 回寫，或載入 imageColorization 模型後呼叫 page.colorize。"
+        case .exportColorization:
+            "狀態提示：上色預覽已完成；只有使用者要求輸出時才呼叫 page.render_colorization。"
         case .done:
             "狀態提示：本頁已有完整產物，除非使用者明確要求修改，否則不需操作。"
         }
+    }
+
+    private static func resolvedColorizationState(
+        for page: ComicPage,
+        hasMaskData: Bool,
+        hasPreview: Bool,
+        hasOutput: Bool
+    ) -> ColorizationPageState {
+        if hasOutput {
+            return ColorizationPageState(stage: .completed, progress: 1)
+        }
+        if hasPreview {
+            return ColorizationPageState(stage: .previewReady, progress: 0.75)
+        }
+        if let state = page.colorizationState,
+           [.colorizing, .exporting, .failed].contains(state.stage) {
+            return state
+        }
+        if hasMaskData || !(page.colorizationMaskStrokes?.isEmpty ?? true) {
+            return ColorizationPageState(stage: .maskReady, progress: 0.25)
+        }
+        return ColorizationPageState()
     }
 
     func supplementRegions(
@@ -1056,6 +1162,7 @@ actor MCPWorkflowService {
         pages[pageIndex].superResolvedBackgroundURL = nil
         pages[pageIndex].translationPreviewURL = nil
         pages[pageIndex].outputURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         pages[pageIndex].stage = .maskReady
         pages[pageIndex].progress = 0.25
         pages[pageIndex].errorMessage = nil
@@ -1133,6 +1240,7 @@ actor MCPWorkflowService {
         }
         pages[pageIndex].outputURL = nil
         pages[pageIndex].translationPreviewURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         if shouldRegenerateMask {
             try await refreshEditedPage(pageIndex: pageIndex)
         } else {
@@ -1215,6 +1323,7 @@ actor MCPWorkflowService {
         pages[pageIndex].regions = updatedRegions
         pages[pageIndex].outputURL = nil
         pages[pageIndex].translationPreviewURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         if let regeneratedMaskURL {
             pages[pageIndex].maskURL = regeneratedMaskURL
             pages[pageIndex].backgroundURL = regeneratedBackgroundURL
@@ -1262,6 +1371,7 @@ actor MCPWorkflowService {
         pages[pageIndex].regions = orderedRegionIDs.compactMap { regionsByID[$0] }
         pages[pageIndex].outputURL = nil
         pages[pageIndex].translationPreviewURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         pages[pageIndex].stage = pages[pageIndex].regions.contains(where: { !$0.translatedText.isEmpty })
             ? .translating
             : .maskReady
@@ -1299,6 +1409,302 @@ actor MCPWorkflowService {
             progress(fraction, "\(stage.rawValue)：\(pageID.uuidString)")
         }
         try await compose(pageID: pageID, progress: pageProgress)
+        await publishStateChange()
+        return try Self.makeMutationResult(workspaceID: workspaceID, page: pages[pageIndex])
+    }
+
+    func colorizePage(
+        workspaceID: UUID,
+        pageID: UUID,
+        expectedRevision: String,
+        progress: @escaping Progress
+    ) async throws -> MCPPageMutationResult {
+        try await requireWorkspace(workspaceID)
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw MCPServiceError.pageNotFound
+        }
+        try Self.requireRevision(expectedRevision, for: pages[pageIndex])
+        guard hasMaskData(pageID: pageID), !pages[pageIndex].regions.isEmpty else {
+            throw MCPServiceError.colorizationMaskDataRequired
+        }
+
+        let page = pages[pageIndex]
+        let inputURL = page.outputURL.flatMap {
+            FileManager.default.fileExists(atPath: $0.path) ? $0 : nil
+        } ?? page.sourceURL
+        guard FileManager.default.fileExists(atPath: inputURL.path) else {
+            throw MCPServiceError.resourceNotFound(inputURL.absoluteString)
+        }
+
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].colorizationState = ColorizationPageState(
+            stage: .colorizing,
+            progress: 0.25
+        )
+        await publishStateChange()
+
+        do {
+            progress(0.05, "準備上色輸入：\(page.title)")
+            let previewURL = try await pipeline.colorize(
+                page: page,
+                inputURL: inputURL,
+                regions: page.regions,
+                strokes: page.colorizationMaskStrokes ?? [],
+                progress: { value in
+                    let fraction = min(max(value, 0), 1)
+                    progress(0.05 + fraction * 0.95, "DDColor 上色：\(page.title)")
+                }
+            )
+            try Task.checkCancellation()
+            guard let updatedIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+                throw MCPServiceError.pageNotFound
+            }
+            pages[updatedIndex].colorizationPreviewURL = previewURL
+            pages[updatedIndex].colorizationOutputURL = nil
+            pages[updatedIndex].colorizationState = ColorizationPageState(
+                stage: .previewReady,
+                progress: 0.75
+            )
+            await publishStateChange()
+            return try Self.makeMutationResult(
+                workspaceID: workspaceID,
+                page: pages[updatedIndex]
+            )
+        } catch {
+            if let failedIndex = pages.firstIndex(where: { $0.id == pageID }) {
+                pages[failedIndex].colorizationState = ColorizationPageState(
+                    stage: .failed,
+                    progress: pages[failedIndex].colorizationState?.progress ?? 0.25,
+                    errorMessage: error.localizedDescription
+                )
+                await publishStateChange()
+            }
+            throw error
+        }
+    }
+
+    func prepareAgentColorizationTask(
+        workspaceID: UUID,
+        pageID: UUID,
+        progress: @escaping Progress
+    ) async throws -> MCPAgentColorizationTaskPayload {
+        try await requireWorkspace(workspaceID)
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw MCPServiceError.pageNotFound
+        }
+        guard hasMaskData(pageID: pageID), !pages[pageIndex].regions.isEmpty else {
+            throw MCPServiceError.colorizationMaskDataRequired
+        }
+
+        let page = pages[pageIndex]
+        let input = Self.colorizationInput(for: page)
+        let inputData = try Data(contentsOf: input.url)
+        let dimensions = try Self.imageDimensions(from: inputData)
+        progress(0.25, "建立反對話框遮罩：\(page.title)")
+        let maskURL = try await pipeline.prepareColorizationMask(
+            page: page,
+            sourceURL: input.url,
+            regions: page.regions,
+            strokes: page.colorizationMaskStrokes ?? []
+        )
+        let maskData = try Data(contentsOf: maskURL)
+        let identifier = page.id.uuidString.lowercased()
+        let bundle = MCPAgentColorizationBundle(
+            workspaceID: workspaceID,
+            pageID: page.id,
+            revision: try Self.revision(for: page),
+            title: page.title,
+            pixelWidth: dimensions.width,
+            pixelHeight: dimensions.height,
+            inputSource: input.source,
+            inputURI: input.source == .translatedOutput
+                ? "mangakitchen://page/\(identifier)/output"
+                : "mangakitchen://page/\(identifier)/source",
+            maskSemantics: "白色像素允許上色；黑色像素必須保留輸入，主要用於保護對話框與人工擦除區。",
+            maximumResultBytes: MCPContractDescription.current.limits.maximumColorizationResultBytes,
+            instruction: "本次 tool result 依序附上實際上色輸入與反對話框遮罩。請以多模態影像模型自行完成整頁上色，嚴格保留黑色遮罩區的輸入像素，不得裁切、旋轉或改變像素尺寸。結果必須是完整頁面圖片，並以 submit_colorization_result 的 result_image_base64 一次回寫；這一步只建立預覽，只有使用者要求輸出時才呼叫 render_colorization。"
+        )
+        progress(1, "Agent 上色工作包已準備完成：\(page.title)")
+        return MCPAgentColorizationTaskPayload(
+            bundle: bundle,
+            inputImageData: inputData,
+            inputImageMIMEType: Self.imageMIMEType(for: input.url),
+            maskImageData: maskData
+        )
+    }
+
+    func submitAgentColorizationResult(
+        workspaceID: UUID,
+        pageID: UUID,
+        expectedRevision: String,
+        resultImageBase64: String,
+        resultMIMEType: String,
+        progress: @escaping Progress
+    ) async throws -> MCPPageMutationResult {
+        try await requireWorkspace(workspaceID)
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw MCPServiceError.pageNotFound
+        }
+        try Self.requireRevision(expectedRevision, for: pages[pageIndex])
+        guard hasMaskData(pageID: pageID), !pages[pageIndex].regions.isEmpty else {
+            throw MCPServiceError.colorizationMaskDataRequired
+        }
+
+        let normalizedMIMEType = resultMIMEType
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard Self.acceptedColorizationMIMETypes.contains(normalizedMIMEType) else {
+            throw MCPServiceError.invalidArguments(
+                "result_mime_type 必須是 PNG、JPEG、HEIC、TIFF 或 WebP 圖片。"
+            )
+        }
+        let maximumBytes = MCPContractDescription.current.limits.maximumColorizationResultBytes
+        let compactBase64 = resultImageBase64.filter { !$0.isWhitespace }
+        guard compactBase64.utf8.count <= maximumBytes * 4 / 3 + 8 else {
+            throw MCPServiceError.invalidArguments(
+                "上色結果 Base64 超過契約上限。"
+            )
+        }
+        guard let resultData = Data(base64Encoded: compactBase64), !resultData.isEmpty else {
+            throw MCPServiceError.invalidArguments("result_image_base64 不是有效的 Base64 圖片。")
+        }
+        guard resultData.count <= maximumBytes else {
+            throw MCPServiceError.invalidArguments(
+                "上色結果超過契約上限 \(maximumBytes) bytes。"
+            )
+        }
+
+        let page = pages[pageIndex]
+        let inputData = try Data(contentsOf: Self.colorizationInput(for: page).url)
+        let expectedDimensions = try Self.imageDimensions(from: inputData)
+        let previewURL = try await pipeline.colorizationPreviewURL(for: page)
+        let generatedURL = previewURL.deletingLastPathComponent()
+            .appendingPathComponent("agent-colorized.png")
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].colorizationState = ColorizationPageState(
+            stage: .colorizing,
+            progress: 0.5
+        )
+        await publishStateChange()
+        progress(0.4, "驗證 Agent 上色結果：\(page.title)")
+
+        do {
+            try Self.writeValidatedColorizationPNG(
+                data: resultData,
+                expectedWidth: expectedDimensions.width,
+                expectedHeight: expectedDimensions.height,
+                outputURL: generatedURL
+            )
+            let input = Self.colorizationInput(for: page)
+            let maskURL = try await pipeline.prepareColorizationMask(
+                page: page,
+                sourceURL: input.url,
+                regions: page.regions,
+                strokes: page.colorizationMaskStrokes ?? []
+            )
+            try await colorizationCompositor.composite(
+                sourceURL: input.url,
+                generatedURL: generatedURL,
+                maskURL: maskURL,
+                outputURL: previewURL
+            )
+            try? FileManager.default.removeItem(at: generatedURL)
+            guard let updatedIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+                throw MCPServiceError.pageNotFound
+            }
+            pages[updatedIndex].colorizationPreviewURL = previewURL
+            pages[updatedIndex].colorizationOutputURL = nil
+            pages[updatedIndex].colorizationState = ColorizationPageState(
+                stage: .previewReady,
+                progress: 0.75
+            )
+            progress(1, "Agent 上色結果已寫回預覽：\(page.title)")
+            await publishStateChange()
+            return try Self.makeMutationResult(
+                workspaceID: workspaceID,
+                page: pages[updatedIndex]
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: generatedURL)
+            if let failedIndex = pages.firstIndex(where: { $0.id == pageID }) {
+                pages[failedIndex].colorizationState = ColorizationPageState(
+                    stage: .failed,
+                    progress: 0.5,
+                    errorMessage: error.localizedDescription
+                )
+                await publishStateChange()
+            }
+            throw error
+        }
+    }
+
+    func renderColorizationPage(
+        workspaceID: UUID,
+        pageID: UUID,
+        expectedRevision: String,
+        progress: @escaping Progress
+    ) async throws -> MCPPageMutationResult {
+        try await requireWorkspace(workspaceID)
+        guard let outputDirectoryURL else { throw MCPServiceError.outputDirectoryRequired }
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw MCPServiceError.pageNotFound
+        }
+        try Self.requireRevision(expectedRevision, for: pages[pageIndex])
+        let page = pages[pageIndex]
+        guard let previewURL = page.colorizationPreviewURL,
+              FileManager.default.fileExists(atPath: previewURL.path) else {
+            throw MCPServiceError.colorizationPreviewRequired
+        }
+
+        let outputURL = try pathResolver.colorizationOutputURL(
+            relativeSourcePath: page.relativeSourcePath ?? page.sourceURL.lastPathComponent,
+            outputDirectoryURL: outputDirectoryURL
+        )
+        guard outputURL.standardizedFileURL != page.sourceURL.standardizedFileURL else {
+            throw MCPServiceError.outputWouldOverwriteSource
+        }
+
+        pages[pageIndex].colorizationState = ColorizationPageState(
+            stage: .exporting,
+            progress: 0.85
+        )
+        await publishStateChange()
+        progress(0.25, "準備儲存上色輸出：\(page.title)")
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(contentsOf: previewURL).write(to: outputURL, options: .atomic)
+        try Task.checkCancellation()
+        guard let updatedIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw MCPServiceError.pageNotFound
+        }
+        pages[updatedIndex].colorizationOutputURL = outputURL
+        pages[updatedIndex].colorizationState = ColorizationPageState(
+            stage: .completed,
+            progress: 1
+        )
+        progress(1, "上色輸出已儲存：\(page.title)")
+        await publishStateChange()
+        return try Self.makeMutationResult(workspaceID: workspaceID, page: pages[updatedIndex])
+    }
+
+    func resetColorizationPage(
+        workspaceID: UUID,
+        pageID: UUID,
+        expectedRevision: String
+    ) async throws -> MCPPageMutationResult {
+        try await requireWorkspace(workspaceID)
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw MCPServiceError.pageNotFound
+        }
+        try Self.requireRevision(expectedRevision, for: pages[pageIndex])
+
+        Self.removeColorizationFiles(for: pages[pageIndex])
+        pages[pageIndex].colorizationMaskStrokes = nil
+        pages[pageIndex].colorizationPreviewURL = nil
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].colorizationState = nil
         await publishStateChange()
         return try Self.makeMutationResult(workspaceID: workspaceID, page: pages[pageIndex])
     }
@@ -1393,6 +1799,17 @@ actor MCPWorkflowService {
                 mimeType: "application/json"
             )
         }
+        if uri == "mangakitchen://workspace/current/colorization-pages" {
+            guard let workspaceID else { throw MCPServiceError.workspaceNotOpen }
+            return .text(
+                try Self.json(await pageTasks(
+                    workspaceID: workspaceID,
+                    pendingOnly: false,
+                    workflow: .colorization
+                )),
+                mimeType: "application/json"
+            )
+        }
         if uri == "mangakitchen://workspace/current/glossary" {
             return .text(try Self.json(glossary.entries), mimeType: "application/json")
         }
@@ -1458,6 +1875,16 @@ actor MCPWorkflowService {
         case "output":
             guard let outputURL = page.outputURL else { throw MCPServiceError.resourceNotFound(uri) }
             return .binary(try Data(contentsOf: outputURL), mimeType: "image/png")
+        case "colorization-preview":
+            guard let previewURL = page.colorizationPreviewURL else {
+                throw MCPServiceError.resourceNotFound(uri)
+            }
+            return .binary(try Data(contentsOf: previewURL), mimeType: "image/png")
+        case "colorization-output":
+            guard let outputURL = page.colorizationOutputURL else {
+                throw MCPServiceError.resourceNotFound(uri)
+            }
+            return .binary(try Data(contentsOf: outputURL), mimeType: "image/png")
         default:
             throw MCPServiceError.resourceNotFound(uri)
         }
@@ -1507,6 +1934,7 @@ actor MCPWorkflowService {
         pages[pageIndex].superResolvedBackgroundURL = nil
         pages[pageIndex].translationPreviewURL = nil
         pages[pageIndex].outputURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         pages[pageIndex].stage = .maskReady
         pages[pageIndex].progress = 0.25
         pages[pageIndex].errorMessage = nil
@@ -1546,6 +1974,7 @@ actor MCPWorkflowService {
         pages[pageIndex].superResolvedBackgroundURL = nil
         pages[pageIndex].translationPreviewURL = nil
         pages[pageIndex].outputURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         pages[pageIndex].stage = .maskReady
         pages[pageIndex].progress = 0.25
         pages[pageIndex].errorMessage = nil
@@ -1579,6 +2008,7 @@ actor MCPWorkflowService {
         try previewData.write(to: paths.outputURL, options: .atomic)
         progress(.completed, 1)
         pages[index].outputURL = paths.outputURL
+        invalidateColorization(pageIndex: index)
         pages[index].stage = .completed
         pages[index].progress = 1
         pages[index].errorMessage = nil
@@ -1603,6 +2033,7 @@ actor MCPWorkflowService {
         pages[pageIndex].superResolvedBackgroundURL = nil
         pages[pageIndex].translationPreviewURL = nil
         pages[pageIndex].outputURL = nil
+        invalidateColorization(pageIndex: pageIndex)
         pages[pageIndex].stage = .maskReady
         pages[pageIndex].progress = 0.25
         try await persistStringTable(pageID: pageID)
@@ -1615,6 +2046,12 @@ actor MCPWorkflowService {
         let candidateArea = max(candidate.width * candidate.height, .leastNonzeroMagnitude)
         let existingArea = max(existing.width * existing.height, .leastNonzeroMagnitude)
         return overlapArea / candidateArea >= 0.5 && overlapArea / existingArea >= 0.5
+    }
+
+    private func invalidateColorization(pageIndex: Int) {
+        pages[pageIndex].colorizationPreviewURL = nil
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].colorizationState = nil
     }
 
     private static func mergeAgentEditingState(
@@ -1802,6 +2239,24 @@ actor MCPWorkflowService {
             FileManager.default.fileExists(atPath: $0.path)
         } ?? false
         let outputExists = page.outputURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        let colorizationPreviewExists = page.colorizationPreviewURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
+        let colorizationOutputExists = page.colorizationOutputURL.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
+        let colorizationState = resolvedColorizationState(
+            for: page,
+            hasMaskData: maskExists && backgroundExists,
+            hasPreview: colorizationPreviewExists,
+            hasOutput: colorizationOutputExists
+        )
+        let colorizationInputSource: MCPColorizationInputSource = outputExists
+            ? .translatedOutput
+            : .source
+        let colorizationInputURI = outputExists
+            ? "mangakitchen://page/\(identifier)/output"
+            : "mangakitchen://page/\(identifier)/source"
         var operations = [
             "mangakitchen.page.inspect",
             "mangakitchen.page.update"
@@ -1821,6 +2276,20 @@ actor MCPWorkflowService {
            page.regions.allSatisfy({ !$0.translatedText.isEmpty }) {
             operations.append("mangakitchen.page.render")
         }
+        if maskExists, backgroundExists, !page.regions.isEmpty {
+            operations.append("mangakitchen.page.colorize")
+            operations.append("mangakitchen.page.prepare_colorization_task")
+            operations.append("mangakitchen.page.submit_colorization_result")
+        }
+        if colorizationPreviewExists {
+            operations.append("mangakitchen.page.render_colorization")
+        }
+        if page.colorizationState != nil
+            || !(page.colorizationMaskStrokes?.isEmpty ?? true)
+            || colorizationPreviewExists
+            || colorizationOutputExists {
+            operations.append("mangakitchen.page.reset_colorization")
+        }
         return MCPPageInspection(
             workspaceID: workspaceID,
             contractVersion: MCPContractDescription.current.contractVersion,
@@ -1833,9 +2302,24 @@ actor MCPWorkflowService {
                 hasSuperResolvedBackground: superResolvedExists,
                 hasTranslationPreview: translationPreviewExists,
                 hasOutput: outputExists,
+                hasColorizationPreview: colorizationPreviewExists,
+                hasColorizationOutput: colorizationOutputExists,
                 sourceURI: "mangakitchen://page/\(identifier)/source",
                 maskURI: maskExists ? "mangakitchen://page/\(identifier)/mask" : nil,
-                outputURI: outputExists ? "mangakitchen://page/\(identifier)/output" : nil
+                outputURI: outputExists ? "mangakitchen://page/\(identifier)/output" : nil,
+                colorizationPreviewURI: colorizationPreviewExists
+                    ? "mangakitchen://page/\(identifier)/colorization-preview"
+                    : nil,
+                colorizationOutputURI: colorizationOutputExists
+                    ? "mangakitchen://page/\(identifier)/colorization-output"
+                    : nil
+            ),
+            colorization: MCPColorizationStatus(
+                stage: colorizationState.stage,
+                progress: colorizationState.progress,
+                errorMessage: colorizationState.errorMessage,
+                inputSource: colorizationInputSource,
+                inputURI: colorizationInputURI
             ),
             availableOperations: operations,
             regionsURI: "mangakitchen://page/\(identifier)/regions"
@@ -1869,6 +2353,90 @@ actor MCPWorkflowService {
         let current = try revision(for: page)
         guard expected == current else {
             throw MCPServiceError.revisionConflict(expected: expected, current: current)
+        }
+    }
+
+    private static let acceptedColorizationMIMETypes: Set<String> = [
+        "image/png",
+        "image/jpeg",
+        "image/heic",
+        "image/heif",
+        "image/tiff",
+        "image/webp"
+    ]
+
+    private static func colorizationInput(
+        for page: ComicPage
+    ) -> (url: URL, source: MCPColorizationInputSource) {
+        if let outputURL = page.outputURL,
+           FileManager.default.fileExists(atPath: outputURL.path) {
+            return (outputURL, .translatedOutput)
+        }
+        return (page.sourceURL, .source)
+    }
+
+    private static func imageDimensions(from data: Data) throws -> (width: Int, height: Int) {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.intValue > 0,
+              height.intValue > 0 else {
+            throw MCPServiceError.invalidArguments("無法解析圖片像素尺寸。")
+        }
+        return (width.intValue, height.intValue)
+    }
+
+    private static func writeValidatedColorizationPNG(
+        data: Data,
+        expectedWidth: Int,
+        expectedHeight: Int,
+        outputURL: URL
+    ) throws {
+        let dimensions = try imageDimensions(from: data)
+        guard dimensions.width == expectedWidth,
+              dimensions.height == expectedHeight else {
+            throw MCPServiceError.invalidArguments(
+                "上色結果尺寸必須是 \(expectedWidth)x\(expectedHeight)，實際為 \(dimensions.width)x\(dimensions.height)。"
+            )
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(
+                source,
+                0,
+                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+              ) else {
+            throw MCPServiceError.invalidArguments("無法解碼上色結果圖片。")
+        }
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard let destination = CGImageDestinationCreateWithURL(
+            outputURL as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw MCPServiceError.invalidArguments("無法建立上色預覽檔案。")
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw MCPServiceError.invalidArguments("無法寫入上色預覽 PNG。")
+        }
+    }
+
+    private static func removeColorizationFiles(for page: ComicPage) {
+        var urls = Set([page.colorizationPreviewURL, page.colorizationOutputURL].compactMap { $0 })
+        if let previewURL = page.colorizationPreviewURL {
+            urls.insert(
+                previewURL.deletingLastPathComponent().appendingPathComponent("colorization-mask.png")
+            )
+        }
+        let fileManager = FileManager.default
+        for url in urls where fileManager.fileExists(atPath: url.path) {
+            try? fileManager.removeItem(at: url)
         }
     }
 
@@ -1924,6 +2492,8 @@ enum MCPServiceError: LocalizedError {
     case maskDataRequired
     case agentTranslationRequired
     case translationPreviewRequired
+    case colorizationMaskDataRequired
+    case colorizationPreviewRequired
     case outputDirectoryRequired
     case outputInsideSource
     case outputWouldOverwriteSource
@@ -1944,6 +2514,10 @@ enum MCPServiceError: LocalizedError {
             "MCP 步驟三由 Agent 接手，不會呼叫 App 內建圖生文模型。請先呼叫 page.prepare_agent_task，完成全部區域原文、譯文與排版後，以 page.submit_agent_result 一次回寫。"
         case .translationPreviewRequired:
             "步驟三尚未完成翻譯排字預覽；請先完成 page.submit_agent_result，再執行 page.render 儲存輸出。"
+        case .colorizationMaskDataRequired:
+            "上色步驟二的反對話框遮罩尚未完成；請先在 App 建立並確認遮罩。"
+        case .colorizationPreviewRequired:
+            "上色步驟三預覽尚未完成；請先執行 page.colorize，再呼叫 page.render_colorization。"
         case .outputDirectoryRequired: "合成前必須設定輸出目錄。"
         case .outputInsideSource: "輸出目錄不可等於來源目錄或位於來源目錄內。"
         case .outputWouldOverwriteSource: "輸出路徑會覆寫來源圖片。"

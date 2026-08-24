@@ -368,6 +368,25 @@ final class HybridBridgeController: NSObject, ObservableObject {
         case "redoMaskStroke":
             try redoMaskStroke(params)
             return nil
+        case "appendColorizationMaskStroke":
+            try appendColorizationMaskStroke(params)
+            return nil
+        case "undoColorizationMaskStroke":
+            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
+            store.undoColorizationMaskStroke(pageID: pageID)
+            return nil
+        case "redoColorizationMaskStroke":
+            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
+            store.redoColorizationMaskStroke(pageID: pageID)
+            return nil
+        case "resetColorizationPages":
+            guard let rawPageIDs = params["pageIDs"] as? [String] else {
+                throw BridgeError.invalidParameters
+            }
+            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
+            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
+            store.resetColorizationPages(pageIDs)
+            return nil
         case "undoRegionEdit":
             guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
             store.undoRegionEdit(pageID: pageID)
@@ -482,13 +501,15 @@ final class HybridBridgeController: NSObject, ObservableObject {
 
     private func choosePreferredModelDirectory(_ params: [String: Any]) throws -> [String: Any]? {
         guard let rawCapability = params["capability"] as? String,
-              let capability = ModelCapability(rawValue: rawCapability) else {
+              let capability = ModelCapability(rawValue: rawCapability),
+              capability != .textToText else {
             throw BridgeError.invalidParameters
         }
         let panelTitleKey: String
         switch capability {
-        case .textToText: panelTitleKey = "textToTextModelPanelTitle"
+        case .textToText: throw BridgeError.invalidParameters
         case .imageToText: panelTitleKey = "imageToTextModelPanelTitle"
+        case .imageColorization: panelTitleKey = "imageColorizationModelPanelTitle"
         case .superResolution: panelTitleKey = "superResolutionModelPanelTitle"
         case .imageToImage: panelTitleKey = "imageToImageModelPanelTitle"
         }
@@ -506,13 +527,14 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private func chooseModelDownloadDirectory(_ params: [String: Any]) throws -> [String: Any]? {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
-              [.textToText, .imageToText, .superResolution].contains(capability) else {
+              [.imageToText, .imageColorization, .superResolution].contains(capability) else {
             throw BridgeError.invalidParameters
         }
         let panelTitleKey: String
         switch capability {
-        case .textToText: panelTitleKey = "textToTextModelDownloadDirectoryPanelTitle"
+        case .textToText: throw BridgeError.invalidParameters
         case .imageToText: panelTitleKey = "imageToTextModelDownloadDirectoryPanelTitle"
+        case .imageColorization: panelTitleKey = "imageColorizationModelDownloadDirectoryPanelTitle"
         case .superResolution: panelTitleKey = "superResolutionModelDownloadDirectoryPanelTitle"
         case .imageToImage: throw BridgeError.invalidParameters
         }
@@ -536,7 +558,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private func downloadPreferredModel(_ params: [String: Any]) throws {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
-              [.textToText, .imageToText, .superResolution].contains(capability),
+              [.imageToText, .imageColorization, .superResolution].contains(capability),
               let variantID = params["variantID"] as? String,
               let model = DownloadableModelCatalog.model(id: variantID, capability: capability)
         else {
@@ -545,9 +567,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
         let directoryPath: String?
         switch capability {
         case .textToText:
-            directoryPath = preferences.settings.textToTextModelDownloadDirectoryPath
+            throw BridgeError.invalidParameters
         case .imageToText:
             directoryPath = preferences.settings.imageToTextModelDownloadDirectoryPath
+        case .imageColorization:
+            directoryPath = preferences.settings.imageColorizationModelDownloadDirectoryPath
         case .superResolution:
             directoryPath = preferences.settings.superResolutionModelDownloadDirectoryPath
         case .imageToImage:
@@ -559,14 +583,14 @@ final class HybridBridgeController: NSObject, ObservableObject {
             guard let self, case let .success(modelDirectoryURL) = result else { return }
             let previous = preferences.settings
             var updated = previous
-            if capability == .textToText {
-                updated.textToTextModelDownloadDirectoryPath = storageDirectoryURL.path
-                updated.textToTextModelVariant = model.id
-                updated.textToTextModelPath = modelDirectoryURL.path
-            } else if capability == .imageToText {
+            if capability == .imageToText {
                 updated.imageToTextModelDownloadDirectoryPath = storageDirectoryURL.path
                 updated.imageToTextModelVariant = model.id
                 updated.imageToTextModelPath = modelDirectoryURL.path
+            } else if capability == .imageColorization {
+                updated.imageColorizationModelDownloadDirectoryPath = storageDirectoryURL.path
+                updated.imageColorizationModelVariant = model.id
+                updated.imageColorizationModelPath = modelDirectoryURL.path
             } else {
                 updated.superResolutionModelDownloadDirectoryPath = storageDirectoryURL.path
                 updated.superResolutionModelVariant = model.id
@@ -574,13 +598,13 @@ final class HybridBridgeController: NSObject, ObservableObject {
             }
             preferences.replace(with: updated)
             let current = preferences.settings
-            if previous.textToTextModelPath != current.textToTextModelPath
-                || previous.imageToTextModelPath != current.imageToTextModelPath
+            if previous.imageToTextModelPath != current.imageToTextModelPath
+                || previous.imageColorizationModelPath != current.imageColorizationModelPath
                 || previous.superResolutionModelPath != current.superResolutionModelPath {
                 store.applyPreferredModels(
-                    textToTextPath: current.textToTextModelPath,
                     imageToTextPath: current.imageToTextModelPath,
                     imageToImagePath: current.imageToImageModelPath,
+                    imageColorizationPath: current.imageColorizationModelPath,
                     superResolutionPath: current.superResolutionModelPath
                 )
             }
@@ -590,7 +614,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private func deleteInstalledModel(_ params: [String: Any]) throws {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
-              [.textToText, .imageToText, .superResolution].contains(capability),
+              [.imageToText, .imageColorization, .superResolution].contains(capability),
               let variantID = params["variantID"] as? String,
               let model = DownloadableModelCatalog.model(id: variantID, capability: capability)
         else {
@@ -599,9 +623,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
         let directoryPath: String?
         switch capability {
         case .textToText:
-            directoryPath = preferences.settings.textToTextModelDownloadDirectoryPath
+            throw BridgeError.invalidParameters
         case .imageToText:
             directoryPath = preferences.settings.imageToTextModelDownloadDirectoryPath
+        case .imageColorization:
+            directoryPath = preferences.settings.imageColorizationModelDownloadDirectoryPath
         case .superResolution:
             directoryPath = preferences.settings.superResolutionModelDownloadDirectoryPath
         case .imageToImage:
@@ -617,17 +643,17 @@ final class HybridBridgeController: NSObject, ObservableObject {
             storageDirectoryURL: storageDirectoryURL,
             model: model
         )
-        if capability == .textToText {
-            if previous.textToTextModelPath.map({
-                URL(fileURLWithPath: $0).standardizedFileURL == deletedDirectoryURL
-            }) == true {
-                updated.textToTextModelPath = nil
-            }
-        } else if capability == .imageToText {
+        if capability == .imageToText {
             if previous.imageToTextModelPath.map({
                 URL(fileURLWithPath: $0).standardizedFileURL == deletedDirectoryURL
             }) == true {
                 updated.imageToTextModelPath = nil
+            }
+        } else if capability == .imageColorization {
+            if previous.imageColorizationModelPath.map({
+                URL(fileURLWithPath: $0).standardizedFileURL == deletedDirectoryURL
+            }) == true {
+                updated.imageColorizationModelPath = nil
             }
         } else if previous.superResolutionModelPath.map({
             URL(fileURLWithPath: $0).standardizedFileURL == deletedDirectoryURL
@@ -636,13 +662,13 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
         preferences.replace(with: updated)
         let current = preferences.settings
-        if previous.textToTextModelPath != current.textToTextModelPath
-            || previous.imageToTextModelPath != current.imageToTextModelPath
+        if previous.imageToTextModelPath != current.imageToTextModelPath
+            || previous.imageColorizationModelPath != current.imageColorizationModelPath
             || previous.superResolutionModelPath != current.superResolutionModelPath {
             store.applyPreferredModels(
-                textToTextPath: current.textToTextModelPath,
                 imageToTextPath: current.imageToTextModelPath,
                 imageToImagePath: current.imageToImageModelPath,
+                imageColorizationPath: current.imageColorizationModelPath,
                 superResolutionPath: current.superResolutionModelPath
             )
         }
@@ -655,15 +681,15 @@ final class HybridBridgeController: NSObject, ObservableObject {
               AppPreferences.supportedColorSchemes.contains(colorScheme),
               let imageCompositingRaw = params["imageCompositingBackend"] as? String,
               let imageCompositingBackend = ImageCompositingBackend(rawValue: imageCompositingRaw),
-              let textToTextModelVariant = params["textToTextModelVariant"] as? String,
-              DownloadableModelCatalog.model(
-                id: textToTextModelVariant,
-                capability: .textToText
-              ) != nil,
               let imageToTextModelVariant = params["imageToTextModelVariant"] as? String,
               DownloadableModelCatalog.model(
                 id: imageToTextModelVariant,
                 capability: .imageToText
+              ) != nil,
+              let imageColorizationModelVariant = params["imageColorizationModelVariant"] as? String,
+              DownloadableModelCatalog.model(
+                id: imageColorizationModelVariant,
+                capability: .imageColorization
               ) != nil,
               let modelThinkingEnabled = params["modelThinkingEnabled"] as? Bool,
               let superResolutionModelVariant = params["superResolutionModelVariant"] as? String,
@@ -696,11 +722,6 @@ final class HybridBridgeController: NSObject, ObservableObject {
         updated.dataDirectoryPath = params["dataDirectoryPath"] as? String
         updated.defaultOutputDirectoryPath = params["defaultOutputDirectoryPath"] as? String
         updated.imageCompositingBackend = imageCompositingBackend
-        updated.textToTextModelPath = params["textToTextModelPath"] as? String
-        updated.textToTextModelDownloadDirectoryPath = params[
-            "textToTextModelDownloadDirectoryPath"
-        ] as? String
-        updated.textToTextModelVariant = textToTextModelVariant
         updated.imageToTextModelPath = params["imageToTextModelPath"] as? String
         updated.imageToTextModelDownloadDirectoryPath = params[
             "imageToTextModelDownloadDirectoryPath"
@@ -708,6 +729,11 @@ final class HybridBridgeController: NSObject, ObservableObject {
         updated.imageToTextModelVariant = imageToTextModelVariant
         updated.modelThinkingEnabled = modelThinkingEnabled
         updated.imageToImageModelPath = params["imageToImageModelPath"] as? String
+        updated.imageColorizationModelPath = params["imageColorizationModelPath"] as? String
+        updated.imageColorizationModelDownloadDirectoryPath = params[
+            "imageColorizationModelDownloadDirectoryPath"
+        ] as? String
+        updated.imageColorizationModelVariant = imageColorizationModelVariant
         updated.automaticSuperResolutionEnabled = automaticSuperResolutionEnabled
         updated.superResolutionModelPath = params["superResolutionModelPath"] as? String
         updated.superResolutionModelDownloadDirectoryPath = params[
@@ -723,14 +749,14 @@ final class HybridBridgeController: NSObject, ObservableObject {
         if previous.resolvedImageCompositingBackend != current.resolvedImageCompositingBackend {
             store.setImageCompositingBackend(current.resolvedImageCompositingBackend)
         }
-        if previous.textToTextModelPath != current.textToTextModelPath
-            || previous.imageToTextModelPath != current.imageToTextModelPath
+        if previous.imageToTextModelPath != current.imageToTextModelPath
             || previous.imageToImageModelPath != current.imageToImageModelPath
+            || previous.imageColorizationModelPath != current.imageColorizationModelPath
             || previous.superResolutionModelPath != current.superResolutionModelPath {
             store.applyPreferredModels(
-                textToTextPath: current.textToTextModelPath,
                 imageToTextPath: current.imageToTextModelPath,
                 imageToImagePath: current.imageToImageModelPath,
+                imageColorizationPath: current.imageColorizationModelPath,
                 superResolutionPath: current.superResolutionModelPath
             )
         }
@@ -770,10 +796,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
            let method = TextLocalizationMethod(rawValue: raw) {
             value.textLocalizationMethod = method
         }
-        if let raw = params["translationModelMethod"] as? String,
-           let method = TranslationModelMethod(rawValue: raw) {
-            value.translationModelMethod = method
-        }
+        value.translationModelMethod = .imageToText
         if let variantID = params["imageToTextModelVariant"] as? String,
            DownloadableModelCatalog.model(id: variantID, capability: .imageToText) != nil {
             var globalSettings = preferences.settings
@@ -782,9 +805,9 @@ final class HybridBridgeController: NSObject, ObservableObject {
             let currentImageToTextModelPath = preferences.settings.imageToTextModelPath
             if previousImageToTextModelPath != currentImageToTextModelPath {
                 store.applyPreferredModels(
-                    textToTextPath: preferences.settings.textToTextModelPath,
                     imageToTextPath: currentImageToTextModelPath,
                     imageToImagePath: preferences.settings.imageToImageModelPath,
+                    imageColorizationPath: preferences.settings.imageColorizationModelPath,
                     superResolutionPath: preferences.settings.superResolutionModelPath
                 )
             }
@@ -840,6 +863,14 @@ final class HybridBridgeController: NSObject, ObservableObject {
                 )
             }
             value.translationQuality = quality
+        }
+        if let raw = params["colorizationColorRange"] as? String,
+           let colorRange = ColorizationColorRange(rawValue: raw) {
+            value.colorizationColorRange = colorRange
+        }
+        if let raw = params["colorizationMode"] as? String,
+           let mode = ColorizationMode(rawValue: raw) {
+            value.colorizationMode = mode
         }
         store.setOptions(value)
     }
@@ -983,7 +1014,35 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private func appendMaskStroke(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let regionID = uuid(params["regionID"]),
-              let rawMode = params["mode"] as? String,
+              let stroke = try? maskStroke(from: params) else {
+            throw BridgeError.invalidParameters
+        }
+        store.appendMaskStroke(
+            pageID: pageID,
+            regionID: regionID,
+            mode: stroke.mode,
+            points: stroke.points,
+            diameter: stroke.diameter
+        )
+    }
+
+    private func appendColorizationMaskStroke(_ params: [String: Any]) throws {
+        guard let pageID = uuid(params["pageID"]),
+              let stroke = try? maskStroke(from: params) else {
+            throw BridgeError.invalidParameters
+        }
+        store.appendColorizationMaskStroke(
+            pageID: pageID,
+            mode: stroke.mode,
+            points: stroke.points,
+            diameter: stroke.diameter
+        )
+    }
+
+    private func maskStroke(
+        from params: [String: Any]
+    ) throws -> (mode: MaskStrokeMode, points: [NormalizedPoint], diameter: Double) {
+        guard let rawMode = params["mode"] as? String,
               let mode = MaskStrokeMode(rawValue: rawMode),
               let diameter = double(params["diameter"]),
               let rawPoints = params["points"] as? [[String: Any]] else {
@@ -997,13 +1056,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         guard points.count == rawPoints.count, !points.isEmpty, diameter.isFinite else {
             throw BridgeError.invalidParameters
         }
-        store.appendMaskStroke(
-            pageID: pageID,
-            regionID: regionID,
-            mode: mode,
-            points: points,
-            diameter: diameter
-        )
+        return (mode, points, diameter)
     }
 
     private func undoMaskStroke(_ params: [String: Any]) throws {
@@ -1032,9 +1085,13 @@ final class HybridBridgeController: NSObject, ObservableObject {
 
     private func revealOutput(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
-              let outputURL = store.pages.first(where: { $0.id == pageID })?.outputURL else {
+              let page = store.pages.first(where: { $0.id == pageID }) else {
             throw BridgeError.invalidParameters
         }
+        let outputURL = (params["preferColorization"] as? Bool == true
+            ? page.colorizationOutputURL
+            : nil) ?? page.outputURL
+        guard let outputURL else { throw BridgeError.invalidParameters }
         NSWorkspace.shared.activateFileViewerSelecting([outputURL])
     }
 

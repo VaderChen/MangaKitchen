@@ -58,10 +58,18 @@ export const workflow = Object.freeze({
     invoke("createRegion", { pageID, bounds, ...changes }),
   appendMaskStroke: (pageID, regionID, mode, diameter, points) =>
     invoke("appendMaskStroke", { pageID, regionID, mode, diameter, points }),
+  appendColorizationMaskStroke: (pageID, mode, diameter, points) =>
+    invoke("appendColorizationMaskStroke", { pageID, mode, diameter, points }),
   undoMaskStroke: (pageID, regionID) =>
     invoke("undoMaskStroke", { pageID, regionID }),
   redoMaskStroke: (pageID, regionID) =>
     invoke("redoMaskStroke", { pageID, regionID }),
+  undoColorizationMaskStroke: (pageID) =>
+    invoke("undoColorizationMaskStroke", { pageID }),
+  redoColorizationMaskStroke: (pageID) =>
+    invoke("redoColorizationMaskStroke", { pageID }),
+  resetColorizationPages: (pageIDs) =>
+    invoke("resetColorizationPages", { pageIDs }),
   undoRegionEdit: (pageID) => invoke("undoRegionEdit", { pageID }),
   redoRegionEdit: (pageID) => invoke("redoRegionEdit", { pageID }),
   removeRegion: (pageID, regionID) =>

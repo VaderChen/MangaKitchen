@@ -68,12 +68,18 @@ struct MangaKitchenMCPServer {
                     return try success("工作區已開啟，共 \(state.pages.count) 頁。", state)
 
                 case "mangakitchen.workspace.pages":
+                    let workflow = try optionalEnum(
+                        arguments,
+                        "workflow",
+                        as: MCPWorkflowKind.self
+                    ) ?? .translation
                     let list = try await service.pageTasks(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pendingOnly: arguments["pending_only"]?.boolValue ?? true
+                        pendingOnly: arguments["pending_only"]?.boolValue ?? true,
+                        workflow: workflow
                     )
                     return try success(
-                        "共 \(list.totalPageCount) 頁，其中 \(list.pendingPageCount) 頁仍有待辦。",
+                        "\(workflow.rawValue) 工作流共 \(list.totalPageCount) 頁，其中 \(list.pendingPageCount) 頁仍有待辦。",
                         list
                     )
 
@@ -199,6 +205,73 @@ struct MangaKitchenMCPServer {
                         progress: progressReporter(request: request, server: server)
                     )
                     return try success("步驟三預覽已儲存到輸出位置。", result)
+
+                case "mangakitchen.page.colorize":
+                    let result = try await service.colorizePage(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
+                        progress: progressReporter(request: request, server: server)
+                    )
+                    return try success("上色步驟三預覽已完成。", result)
+
+                case "mangakitchen.page.prepare_colorization_task":
+                    let payload = try await service.prepareAgentColorizationTask(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        progress: progressReporter(request: request, server: server)
+                    )
+                    return try .init(
+                        content: [
+                            .text(
+                                text: try json(payload.bundle),
+                                annotations: nil,
+                                _meta: nil
+                            ),
+                            .image(
+                                data: payload.inputImageData.base64EncodedString(),
+                                mimeType: payload.inputImageMIMEType,
+                                annotations: nil,
+                                _meta: nil
+                            ),
+                            .image(
+                                data: payload.maskImageData.base64EncodedString(),
+                                mimeType: "image/png",
+                                annotations: nil,
+                                _meta: nil
+                            )
+                        ],
+                        structuredContent: payload.bundle,
+                        isError: false
+                    )
+
+                case "mangakitchen.page.submit_colorization_result":
+                    let result = try await service.submitAgentColorizationResult(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
+                        resultImageBase64: requiredString(arguments, "result_image_base64"),
+                        resultMIMEType: requiredString(arguments, "result_mime_type"),
+                        progress: progressReporter(request: request, server: server)
+                    )
+                    return try success("Agent 上色結果已寫回步驟三預覽。", result)
+
+                case "mangakitchen.page.render_colorization":
+                    let result = try await service.renderColorizationPage(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments),
+                        progress: progressReporter(request: request, server: server)
+                    )
+                    return try success("上色步驟四輸出已儲存。", result)
+
+                case "mangakitchen.page.reset_colorization":
+                    let result = try await service.resetColorizationPage(
+                        workspaceID: requiredUUID(arguments, "workspace_id"),
+                        pageID: requiredUUID(arguments, "page_id"),
+                        expectedRevision: try requiredRevision(arguments)
+                    )
+                    return try success("本頁上色遮罩修正、預覽、輸出與進度已清除。", result)
 
                 case "mangakitchen.region.batch_update":
                     let result = try await service.batchUpdateRegions(
@@ -361,6 +434,12 @@ struct MangaKitchenMCPServer {
                     mimeType: "application/json"
                 ),
                 Resource(
+                    name: "目前專案上色待處理頁面",
+                    uri: "mangakitchen://workspace/current/colorization-pages",
+                    description: "每頁獨立上色進度與 next_action 狀態摘要",
+                    mimeType: "application/json"
+                ),
+                Resource(
                     name: "目前專案專有名詞表",
                     uri: "mangakitchen://workspace/current/glossary",
                     description: "目前工作區的一詞對多語言專有名詞對照",
@@ -412,6 +491,22 @@ struct MangaKitchenMCPServer {
                         mimeType: "image/png"
                     ))
                 }
+                if page.colorizationPreviewURL != nil {
+                    resources.append(Resource(
+                        name: "\(page.title) 上色預覽",
+                        uri: base + "/colorization-preview",
+                        description: "DDColor 完成但尚未輸出的上色預覽",
+                        mimeType: "image/png"
+                    ))
+                }
+                if page.colorizationOutputURL != nil {
+                    resources.append(Resource(
+                        name: "\(page.title) 上色輸出",
+                        uri: base + "/colorization-output",
+                        description: "已儲存至輸出目錄的上色圖片",
+                        mimeType: "image/png"
+                    ))
+                }
             }
             return .init(resources: resources)
         }
@@ -451,6 +546,18 @@ struct MangaKitchenMCPServer {
                     uriTemplate: "mangakitchen://page/{page_id}/output",
                     name: "MangaKitchen 輸出",
                     description: "依 page_id 讀取合成結果",
+                    mimeType: "image/png"
+                ),
+                .init(
+                    uriTemplate: "mangakitchen://page/{page_id}/colorization-preview",
+                    name: "MangaKitchen 上色預覽",
+                    description: "依 page_id 讀取 DDColor 上色預覽",
+                    mimeType: "image/png"
+                ),
+                .init(
+                    uriTemplate: "mangakitchen://page/{page_id}/colorization-output",
+                    name: "MangaKitchen 上色輸出",
+                    description: "依 page_id 讀取已儲存的上色輸出",
                     mimeType: "image/png"
                 )
             ])
@@ -880,7 +987,7 @@ struct MangaKitchenMCPServer {
         let pageID = property("string", "頁面 UUID")
         let expectedRevision = property(
             "string",
-            "最近一次 page.inspect 或 page.prepare_agent_task 回傳的 opaque revision"
+            "最近一次 page.inspect、page.prepare_agent_task 或 page.prepare_colorization_task 回傳的 opaque revision"
         )
         let pageIDs = Value.object([
             "type": "array",
@@ -1001,6 +1108,7 @@ struct MangaKitchenMCPServer {
         ])
         let mutating = Tool.Annotations(readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false)
         let idempotent = Tool.Annotations(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
+        let destructive = Tool.Annotations(readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false)
         let readOnly = Tool.Annotations(readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false)
 
         return [
@@ -1038,7 +1146,12 @@ struct MangaKitchenMCPServer {
                 description: "唯讀頁面狀態摘要。next_action 與 nextActionInstruction 只描述缺少的產物，不是要求 Agent 自行迴圈、清理或重做資料；必須依步驟順序補齊產物。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
-                    "pending_only": property("boolean", "預設 true，只回傳 next_action 不是 done 的頁面")
+                    "pending_only": property("boolean", "預設 true，只回傳 next_action 不是 done 的頁面"),
+                    "workflow": .object([
+                        "type": "string",
+                        "enum": .array(["translation", "colorization"].map(Value.string)),
+                        "description": "要查詢的工作流；預設 translation"
+                    ])
                 ], required: ["workspace_id"]),
                 annotations: readOnly,
                 outputSchema: genericOutputSchema
@@ -1094,7 +1207,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.model.load",
                 title: "載入本機模型",
-                description: "從含 mangakitchen-model.json 的本機目錄載入模型。MCP 的翻譯與排版由 Agent 提供；模型載入不會自動執行任何工作流步驟。",
+                description: "從含 mangakitchen-model.json 的本機目錄載入模型。MCP 翻譯由多模態 Agent 提供；本機 imageColorization 模型供 page.colorize 使用。模型載入不會自動執行工作流步驟。",
                 inputSchema: objectSchema([
                     "model_directory": property("string", "模型目錄的絕對路徑")
                 ], required: ["model_directory"]),
@@ -1129,7 +1242,7 @@ struct MangaKitchenMCPServer {
             Tool(
                 name: "mangakitchen.page.prepare_agent_task",
                 title: "準備單頁 Agent 工作包",
-                description: "步驟三入口。只封裝 App 已完成的步驟二區域、像素遮罩與去字背景，再一次回傳內嵌 regionData JSON 與原圖 image content；缺少任一前置產物時會停止並要求先回 App 完成步驟二。其中既有 sourceText／translatedText 是需要對照原圖校稿的草稿，既有排版欄位也可由 Agent 修正。Agent 不得搜尋 .str 檔案、讀取額外 page resource、自行偵測或重建區域。",
+                description: "多模態步驟三入口。只封裝 App 已完成的步驟二區域、像素遮罩與去字背景，再一次回傳內嵌 regionData JSON 與原圖 image content；缺少任一前置產物時會停止並要求先回 App 完成步驟二。其中既有 sourceText／translatedText 是需要對照原圖校稿的草稿，既有排版欄位也可由 Agent 修正。Agent 必須讀取附帶原圖，不得降級成純文生文，也不得搜尋 .str 檔案、讀取額外 page resource、自行偵測或重建區域。",
                 inputSchema: objectSchema([
                     "workspace_id": workspaceID,
                     "page_id": property("string", "要處理的單頁 UUID")
@@ -1165,6 +1278,83 @@ struct MangaKitchenMCPServer {
                     "expected_revision": expectedRevision
                 ], required: ["workspace_id", "page_id", "expected_revision"]),
                 annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.colorize",
+                title: "建立上色預覽",
+                description: "上色步驟三：使用已載入的 imageColorization 模型立即建立預覽。輸入優先採用已存在的翻譯輸出，否則回退來源圖片；不會隱式執行翻譯或輸出。DDColor 目前不支援色彩範圍與上色模式調參。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision
+                ], required: ["workspace_id", "page_id", "expected_revision"]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.prepare_colorization_task",
+                title: "準備 Agent 上色工作包",
+                description: "上色步驟三的 Agent 入口：一次回傳工作包 JSON、實際上色輸入圖片與反對話框遮罩圖片。輸入優先使用既有翻譯輸出，否則回退來源圖片。此工具不執行 DDColor，也不修改頁面 revision。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID
+                ], required: ["workspace_id", "page_id"]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.submit_colorization_result",
+                title: "回寫 Agent 上色結果",
+                description: "一次回寫 Agent 產生的完整頁面圖片並建立上色步驟三預覽。結果必須符合工作包像素尺寸，接受 PNG、JPEG、HEIC、TIFF 或 WebP Base64；App 會驗證並正規化為 PNG。此工具不寫入最終輸出。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision,
+                    "result_image_base64": property("string", "完整上色結果圖片的 Base64；不得使用路徑或 URL"),
+                    "result_mime_type": .object([
+                        "type": "string",
+                        "enum": .array([
+                            "image/png",
+                            "image/jpeg",
+                            "image/heic",
+                            "image/heif",
+                            "image/tiff",
+                            "image/webp"
+                        ].map(Value.string))
+                    ])
+                ], required: [
+                    "workspace_id",
+                    "page_id",
+                    "expected_revision",
+                    "result_image_base64",
+                    "result_mime_type"
+                ]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.render_colorization",
+                title: "儲存上色輸出",
+                description: "上色步驟四：只把既有上色預覽儲存到輸出目錄，不重新執行 DDColor、翻譯或遮罩計算。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision
+                ], required: ["workspace_id", "page_id", "expected_revision"]),
+                annotations: idempotent,
+                outputSchema: genericOutputSchema
+            ),
+            Tool(
+                name: "mangakitchen.page.reset_colorization",
+                title: "清除本頁上色流程",
+                description: "清除本頁上色遮罩畫筆、預覽、輸出與獨立進度；保留來源圖、翻譯產物及對話區域。",
+                inputSchema: objectSchema([
+                    "workspace_id": workspaceID,
+                    "page_id": pageID,
+                    "expected_revision": expectedRevision
+                ], required: ["workspace_id", "page_id", "expected_revision"]),
+                annotations: destructive,
                 outputSchema: genericOutputSchema
             ),
             Tool(

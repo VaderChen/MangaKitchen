@@ -1,7 +1,7 @@
 import Foundation
 import MangaKitchenCore
 
-public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerating, ImageToImageGenerating, ImageSuperResolving {
+public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerating, ImageToImageGenerating, ImageColorizing, ImageSuperResolving {
     private struct ModelLoadIdentity: Equatable {
         var id: String
         var capability: ModelCapability
@@ -14,6 +14,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     private var textToTextRuntime: (any TextGenerating)?
     private var imageToTextRuntime: (any ImageToTextGenerating)?
     private var imageToImageRuntime: (any ImageToImageGenerating)?
+    private var imageColorizationRuntime: (any ImageColorizing)?
     private var superResolutionRuntime: (any ImageSuperResolving)?
     private var modelInfos: [ModelCapability: LoadedModelInfo] = [:]
     /// `prepare()` 會 suspend 並讓 actor 重入；記錄正在載入的身分，避免原文
@@ -123,6 +124,14 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                 } else {
                     imageToImageRuntime = runtime
                 }
+            case .imageColorization:
+                let runtime = try CoreMLDDColorRuntime(
+                    directoryURL: directoryURL,
+                    manifest: manifest,
+                    metal: metal
+                )
+                info = runtime.info
+                imageColorizationRuntime = runtime
             case .superResolution:
                 let superResolution = try CoreMLSuperResolutionRuntime(
                     directoryURL: directoryURL,
@@ -166,6 +175,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                 superResolutionRuntime = runtime
             case .imageToImage:
                 throw ModelRuntimeError.unsupportedBackendCapability(.mlxSwift, manifest.capability)
+            case .imageColorization:
+                throw ModelRuntimeError.unsupportedBackendCapability(.mlxSwift, manifest.capability)
             }
 
         case .externalRuntime:
@@ -197,6 +208,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
         case .textToText: textToTextRuntime = nil
         case .imageToText: imageToTextRuntime = nil
         case .imageToImage: imageToImageRuntime = nil
+        case .imageColorization: imageColorizationRuntime = nil
         case .superResolution: superResolutionRuntime = nil
         }
         modelInfos[capability] = nil
@@ -222,6 +234,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
         case .textToText: textToTextRuntime != nil
         case .imageToText: imageToTextRuntime != nil
         case .imageToImage: imageToImageRuntime != nil
+        case .imageColorization: imageColorizationRuntime != nil
         case .superResolution: superResolutionRuntime != nil
         }
     }
@@ -299,6 +312,23 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
         }
         try await runtime.superResolve(
             inputURL: inputURL,
+            outputURL: outputURL,
+            progress: progress
+        )
+    }
+
+    public func colorize(
+        inputURL: URL,
+        maskURL: URL?,
+        outputURL: URL,
+        progress: @escaping InferenceProgress
+    ) async throws {
+        guard let runtime = imageColorizationRuntime else {
+            throw ModelRuntimeError.capabilityNotLoaded(.imageColorization)
+        }
+        try await runtime.colorize(
+            inputURL: inputURL,
+            maskURL: maskURL,
             outputURL: outputURL,
             progress: progress
         )

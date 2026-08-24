@@ -199,67 +199,112 @@ struct HuggingFaceModelDownloader: Sendable {
             try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
             return
         }
-        guard model.format == .coreMLZip else { return }
+        guard model.format == .coreMLZip || model.format == .coreMLPackage,
+              let contract = model.coreMLContract else { return }
         let fileManager = FileManager.default
-        let zipFiles = try fileManager.contentsOfDirectory(
-            at: directoryURL,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ).filter { $0.pathExtension.lowercased() == "zip" }
-        guard let archiveURL = zipFiles.first else {
-            throw ModelDownloadError.incompleteRepository(model.repositoryID)
-        }
-        let extractionURL = directoryURL.appendingPathComponent(".coreml-extracted", isDirectory: true)
-        if fileManager.fileExists(atPath: extractionURL.path) {
-            try fileManager.removeItem(at: extractionURL)
-        }
-        try fileManager.createDirectory(at: extractionURL, withIntermediateDirectories: true)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        process.arguments = ["-x", "-k", archiveURL.path, extractionURL.path]
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let message = String(
-                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
-                encoding: .utf8
-            ) ?? "無法解壓 Core ML 模型。"
-            throw ModelDownloadError.archiveExtractionFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
+        var archiveURL: URL?
+        var extractionURL: URL?
+        let searchRootURL: URL
+        if model.format == .coreMLZip {
+            let zipFiles = try fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ).filter { $0.pathExtension.lowercased() == "zip" }
+            guard let selectedArchiveURL = zipFiles.first else {
+                throw ModelDownloadError.incompleteRepository(model.repositoryID)
+            }
+            let selectedExtractionURL = directoryURL
+                .appendingPathComponent(".coreml-extracted", isDirectory: true)
+            if fileManager.fileExists(atPath: selectedExtractionURL.path) {
+                try fileManager.removeItem(at: selectedExtractionURL)
+            }
+            try fileManager.createDirectory(
+                at: selectedExtractionURL,
+                withIntermediateDirectories: true
+            )
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.arguments = ["-x", "-k", selectedArchiveURL.path, selectedExtractionURL.path]
+            let errorPipe = Pipe()
+            process.standardError = errorPipe
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                let message = String(
+                    data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8
+                ) ?? "無法解壓 Core ML 模型。"
+                throw ModelDownloadError.archiveExtractionFailed(
+                    message.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+            archiveURL = selectedArchiveURL
+            extractionURL = selectedExtractionURL
+            searchRootURL = selectedExtractionURL
+        } else {
+            searchRootURL = directoryURL
         }
 
         let modelFileURL = fileManager.enumerator(
-            at: extractionURL,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            at: searchRootURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
         )?.compactMap { $0 as? URL }.first {
-            $0.lastPathComponent == "realesrganAnime512.mlmodel"
+            $0.lastPathComponent == contract.modelFileName
         }
         guard let modelFileURL else {
             throw ModelDownloadError.incompleteRepository(model.repositoryID)
         }
-        let destinationURL = directoryURL.appendingPathComponent(modelFileURL.lastPathComponent)
-        if fileManager.fileExists(atPath: destinationURL.path) {
-            try fileManager.removeItem(at: destinationURL)
+        let destinationURL: URL
+        if model.format == .coreMLZip {
+            destinationURL = directoryURL.appendingPathComponent(modelFileURL.lastPathComponent)
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                try fileManager.removeItem(at: destinationURL)
+            }
+            try fileManager.copyItem(at: modelFileURL, to: destinationURL)
+        } else {
+            destinationURL = modelFileURL
         }
-        try fileManager.copyItem(at: modelFileURL, to: destinationURL)
-        let manifest = ModelManifest(
-            id: model.id,
-            displayName: model.displayName,
-            capability: .superResolution,
-            backend: .coreML,
-            modelFile: destinationURL.lastPathComponent,
-            inputs: ModelManifest.Inputs(image: "input"),
-            outputs: ModelManifest.Outputs(image: "activation_out"),
-            superResolutionScale: model.outputScale
-        )
+        let modelRelativePath = destinationURL.path == directoryURL.path
+            ? destinationURL.lastPathComponent
+            : String(destinationURL.path.dropFirst(directoryURL.path.count + 1))
+        let manifest: ModelManifest
+        switch model.capability {
+        case .superResolution:
+            manifest = ModelManifest(
+                id: model.id,
+                displayName: model.displayName,
+                capability: .superResolution,
+                backend: .coreML,
+                modelFile: modelRelativePath,
+                inputs: ModelManifest.Inputs(image: contract.inputName),
+                outputs: ModelManifest.Outputs(image: contract.outputName),
+                superResolutionScale: model.outputScale
+            )
+        case .imageColorization:
+            manifest = ModelManifest(
+                id: model.id,
+                displayName: model.displayName,
+                capability: .imageColorization,
+                backend: .coreML,
+                modelFile: modelRelativePath,
+                inputs: ModelManifest.Inputs(image: contract.inputName),
+                outputs: ModelManifest.Outputs(chroma: contract.outputName),
+                colorization: ModelManifest.Colorization(
+                    kind: .ddcolor,
+                    inputSize: model.colorizationInputSize ?? 512
+                )
+            )
+        case .textToText, .imageToText, .imageToImage:
+            throw ModelDownloadError.incompleteRepository(model.repositoryID)
+        }
         let manifestURL = directoryURL.appendingPathComponent("mangakitchen-model.json")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
-        try? fileManager.removeItem(at: archiveURL)
-        try? fileManager.removeItem(at: extractionURL)
+        if let archiveURL { try? fileManager.removeItem(at: archiveURL) }
+        if let extractionURL { try? fileManager.removeItem(at: extractionURL) }
     }
 
     private func sourceURL(repositoryID: String, filename: String) -> URL {

@@ -12,14 +12,14 @@ struct AppPreferences: Codable, Equatable, Sendable {
     var dataDirectoryPath: String?
     var defaultOutputDirectoryPath: String?
     var imageCompositingBackend: ImageCompositingBackend? = .cpu
-    var textToTextModelPath: String?
-    var textToTextModelDownloadDirectoryPath: String?
-    var textToTextModelVariant: String?
     var imageToTextModelPath: String?
     var imageToTextModelDownloadDirectoryPath: String?
     var imageToTextModelVariant: String?
     var modelThinkingEnabled = false
     var imageToImageModelPath: String?
+    var imageColorizationModelPath: String?
+    var imageColorizationModelDownloadDirectoryPath: String?
+    var imageColorizationModelVariant: String?
     var automaticSuperResolutionEnabled = false
     var superResolutionModelPath: String?
     var superResolutionModelDownloadDirectoryPath: String?
@@ -35,14 +35,14 @@ struct AppPreferences: Codable, Equatable, Sendable {
         case dataDirectoryPath
         case defaultOutputDirectoryPath
         case imageCompositingBackend
-        case textToTextModelPath
-        case textToTextModelDownloadDirectoryPath
-        case textToTextModelVariant
         case imageToTextModelPath
         case imageToTextModelDownloadDirectoryPath
         case imageToTextModelVariant
         case modelThinkingEnabled
         case imageToImageModelPath
+        case imageColorizationModelPath
+        case imageColorizationModelDownloadDirectoryPath
+        case imageColorizationModelVariant
         case automaticSuperResolutionEnabled
         case superResolutionModelPath
         case superResolutionModelDownloadDirectoryPath
@@ -68,18 +68,6 @@ struct AppPreferences: Codable, Equatable, Sendable {
             ImageCompositingBackend.self,
             forKey: .imageCompositingBackend
         ) ?? .cpu
-        textToTextModelPath = try values.decodeIfPresent(
-            String.self,
-            forKey: .textToTextModelPath
-        )
-        textToTextModelDownloadDirectoryPath = try values.decodeIfPresent(
-            String.self,
-            forKey: .textToTextModelDownloadDirectoryPath
-        )
-        textToTextModelVariant = try values.decodeIfPresent(
-            String.self,
-            forKey: .textToTextModelVariant
-        )
         imageToTextModelPath = try values.decodeIfPresent(String.self, forKey: .imageToTextModelPath)
         imageToTextModelDownloadDirectoryPath = try values.decodeIfPresent(
             String.self,
@@ -91,6 +79,18 @@ struct AppPreferences: Codable, Equatable, Sendable {
             forKey: .modelThinkingEnabled
         ) ?? false
         imageToImageModelPath = try values.decodeIfPresent(String.self, forKey: .imageToImageModelPath)
+        imageColorizationModelPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .imageColorizationModelPath
+        )
+        imageColorizationModelDownloadDirectoryPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .imageColorizationModelDownloadDirectoryPath
+        )
+        imageColorizationModelVariant = try values.decodeIfPresent(
+            String.self,
+            forKey: .imageColorizationModelVariant
+        )
         automaticSuperResolutionEnabled = try values.decodeIfPresent(
             Bool.self,
             forKey: .automaticSuperResolutionEnabled
@@ -121,52 +121,6 @@ struct AppPreferences: Codable, Equatable, Sendable {
         dataDirectoryPath = Self.normalizedOptionalPath(dataDirectoryPath)
         defaultOutputDirectoryPath = Self.normalizedOptionalPath(defaultOutputDirectoryPath)
         imageCompositingBackend = imageCompositingBackend ?? .cpu
-        textToTextModelPath = Self.normalizedOptionalPath(textToTextModelPath)
-        textToTextModelDownloadDirectoryPath = Self.normalizedOptionalPath(
-            textToTextModelDownloadDirectoryPath
-        )
-        let selectedTextToTextModel = textToTextModelVariant.flatMap {
-            DownloadableModelCatalog.model(id: $0, capability: .textToText)
-        } ?? DownloadableModelCatalog.defaultTextToTextModel
-        textToTextModelVariant = selectedTextToTextModel.id
-        if textToTextModelDownloadDirectoryPath == nil,
-           let textToTextModelPath {
-            let modelURL = URL(fileURLWithPath: textToTextModelPath).standardizedFileURL
-            if let matchedModel = DownloadableModelCatalog.model(
-                matching: modelURL,
-                capability: .textToText
-            ) {
-                textToTextModelDownloadDirectoryPath = modelURL.deletingLastPathComponent().path
-                textToTextModelVariant = matchedModel.id
-            }
-        }
-        if let textToTextModelDownloadDirectoryPath,
-           let model = DownloadableModelCatalog.model(
-            id: textToTextModelVariant ?? "",
-            capability: .textToText
-           ) {
-            var storageURL = URL(fileURLWithPath: textToTextModelDownloadDirectoryPath)
-                .standardizedFileURL
-            if let directlySelectedModel = DownloadableModelCatalog.model(
-                matching: storageURL,
-                capability: .textToText
-            ), DownloadableModelCatalog.isCompleteModelDirectory(
-                storageURL,
-                model: directlySelectedModel
-            ) {
-                storageURL.deleteLastPathComponent()
-                self.textToTextModelDownloadDirectoryPath = storageURL.path
-                textToTextModelVariant = directlySelectedModel.id
-            }
-            let resolvedModel = DownloadableModelCatalog.model(
-                id: textToTextModelVariant ?? model.id,
-                capability: .textToText
-            ) ?? model
-            textToTextModelPath = DownloadableModelCatalog.installedModelDirectory(
-                storageDirectoryURL: storageURL,
-                model: resolvedModel
-            )?.path
-        }
         imageToTextModelPath = Self.normalizedOptionalPath(imageToTextModelPath)
         imageToTextModelDownloadDirectoryPath = Self.normalizedOptionalPath(
             imageToTextModelDownloadDirectoryPath
@@ -211,6 +165,22 @@ struct AppPreferences: Codable, Equatable, Sendable {
             )?.path
         }
         imageToImageModelPath = Self.normalizedOptionalPath(imageToImageModelPath)
+        imageColorizationModelPath = Self.normalizedOptionalPath(imageColorizationModelPath)
+        imageColorizationModelDownloadDirectoryPath = Self.normalizedOptionalPath(
+            imageColorizationModelDownloadDirectoryPath
+        )
+        let selectedImageColorizationModel = imageColorizationModelVariant.flatMap {
+            DownloadableModelCatalog.model(id: $0, capability: .imageColorization)
+        } ?? DownloadableModelCatalog.defaultImageColorizationModel
+        imageColorizationModelVariant = selectedImageColorizationModel.id
+        if let imageColorizationModelDownloadDirectoryPath {
+            let storageURL = URL(fileURLWithPath: imageColorizationModelDownloadDirectoryPath)
+                .standardizedFileURL
+            imageColorizationModelPath = DownloadableModelCatalog.installedModelDirectory(
+                storageDirectoryURL: storageURL,
+                model: selectedImageColorizationModel
+            )?.path
+        }
         superResolutionModelPath = Self.normalizedOptionalPath(superResolutionModelPath)
         superResolutionModelDownloadDirectoryPath = Self.normalizedOptionalPath(
             superResolutionModelDownloadDirectoryPath
@@ -244,18 +214,18 @@ struct AppPreferences: Codable, Equatable, Sendable {
         )?.id ?? DownloadableModelCatalog.defaultImageToTextModel.id
     }
 
-    var resolvedTextToTextModelVariant: String {
-        DownloadableModelCatalog.model(
-            id: textToTextModelVariant ?? "",
-            capability: .textToText
-        )?.id ?? DownloadableModelCatalog.defaultTextToTextModel.id
-    }
-
     var resolvedSuperResolutionModelVariant: String {
         DownloadableModelCatalog.model(
             id: superResolutionModelVariant ?? "",
             capability: .superResolution
         )?.id ?? DownloadableModelCatalog.defaultSuperResolutionModel.id
+    }
+
+    var resolvedImageColorizationModelVariant: String {
+        DownloadableModelCatalog.model(
+            id: imageColorizationModelVariant ?? "",
+            capability: .imageColorization
+        )?.id ?? DownloadableModelCatalog.defaultImageColorizationModel.id
     }
 
     private static func normalizedOptionalPath(_ value: String?) -> String? {

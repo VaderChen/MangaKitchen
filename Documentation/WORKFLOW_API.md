@@ -1,4 +1,4 @@
-# 漫畫廚房（MangaKitchen）四階段工作流與 API 契約
+# 漫畫廚房（MangaKitchen）翻譯／上色工作流與 API 契約
 
 ## 設計目標
 
@@ -9,7 +9,7 @@
       ↓ ComicPage[]
 2. Core ML dialogue BBOXes → glyph mask refinement ⇄ edit mask strokes
       ↓ DialogueRegion[]（未確認原文）+ dialogue-mask.png + 去字校對預覽 + page.str
-3. bundled OCR/VLM transcription → text/multimodal/Agent translate + auto layout ⇄ edit text/style
+3. bundled OCR/VLM transcription → multimodal/Agent translate + auto layout ⇄ edit text/style
       ↓ page.str + translation preview.png
 4. save output
       ↓ copy confirmed translation preview to translated page.png
@@ -17,7 +17,9 @@
 
 一鍵模式不是第五套流程。`runFullPage` 只依序呼叫步驟二、三、四；步驟一提供已掃描的頁面列表。
 
-步驟二固定使用內建氣泡分割與原圖像素精修，不需要 PP-OCR 文字偵測或 `imageToText` 模型，也不會因 OCR／VLM 偏好而改變遮罩。步驟三的原文抽取才依專案選項分流：PP-OCR 以 Medium Det 切欄後逐行辨識，VLM 則沿用整區轉錄。翻譯、可選二次校稿與語意 QA 依 `translationModelMethod` 使用文生文或多模態模型；只有 VLM 原文抽取或多模態翻譯需要 `imageToText`。
+步驟二固定使用內建氣泡分割與原圖像素精修，不需要 PP-OCR 文字偵測或 `imageToText` 模型，也不會因 OCR／VLM 偏好而改變遮罩。步驟三的原文抽取才依專案選項分流：PP-OCR 以 Medium Det 切欄後逐行辨識，VLM 則沿用整區轉錄；翻譯、可選二次校稿與語意 QA 固定使用多模態 `imageToText` 模型。舊專案的 `textToText` 設定在讀取時遷移為 `imageToText`，App 不再暴露文生文模型選項。
+
+上色是另一套四步驟流程：選頁、反對話框遮罩、DDColor 預覽、儲存輸出。上色優先使用已存在的翻譯輸出，否則回退來源圖片；`ColorizationPageState`、預覽與輸出不覆寫翻譯的 `stage`、`progress`、`translationPreviewURL` 或 `outputURL`。目前 DDColor 只使用模型預設推論，`colorizationColorRange` 與 `colorizationMode` 僅保留專案欄位，對應介面卡片目前停用，契約不宣稱它們會影響推論。
 
 ## 專案、複選與批次規則
 
@@ -32,7 +34,7 @@
 
 ### 逐區處理與進度
 
-- 步驟三的 OCR 辨識與文生文／多模態翻譯都以區域為獨立工作單位。單一區域的裁切、模型推論、回應解析或翻譯失敗時，該區保留原有 `DialogueRegion`，其他區域仍會繼續；`CancellationError` 不會被吞掉，取消工作仍會停止整體佇列。
+- 步驟三的 OCR 辨識與多模態翻譯都以區域為獨立工作單位。單一區域的裁切、模型推論、回應解析或翻譯失敗時，該區保留原有 `DialogueRegion`，其他區域仍會繼續；`CancellationError` 不會被吞掉，取消工作仍會停止整體佇列。
 - `RegionTranslating.translate` 透過 `PageRegionProgress` 回報 1-based 的 `(current, total)`；`ComicTranslationPipeline` 另外透過 `PagePipelineProgress` 回報頁面 0...1 實際進度。兩者不可互相推算，UI 應使用前者顯示文字、後者更新 progress bar。
 - App 的等待 DLG 在逐區翻譯時顯示「第 current / total 區」，進度條則使用目前頁面進度與批次已完成頁面數計算，不會因區域索引跳動而跳格。
 
@@ -69,7 +71,7 @@
 
 全域設定的 `defaultOutputDirectoryPath` 是新專案的預設輸出根目錄；尚未有專案輸出設定時，App 會在此根目錄下建立以專案名稱命名的子目錄，再把輸出寫入其中。不會覆寫既有專案的 `outputDirectoryURL`。`selectionColorHex` 保存 WebUI 畫布的選取框顏色，僅影響介面顯示，不會寫入頁面像素或 `.str`。
 
-`TranslationQualityOptions` 預設啟用整頁語境、翻譯 QA 與直譯稿保存，二次校稿預設關閉，長度策略為 `balanced`。所選文生文／多模態模型第一階段一次讀取整頁有序區域，產生直譯稿、顯示譯文、語氣與信心；若整頁回覆遺漏區域，只對缺少 UUID 執行一次有界補翻。啟用二次校稿時才以相同整頁資料統一稱謂、詞表、數字、否定、語氣與長度，UI 明確顯示「二次校稿」而不是再次顯示翻譯。QA 會檢查缺譯、詞表、數字、長度及低信心，結果保存於 `.str`，不只存在記憶體。
+`TranslationQualityOptions` 預設啟用整頁語境、翻譯 QA 與直譯稿保存，二次校稿預設關閉，長度策略為 `balanced`。所選多模態模型第一階段一次讀取整頁有序區域與圖片語境，產生直譯稿、顯示譯文、語氣與信心；若整頁回覆遺漏區域，只對缺少 UUID 執行一次有界補翻。啟用二次校稿時才以相同整頁資料統一稱謂、詞表、數字、否定、語氣與長度，UI 明確顯示「二次校稿」而不是再次顯示翻譯。QA 會檢查缺譯、詞表、數字、長度及低信心，結果保存於 `.str`，不只存在記憶體。
 
 - `NormalizedPoint` 與 `NormalizedRect` 都以原圖左上角為原點，範圍為 `0...1`。
 - 遮罩畫筆的 `diameter` 是相對於原圖短邊的比例，範圍為 `0.001...1`。
@@ -78,8 +80,8 @@
 - `mcpExtractedSourceText` 只保存 MCP Agent 回傳的原文抽取結果；本機 VLM 的直譯稿不會填入此欄位，WebUI 只有在 MCP 實際回傳內容時才顯示「MCP 抽取原文」。
 - `ocrResults` 以 OCR 模型 ID 分開保存各模型的候選 `text`、信心、文字行與正規化座標；當 `sourceText` 空白時，預設 OCR 候選會被採用為翻譯原文，但不覆寫已確認原文、`bounds`、`maskPolygons` 或人工筆劃。複合 OCR 與多模型校稿融合尚未啟用。
 - `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；`true` 代表來源文字已由 VLM、MCP Agent 或人工確認。單模型 OCR 候選被採用時不會冒用此標記。
-- **GUI 路徑**：步驟二一律先由 `MangaBubbleSegmentationCoreMLRuntime` 產生對話框 BBOX 與氣泡形狀，再固定以原圖像素收斂為遮罩；不會呼叫 Medium Det 或 VLM。步驟三才依「原文抽取方式」選擇 `OCRRegionTextRecognitionService` 逐欄 OCR 或 `VLMRegionTranscriptionService` 整區轉錄；辨識合併只採用原文與 OCR 候選，不覆寫座標與遮罩。翻譯、可選二次校稿與語意 QA 再依「文字翻譯方式」選擇 `textToText` 或 `imageToText` runtime。
-- **MCP 路徑**：App 先完成區域、像素遮罩與去字背景，再由 `prepare_agent_task` 將原圖及完整遮罩 JSON 一次交給 Agent；Agent 只依既有 `region_id` 抽取原文、翻譯與決定排版，最後以 `submit_agent_result` 一次回寫並建立步驟三預覽。只有使用者要求輸出時才以 `page.render` 儲存步驟四結果。MCP 不接受 Agent 修改區域或遮罩，也不呼叫內建 VLM 翻譯。詳見〈標準 MCP〉。
+- **GUI 路徑**：步驟二一律先由 `MangaBubbleSegmentationCoreMLRuntime` 產生對話框 BBOX 與氣泡形狀，再固定以原圖像素收斂為遮罩；不會呼叫 Medium Det 或 VLM。步驟三才依「原文抽取方式」選擇 `OCRRegionTextRecognitionService` 逐欄 OCR 或 `VLMRegionTranscriptionService` 整區轉錄；辨識合併只採用原文與 OCR 候選，不覆寫座標與遮罩。翻譯、可選二次校稿與語意 QA 固定使用 `imageToText` runtime。
+- **MCP 路徑**：App 先完成區域、像素遮罩與去字背景，再由 `prepare_agent_task` 將原圖及完整遮罩 JSON 一次交給可讀圖的多模態 Agent；Agent 只依既有 `region_id` 抽取原文、翻譯與決定排版，最後以 `submit_agent_result` 一次回寫並建立步驟三預覽。只有使用者要求輸出時才以 `page.render` 儲存步驟四結果。MCP 不接受 Agent 修改區域或遮罩，也不呼叫 App 內建 VLM 翻譯。詳見〈標準 MCP〉。
 - `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形像素遮罩；抗鋸齒遲滯與固定像素膨脹都在像素層完成，不再對逐條矩形做向量描邊，因此輸出的 `dialogue-mask.png` 維持二值邊界。
 - `maskCoverageRatio` 是系統像素精修保留的前景筆畫比例；`null` 代表尚未執行自動檢查。
 - `maskCoverageComplete == true` 表示前景覆蓋率通過且文字沒有碰到搜尋邊界；擴張搜尋遇到貼著 `bubbleBounds` 的元件時會排除該元件以免抹掉泡泡框線。若未通過，由使用者回到 App 步驟二調整，不讓 Agent 變更邊界或重建遮罩。
@@ -104,6 +106,8 @@
 | `failed` | 最近命令失敗 | 修正問題後重做該步驟 |
 
 `detectingText`、`translating`、`composing` 是執行中狀態。舊版的 `recognizing`、`masking`、`restoringBackground`、`typesetting` 僅保留工作區向後相容。
+
+上色使用獨立的 `ColorizationProcessingStage`：`pending`、`maskReady`、`colorizing`、`previewReady`、`exporting`、`completed`、`failed`。其進度固定保存在 `ComicPage.colorizationState`，不得借用翻譯頁面的狀態欄位。
 
 ## Swift API
 
@@ -148,6 +152,14 @@ let composition = try await pipeline.compose(
     options: options,
     outputURL: finalOutputURL,
     progress: progress
+)
+
+let colorizationPreviewURL = try await pipeline.colorize(
+    page: page,
+    inputURL: translatedOutputURL ?? page.sourceURL,
+    regions: page.regions,
+    strokes: page.colorizationMaskStrokes ?? [],
+    progress: colorizationProgress
 )
 ```
 
@@ -239,9 +251,9 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `setInterfaceLanguage(language)` | 設定 `auto`、`zh-Hant`、`en`、`ja` 或 `ko`，立即重繪並保存偏好 |
 | `updateGlobalSettings(settings)` | 更新完整全域設定；包含色系、框選顏色、資料位置、預設輸出位置、偏好模型與 MCP 網路設定 |
 | `chooseDataDirectory()` | 開啟原生資料目錄選擇面板；回傳 `{ path }`，套用後需重新啟動 |
-| `choosePreferredModelDirectory(capability)` | 選取並驗證 `textToText`、`imageToText`、`imageToImage` 或 `superResolution` 模型目錄 |
-| `chooseModelDownloadDirectory(capability)` | 選取文生文、多模態或超高解析度模型儲存根目錄；若直接選到支援的既有模型，會回傳其版本 |
-| `downloadPreferredModel(capability, variantID)` | 從 Hugging Face 下載所選文生文、多模態或超高解析度模型；已存在時不重複下載 |
+| `choosePreferredModelDirectory(capability)` | 選取並驗證 `imageToText`、`imageToImage`、`imageColorization` 或 `superResolution` 模型目錄 |
+| `chooseModelDownloadDirectory(capability)` | 選取多模態、上色或超高解析度模型儲存根目錄；若直接選到支援的既有模型，會回傳其版本 |
+| `downloadPreferredModel(capability, variantID)` | 從 Hugging Face 下載所選多模態、上色或超高解析度模型；已存在時不重複下載 |
 | `createProject()`／`chooseSourceDirectory()` | 從圖片、資料夾、ZIP／CBZ、RAR／CBR 或 PDF 建立受管理專案 |
 | `appendPages()` | 將相同支援格式追加到目前專案；必要時先把外部來源轉成受管理專案 |
 | `switchProject(projectID)` | 切換目前專案 |
@@ -256,7 +268,7 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `exportPSD(pageIDs)` | 選取輸出資料夾，以目前 HTML/CSS 合成圖與逐文字 Raster Layer 匯出 PSD |
 | `setPageSelection(pageIDs, activePageID)` | 同時設定批次選取與中央畫布頁面 |
 | `selectAllPages()`／`clearPageSelection()` | 全選或清除批次選取 |
-| `runBatch(operation, pageIDs, forceRecalculation)` | 將明確頁面集合加入 `detectMasks`、`translate`、`extractText`、`retranslate`、`superResolve`、`compose` 或完整處理佇列；翻譯重算時設為 `true`，會強制重新呼叫既有模型 |
+| `runBatch(operation, pageIDs, forceRecalculation)` | 將明確頁面集合加入 `detectMasks`、`translate`、`extractText`、`retranslate`、`superResolve`、`compose`、`colorize`、`colorizationCompose` 或完整處理佇列；重算時設為 `true` |
 | `detectMasks(scope)` | `selected` 或 `all` 的步驟二 |
 | `translate(scope)` | `selected` 或 `all` 的步驟三 |
 | `extractText(scope)` | 以目前區域與遮罩重新抽取原文；保留步驟二產物並清除依賴原文的譯文，完成後等待 `retranslate` |
@@ -273,6 +285,9 @@ try await ComicStringTableRepository().save(table, to: stringTableURL)
 | `appendMaskStroke(pageID, regionID, mode, diameter, points)` | 添加或擦除遮罩 |
 | `undoMaskStroke(pageID, regionID)` | 復原該區域最後一筆遮罩 |
 | `redoMaskStroke(pageID, regionID)` | 重做該區域最後一筆已復原遮罩 |
+| `appendColorizationMaskStroke(pageID, mode, diameter, points)` | 添加或擦除上色用反對話框遮罩 |
+| `undoColorizationMaskStroke(pageID)`／`redoColorizationMaskStroke(pageID)` | 復原或重做上色遮罩畫筆 |
+| `resetColorizationPages(pageIDs)` | 清除選取頁的上色畫筆、預覽、輸出與獨立進度，保留翻譯產物 |
 | `undoRegionEdit(pageID)`／`redoRegionEdit(pageID)` | 復原或重做該頁文字區域編輯；每頁最多保留 50 份快照 |
 | `removeRegion(pageID, regionID)` | 移除區域 |
 | `moveRegion(pageID, regionID, offset)` | 調整閱讀順序及 PSD 文字圖層順序 |
@@ -291,7 +306,7 @@ PSD 匯出以目前頁面順序產生 `序號_頁名.psd`。合併預覽、每�
 
 ## 標準 MCP
 
-`MangaKitchen` 使用官方 Swift MCP SDK `0.12.1`，提供 MCP `2025-11-25` 的標準 Streamable HTTP transport、tools、resources、resource templates、取消與 progress notification；目前工作流契約版本為 `1.2.0`。MCP adapter 在 GUI process 內運作，但 JSON-RPC 或 transport 型別不會進入漫畫核心。
+`MangaKitchen` 使用官方 Swift MCP SDK `0.12.1`，提供 MCP `2025-11-25` 的標準 Streamable HTTP transport、tools、resources、resource templates、取消與 progress notification；目前工作流契約版本為 `1.3.0`。MCP adapter 在 GUI process 內運作，但 JSON-RPC 或 transport 型別不會進入漫畫核心。
 
 啟動參數：
 
@@ -303,7 +318,7 @@ PSD 匯出以目前頁面順序產生 `序號_頁名.psd`。合併預覽、每�
 | `--mcp` | `--mcp=on` 的簡寫 |
 | `--mcp-port=12080` | 覆寫本次啟動的 MCP listener port；設定預設為 `12080` |
 
-GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 仍會常駐；可由 menu bar 選單重新開啟主視窗、複製 endpoint 或完整結束 App。布林值也接受 `true/false`、`1/0` 與 `yes/no`；其他值會直接回報參數錯誤。
+GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 仍會常駐；可由 menu bar 選單重新開啟主視窗、複製 MCP 網址或完整結束 App。布林值也接受 `true/false`、`1/0` 與 `yes/no`；其他值會直接回報參數錯誤。
 
 ### Tools
 
@@ -320,12 +335,17 @@ GUI 一定會建立。MCP 開啟後即使關閉主視窗，App 與 MCP listener 
 | `mangakitchen.glossary.upsert` | 新增詞條或以 `entry_id` 更新完整映射 |
 | `mangakitchen.glossary.remove` | 移除指定詞條 |
 | `mangakitchen.model.load` | 載入本機模型 manifest 目錄 |
-| `mangakitchen.workspace.pages` | 查詢每頁產物狀態；`nextAction` 只是摘要，不會授權 Agent 自行執行 |
-| `mangakitchen.page.inspect` | 讀取完整頁面、產物、可用操作與 opaque `revision` |
+| `mangakitchen.workspace.pages` | 以 `workflow=translation|colorization` 查詢每頁產物狀態；`nextAction` 只是摘要，不會授權 Agent 自行執行 |
+| `mangakitchen.page.inspect` | 讀取完整頁面、翻譯／上色產物、上色輸入來源、可用操作與 opaque `revision` |
 | `mangakitchen.page.update` | 帶入 `expected_revision` 更新頁名或頁序 |
 | `mangakitchen.page.prepare_agent_task` | 主要入口；一次回傳指定頁原圖與步驟二遮罩 JSON |
 | `mangakitchen.page.submit_agent_result` | 帶入工作包 revision，一次回寫全部區域並建立步驟三排字預覽 |
 | `mangakitchen.page.render` | 步驟四只將既有步驟三預覽儲存到輸出目錄 |
+| `mangakitchen.page.colorize` | 上色步驟三；以已載入的 `imageColorization` 模型建立預覽 |
+| `mangakitchen.page.prepare_colorization_task` | 一次回傳實際上色輸入與反對話框遮罩，交由 Agent 自行上色 |
+| `mangakitchen.page.submit_colorization_result` | 驗證 Agent 完整頁面結果、強制套用保護遮罩並寫回上色預覽 |
+| `mangakitchen.page.render_colorization` | 上色步驟四；只把既有上色預覽儲存到輸出目錄 |
+| `mangakitchen.page.reset_colorization` | 清除本頁上色畫筆、預覽、輸出與獨立進度，保留翻譯產物 |
 | `mangakitchen.region.batch_update` | 原子套用 1...64 個區域 partial patch |
 | `mangakitchen.region.reorder` | 以完整 ID 陣列更新閱讀與 PSD 圖層順序 |
 
@@ -338,9 +358,9 @@ MCP 初始化與工具清單只描述能力，不代表應立即操作資料。�
 標準流程固定為：
 
 1. App 已載入步驟一原圖，並由使用者在 App 完成步驟二區域、像素遮罩與去字背景。
-2. Agent 呼叫 `page.prepare_agent_task(workspace_id, page_id)`。
+2. 可讀取圖片的多模態 Agent 呼叫 `page.prepare_agent_task(workspace_id, page_id)`。
 3. Tool result 的 image content 直接包含原圖；structured content 的 `regionData` 內嵌所有區域、BBOX、氣泡形狀、像素遮罩、筆刷與現有排版資料，也同時提供目標語言、閱讀順序與專有名詞。
-4. Agent 只依既有 `region_id` 處理文字：`sourceText` 與 `translatedText` 若已有內容就是待校稿草稿，必須對照原圖確認或修正；空白欄位才重新抽取或翻譯。同時檢查並必要時調整 `translationAnchor`、`translationBounds`、`fontSize`、`automaticFontSize`、`fontWeight` 與 `writingDirection`。
+4. Agent 必須實際讀取附帶原圖，再只依既有 `region_id` 處理文字：`sourceText` 與 `translatedText` 若已有內容就是待校稿草稿，必須對照原圖確認或修正；空白欄位才重新抽取或翻譯。不得降級成只讀文字欄位的文生文流程。同時檢查並必要時調整 `translationAnchor`、`translationBounds`、`fontSize`、`automaticFontSize`、`fontWeight` 與 `writingDirection`。
 5. Agent 呼叫 `page.submit_agent_result`，一次送回本頁全部區域。
 6. App 驗證回傳 `region_id` 集合與步驟二完全一致，保留遮罩與去字背景、更新內部專案資料，並建立步驟三排字預覽；只有使用者要求輸出時才另呼叫 `page.render`。
 
@@ -379,6 +399,18 @@ MCP 初始化與工具清單只描述能力，不代表應立即操作資料。�
 
 `region.batch_update` 是 partial patch：省略欄位代表沿用；只有 `translation_anchor`、`translation_bounds`、`bubble_bounds` 與 `font_size` 接受 `null` 清除。完整批次會先驗證 revision、ID、有限數值、顏色與範圍，任一 patch 無效時不會部分寫入。只有幾何欄位變更才重建遮罩；文字與樣式更新保留既有像素遮罩。
 
+### 上色 MCP 契約
+
+1. 先以 `workspace.pages(workflow: "colorization")` 或 `page.inspect` 讀取上色待辦、`colorization.stage`、獨立進度及實際產物。
+2. 上色步驟二必須已在 App 完成反對話框遮罩；API 不會隱式重跑翻譯遮罩或區域偵測。
+3. Agent 路徑呼叫 `page.prepare_colorization_task`，單次 tool result 依序取得工作包 JSON、實際上色輸入與反對話框遮罩；Agent 可使用自身 Provider 完成上色，不需要載入 App 本機模型。
+4. Agent 以工作包 revision 呼叫 `page.submit_colorization_result`，透過 `result_image_base64` 與 `result_mime_type` 一次回寫 PNG、JPEG、HEIC、TIFF 或 WebP 完整頁面。App 會限制解碼後圖片為 20 MiB，以配合 32 MiB HTTP request 上限，並驗證像素尺寸、正規化為 PNG、再次套用遮罩，保證黑色保護區使用原輸入像素。
+5. 本機替代路徑可先用 `model.load` 載入 capability 為 `imageColorization` 的 DDColor manifest，再帶入最新 `expected_revision` 呼叫 `page.colorize`。
+6. 兩條路徑都優先讀取既有 `output`，沒有翻譯輸出才讀 `source`；`page.inspect.colorization.inputSource` 與 `inputURI` 會明確回報實際選擇。
+7. 使用者要求輸出時才帶入新 revision 呼叫 `page.render_colorization`；需清除重來時呼叫 `page.reset_colorization`。
+
+`page.colorize`、`page.submit_colorization_result`、`page.render_colorization` 與 `page.reset_colorization` 都使用 optimistic concurrency。DDColor 本機路徑目前固定採模型預設推論，MCP 不接受 `colorizationColorRange` 或 `colorizationMode`，避免宣稱無效參數已生效；Agent 路徑則由 Agent 自行選擇模型與 Provider，但仍必須遵守工作包尺寸、遮罩與分階段輸出契約。
+
 ### Resources
 
 ```text
@@ -386,6 +418,7 @@ mangakitchen://contract/current
 mangakitchen://workspace/list
 mangakitchen://workspace/current
 mangakitchen://workspace/current/pages
+mangakitchen://workspace/current/colorization-pages
 mangakitchen://workspace/current/glossary
 mangakitchen://workspace/{workspace_id}/capabilities
 mangakitchen://page/{page_id}
@@ -393,9 +426,11 @@ mangakitchen://page/{page_id}/regions
 mangakitchen://page/{page_id}/source
 mangakitchen://page/{page_id}/mask
 mangakitchen://page/{page_id}/output
+mangakitchen://page/{page_id}/colorization-preview
+mangakitchen://page/{page_id}/colorization-output
 ```
 
-頁面 JSON 狀態以 text resource 回傳；原圖、遮罩與輸出圖以 binary resource 回傳。標準 Agent 流程只使用 `prepare_agent_task` 的內嵌資料，不需要逐一讀取上述 resource。
+頁面 JSON 狀態以 text resource 回傳；原圖、遮罩、翻譯輸出與上色產物以 binary resource 回傳。標準翻譯 Agent 流程只使用 `prepare_agent_task` 的內嵌資料，不需要逐一讀取上述 resource。
 
 ### 啟動設定
 
@@ -409,7 +444,7 @@ swift build -c release --product MangaKitchen
 .build/release/MangaKitchen --mcp=on
 ```
 
-再將支援 Streamable HTTP 的 MCP client 指向下列 endpoint：
+再將支援 Streamable HTTP 的 MCP client 指向下列 MCP 網址：
 
 ```json
 {
@@ -422,4 +457,4 @@ swift build -c release --product MangaKitchen
 }
 ```
 
-不同 MCP client 的設定欄位名稱可能不同。Listener 綁定 `0.0.0.0`，遠端 client 應以這台 Mac 的實際 LAN 位址組合 endpoint，並先在設定 DLG 將單一 IP 或 CIDR（例如 `192.168.1.0/24`）加入白名單。白名單使用 TCP socket 的來源位址，不信任 `X-Forwarded-For`；空白名單會拒絕全部 request。服務目前仍是明文 HTTP，若跨越受信任區網，仍應另加 TLS、身分驗證與 macOS 防火牆規則。
+不同 MCP client 的設定欄位名稱可能不同。Listener 綁定 `0.0.0.0`，遠端 client 應以這台 Mac 的實際 LAN 位址組合 MCP 網址，並先在設定 DLG 將單一 IP 或 CIDR（例如 `192.168.1.0/24`）加入白名單。白名單使用 TCP socket 的來源位址，不信任 `X-Forwarded-For`；空白名單會拒絕全部 request。服務目前仍是明文 HTTP，若跨越受信任區網，仍應另加 TLS、身分驗證與 macOS 防火牆規則。

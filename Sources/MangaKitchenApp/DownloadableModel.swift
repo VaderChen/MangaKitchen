@@ -6,6 +6,13 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
     enum Format: String, Hashable, Sendable {
         case mlxDirectory
         case coreMLZip
+        case coreMLPackage
+    }
+
+    struct CoreMLContract: Hashable, Sendable {
+        var modelFileName: String
+        var inputName: String
+        var outputName: String
     }
 
     var id: String
@@ -15,6 +22,8 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
     var recommended: Bool = false
     var format: Format = .mlxDirectory
     var outputScale: Int? = nil
+    var coreMLContract: CoreMLContract? = nil
+    var colorizationInputSize: Int? = nil
 
     var directoryName: String {
         repositoryID.split(separator: "/").last.map(String.init) ?? id
@@ -22,22 +31,6 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
 }
 
 enum DownloadableModelCatalog {
-    static let textToTextModels = [
-        DownloadableModelDescriptor(
-            id: "qwen3-4b-4bit",
-            displayName: "Qwen3-4B 4-bit",
-            repositoryID: "mlx-community/Qwen3-4B-4bit",
-            capability: .textToText,
-            recommended: true
-        ),
-        DownloadableModelDescriptor(
-            id: "qwen3-8b-4bit",
-            displayName: "Qwen3-8B 4-bit",
-            repositoryID: "mlx-community/Qwen3-8B-4bit",
-            capability: .textToText
-        )
-    ]
-
     static let imageToTextModels = [
         DownloadableModelDescriptor(
             id: "qwen3.5-4b-4bit",
@@ -73,7 +66,12 @@ enum DownloadableModelCatalog {
             repositoryID: "TheMurusTeam/coreml-upscaler-realesrganAnime512",
             capability: .superResolution,
             format: .coreMLZip,
-            outputScale: 4
+            outputScale: 4,
+            coreMLContract: .init(
+                modelFileName: "realesrganAnime512.mlmodel",
+                inputName: "input",
+                outputName: "activation_out"
+            )
         ),
         DownloadableModelDescriptor(
             id: "realesrgan-x2plus-mlx",
@@ -86,20 +84,37 @@ enum DownloadableModelCatalog {
         )
     ]
 
+    static let imageColorizationModels = [
+        DownloadableModelDescriptor(
+            id: "ddcolor-tiny-coreml",
+            displayName: "DDColor Tiny（Core ML）",
+            repositoryID: "mlboydaisuke/DDColor-Tiny-CoreML",
+            capability: .imageColorization,
+            recommended: true,
+            format: .coreMLPackage,
+            coreMLContract: .init(
+                modelFileName: "DDColor_Tiny.mlpackage",
+                inputName: "image",
+                outputName: "ab_channels"
+            ),
+            colorizationInputSize: 512
+        )
+    ]
+
     static var defaultImageToTextModel: DownloadableModelDescriptor {
         imageToTextModels.first(where: \.recommended) ?? imageToTextModels[0]
-    }
-
-    static var defaultTextToTextModel: DownloadableModelDescriptor {
-        textToTextModels.first(where: \.recommended) ?? textToTextModels[0]
     }
 
     static var defaultSuperResolutionModel: DownloadableModelDescriptor {
         superResolutionModels.first(where: \.recommended) ?? superResolutionModels[0]
     }
 
+    static var defaultImageColorizationModel: DownloadableModelDescriptor {
+        imageColorizationModels.first(where: \.recommended) ?? imageColorizationModels[0]
+    }
+
     static var allModels: [DownloadableModelDescriptor] {
-        textToTextModels + imageToTextModels + superResolutionModels
+        imageToTextModels + imageColorizationModels + superResolutionModels
     }
 
     static func model(id: String, capability: ModelCapability) -> DownloadableModelDescriptor? {
@@ -135,9 +150,9 @@ enum DownloadableModelCatalog {
         model: DownloadableModelDescriptor? = nil
     ) -> Bool {
         let fileManager = FileManager.default
-        if model?.format == .coreMLZip {
+        if model?.format == .coreMLZip || model?.format == .coreMLPackage {
             guard let manifest = try? ModelManifest.load(from: directoryURL),
-                  manifest.capability == .superResolution,
+                  manifest.capability == model?.capability,
                   let modelFile = manifest.modelFile else { return false }
             return fileManager.fileExists(atPath: directoryURL.appendingPathComponent(modelFile).path)
         }
