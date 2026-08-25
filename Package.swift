@@ -10,6 +10,7 @@ let package = Package(
     products: [
         .executable(name: "MangaKitchen", targets: ["MangaKitchenApp"]),
         .library(name: "MangaKitchenCore", targets: ["MangaKitchenCore"]),
+        .library(name: "MangaKitchenApplication", targets: ["MangaKitchenApplication"]),
         .library(name: "MangaKitchenRuntime", targets: ["MangaKitchenRuntime"])
     ],
     dependencies: [
@@ -37,6 +38,10 @@ let package = Package(
     targets: [
         .target(name: "MangaKitchenCore"),
         .target(
+            name: "MangaKitchenApplication",
+            dependencies: ["MangaKitchenCore"]
+        ),
+        .target(
             name: "MangaKitchenRuntime",
             dependencies: [
                 "MangaKitchenCore",
@@ -53,6 +58,7 @@ let package = Package(
             name: "MangaKitchenApp",
             dependencies: [
                 "MangaKitchenCore",
+                "MangaKitchenApplication",
                 "MangaKitchenRuntime",
                 .product(name: "Hub", package: "swift-transformers"),
                 .product(name: "MCP", package: "swift-sdk"),

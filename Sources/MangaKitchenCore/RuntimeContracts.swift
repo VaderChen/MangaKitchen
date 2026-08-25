@@ -216,6 +216,52 @@ public protocol RegionTranslating: Sendable {
     ) async throws -> [DialogueRegion]
 }
 
+/// 翻譯初稿已完成、尚未執行可選二次校稿時的提交點。
+public typealias TranslationDraftHandler = @Sendable ([DialogueRegion]) async throws -> Void
+
+/// 支援將初稿先提交給上層，再繼續執行二次校稿的翻譯器。
+public protocol DraftRegionTranslating: RegionTranslating {
+    func translate(
+        regions: [DialogueRegion],
+        pageURL: URL,
+        targetLanguageCode: String,
+        glossaryTerms: [ResolvedGlossaryTerm],
+        readingDirection: ReadingDirection,
+        qualityOptions: TranslationQualityOptions,
+        activity: @escaping PagePipelineActivity,
+        regionProgress: @escaping PageRegionProgress,
+        draftsReady: @escaping TranslationDraftHandler,
+        progress: @escaping InferenceProgress
+    ) async throws -> [DialogueRegion]
+}
+
+public extension DraftRegionTranslating {
+    func translate(
+        regions: [DialogueRegion],
+        pageURL: URL,
+        targetLanguageCode: String,
+        glossaryTerms: [ResolvedGlossaryTerm],
+        readingDirection: ReadingDirection,
+        qualityOptions: TranslationQualityOptions,
+        activity: @escaping PagePipelineActivity,
+        regionProgress: @escaping PageRegionProgress,
+        progress: @escaping InferenceProgress
+    ) async throws -> [DialogueRegion] {
+        try await translate(
+            regions: regions,
+            pageURL: pageURL,
+            targetLanguageCode: targetLanguageCode,
+            glossaryTerms: glossaryTerms,
+            readingDirection: readingDirection,
+            qualityOptions: qualityOptions,
+            activity: activity,
+            regionProgress: regionProgress,
+            draftsReady: { _ in },
+            progress: progress
+        )
+    }
+}
+
 public protocol DialogueMaskGenerating: Sendable {
     func generateMask(
         sourceURL: URL,

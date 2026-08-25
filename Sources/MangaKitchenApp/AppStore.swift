@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import ImageIO
+import MangaKitchenApplication
 import MangaKitchenCore
 import MangaKitchenRuntime
 
@@ -40,6 +41,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var processingRegionProgress: [UUID: ProcessingRegionProgress] = [:]
     @Published var statusMessage: String?
 
+    private(set) var runtimeEnvironment: MangaKitchenRuntimeEnvironment?
     private let models: ModelRuntimeHub?
     private let pipeline: ComicTranslationPipeline?
     private let backgroundRestorer: HybridBackgroundRestorer?
@@ -57,26 +59,34 @@ final class AppStore: ObservableObject {
     private var defaultOutputDirectoryURL: URL?
     private var projectSnapshots: [UUID: WorkspaceSnapshot] = [:]
     private var activeModelDirectories: [URL] = []
-    private var preferredModelPaths: [ModelCapability: String] = [:]
     private var activeProjectCreatedAt = Date()
-    private var processingTask: Task<Void, Never>?
+    private var sourceScanTask: Task<Void, Never>?
     private var regionRecognitionTask: Task<Void, Never>?
     private var modelDownloadTask: Task<Void, Never>?
     private var systemMetricsTask: Task<Void, Never>?
     private var persistenceTask: Task<Void, Never>?
     private var maskRegenerationTasks: [UUID: Task<Void, Never>] = [:]
     private var translationPreviewTasks: [UUID: Task<Void, Never>] = [:]
-    private var undoneMaskStrokes: [UUID: [UUID: [MaskStroke]]] = [:]
-    private var undoneColorizationMaskStrokes: [UUID: [MaskStroke]] = [:]
-    private var maskRevisions: [UUID: UInt64] = [:]
-    private var regionUndoHistory: [UUID: [[DialogueRegion]]] = [:]
-    private var regionRedoHistory: [UUID: [[DialogueRegion]]] = [:]
+    private let editingHistory = AppEditingHistory()
     private var excludedSourceRelativePaths: Set<String> = []
-
-    /// 載入大型 MLX／Core ML 模型前的保守記憶體門檻。統一記憶體機種在
-    /// 模型建立期間會短暫同時保留權重與工作 buffer，因此不能等到 100% 才清理。
-    private static let modelLoadMemoryPressureThreshold = 0.80
-    private static let largeModelWeightThresholdBytes: UInt64 = 8 * 1_024 * 1_024 * 1_024
+    private lazy var batchWorkflowCoordinator = AppBatchWorkflowCoordinator {
+        [weak self] jobs, isRunning in
+        guard let self else { return }
+        self.batchJobs = jobs
+        if self.sourceScanTask == nil {
+            self.isProcessing = isRunning
+        }
+    }
+    private lazy var modelLifecycleCoordinator = AppModelLifecycleCoordinator(
+        models: models,
+        loadedModelsDidChange: { [weak self] in self?.loadedModels = $0 },
+        loadingStateDidChange: { [weak self] in self?.modelLoadingState = $0 },
+        statusDidChange: { [weak self] in self?.statusMessage = $0 },
+        metricsDidChange: { [weak self] in self?.systemMetrics = $0 },
+        log: { [weak self] level, message in
+            self?.applicationLog.append(level, category: "Model", message: message)
+        }
+    )
 
     init(
         dataDirectoryPath: String? = nil,
@@ -100,69 +110,21 @@ final class AppStore: ObservableObject {
         defaultOutputDirectoryURL = defaultOutputDirectoryPath
             .map { URL(fileURLWithPath: $0).standardizedFileURL }
         do {
-            let metal = try MetalContext()
-            let models = ModelRuntimeHub(
-                metal: metal,
-                thinkingEnabled: modelThinkingEnabled,
+            let root = try Self.makeApplicationRoot(dataDirectoryPath: dataDirectoryPath)
+            let projectsRoot = root.appendingPathComponent("Projects", isDirectory: true)
+            try FileManager.default.createDirectory(at: projectsRoot, withIntermediateDirectories: true)
+            let environment = try MangaKitchenRuntimeEnvironment(
+                applicationRoot: root,
+                imageCompositingBackend: imageCompositingBackend,
+                modelThinkingEnabled: modelThinkingEnabled,
                 log: runtimeLog,
                 reasoningStream: reasoningStream
             )
-            let root = try Self.makeApplicationRoot(dataDirectoryPath: dataDirectoryPath)
-            let artifactsRoot = root.appendingPathComponent("Artifacts", isDirectory: true)
-            let projectsRoot = root.appendingPathComponent("Projects", isDirectory: true)
-            try FileManager.default.createDirectory(at: artifactsRoot, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: projectsRoot, withIntermediateDirectories: true)
-            let backgroundRestorer = try HybridBackgroundRestorer(
-                models: models,
-                metal: metal,
-                compositingBackend: imageCompositingBackend
-            )
-            let bubbleSegmenter = Self.bundledBubbleSegmenter()
-            let htmlTypesetter = HTMLDialogueTypesetter()
-            let ppocrTextRecognizer: any RegionTextRecognizing
-            if let ocrRuntime = Self.bundledOCRRuntime() {
-                ppocrTextRecognizer = OCRRegionTextRecognitionService(
-                    ocr: ocrRuntime,
-                    // Medium Det 只在步驟三既有區域內切文字行，
-                    // 不參與步驟二氣泡與遮罩產生。
-                    locator: Self.bundledTextLocalizationRuntime()
-                )
-            } else {
-                // 步驟三抽字必須固定使用 OCR；資源缺失時明確失敗，
-                // 不得暗中改走 VLM 而改變流程語意。
-                ppocrTextRecognizer = UnavailableOCRRegionTextRecognizer()
-            }
-            // 恢復舊版已驗證的 VLM 整個對話區域轉錄。這個分流只在
-            // 步驟三依專案選項使用，不能寫回或重建步驟二產物。
-            let vlmTextRecognizer = VLMRegionTranscriptionService(model: models)
-            let imageTranslator = VLMRegionTranslationService(model: models, log: runtimeLog)
-            let pipeline = ComicTranslationPipeline(
-                // 步驟二永遠固定為氣泡偵測→像素內縮；OCR／VLM
-                // 選項只能在後續原文抽取使用，不得改變遮罩。
-                regionDetector: MangaBubbleMaskRegionDetector(
-                    bubbleSegmenter: bubbleSegmenter
-                ),
-                textRecognizer: ppocrTextRecognizer,
-                textRecognizers: [
-                    .ppocrv6MediumDet: ppocrTextRecognizer,
-                    .vlm: vlmTextRecognizer
-                ],
-                maskRefiner: MangaTextMaskRefiner(),
-                translator: imageTranslator,
-                translators: [
-                    .imageToText: imageTranslator
-                ],
-                maskGenerator: DialogueMaskGenerator(),
-                backgroundRestorer: backgroundRestorer,
-                typesetter: htmlTypesetter,
-                outputRoot: artifactsRoot,
-                superResolver: models,
-                colorizer: models
-            )
-            self.models = models
-            self.pipeline = pipeline
-            self.backgroundRestorer = backgroundRestorer
-            self.htmlTypesetter = htmlTypesetter
+            runtimeEnvironment = environment
+            models = environment.models
+            pipeline = environment.appPipeline
+            backgroundRestorer = environment.backgroundRestorer
+            htmlTypesetter = environment.htmlTypesetter
             applicationRoot = root
             self.projectsRoot = projectsRoot
             legacyRepository = WorkspaceRepository(
@@ -177,6 +139,7 @@ final class AppStore: ObservableObject {
             applicationLog.append(.info, category: "App", message: "Metal and processing pipeline are ready.")
             self.automaticSuperResolutionEnabled = automaticSuperResolutionEnabled
         } catch {
+            runtimeEnvironment = nil
             models = nil
             pipeline = nil
             backgroundRestorer = nil
@@ -208,67 +171,6 @@ final class AppStore: ObservableObject {
 
     var applicationDataDirectoryPath: String? { applicationRoot?.path }
 
-    private static func bundledBubbleSegmenter() -> MangaBubbleSegmentationCoreMLRuntime? {
-        guard let modelURL = Bundle.module.url(
-            forResource: "MangaBubbleSegmentation",
-            withExtension: "mlpackage",
-            subdirectory: "Models"
-        ) else {
-            return nil
-        }
-        return try? MangaBubbleSegmentationCoreMLRuntime(modelURL: modelURL)
-    }
-
-    private static func bundledTextLocalizationRuntime() -> PPOCRTextDetectionRuntime? {
-        guard let modelURL = Bundle.module.url(
-            forResource: "ppocrv6-medium-det-736x480-macos14",
-            withExtension: "mlpackage",
-            subdirectory: "Models/TextLocalization"
-        ) else {
-            return nil
-        }
-        return try? PPOCRTextDetectionRuntime(modelURL: modelURL)
-    }
-
-    /// 本機原文抽取固定使用內建 OCR；資源缺失時由上層明確回報錯誤。
-    /// 預設優先使用 Medium；若 Medium 資源無法載入則回退至已驗證的 Small。
-    /// OCR 只保存步驟二既有區域的獨立候選，不會改動座標或遮罩。
-    private static func bundledOCRRuntime() -> PPOCRRecognitionRuntime? {
-        let candidates = [
-            (
-                modelID: "ppocrv6-medium-rec",
-                modelResource: "ppocrv6-medium-rec-macos14",
-                characterResource: "ppocrv6-medium-rec-characters"
-            ),
-            (
-                modelID: "ppocrv6-small-rec",
-                modelResource: "ppocrv6-small-rec-macos14",
-                characterResource: "ppocrv6-small-rec-characters"
-            )
-        ]
-
-        for candidate in candidates {
-            guard let modelURL = Bundle.module.url(
-                forResource: candidate.modelResource,
-                withExtension: "mlpackage",
-                subdirectory: "Models/OCR"
-            ), let characterURL = Bundle.module.url(
-                forResource: candidate.characterResource,
-                withExtension: "json",
-                subdirectory: "Models/OCR"
-            ), let characters = try? PPOCRCharacterList.load(from: characterURL),
-            let runtime = try? PPOCRRecognitionRuntime(
-                modelURL: modelURL,
-                modelID: candidate.modelID,
-                characters: characters
-            ) else {
-                continue
-            }
-            return runtime
-        }
-        return nil
-    }
-
     func setImageCompositingBackend(_ backend: ImageCompositingBackend) {
         guard let backgroundRestorer else { return }
         Task { [weak self] in
@@ -280,6 +182,8 @@ final class AppStore: ObservableObject {
     }
 
     func applyMCPState(_ state: MCPWorkspaceState) async {
+        // MCP 與 GUI 共用同一個 ModelRuntimeHub；先同步模型摘要，即使尚未開啟工作區。
+        modelLifecycleCoordinator.replaceLoadedModels(state.loadedModels)
         guard let sourceDirectoryURL = state.sourceDirectoryURL?.standardizedFileURL else { return }
         let isActiveSource = self.sourceDirectoryURL?.standardizedFileURL == sourceDirectoryURL
         if !isActiveSource {
@@ -498,7 +402,7 @@ final class AppStore: ObservableObject {
             await self.persistActiveProjectNow()
             self.projectSnapshots[projectID] = nil
             self.projects.removeAll { $0.id == projectID }
-            self.batchJobs.removeAll { $0.projectID == projectID }
+            self.batchWorkflowCoordinator.removeJobs(projectID: projectID)
 
             var activationError: Error?
             if self.activeProjectID == projectID {
@@ -560,11 +464,11 @@ final class AppStore: ObservableObject {
 
         isProcessing = true
         statusMessage = "正在遞迴掃描來源目錄…"
-        processingTask = Task { [weak self] in
+        sourceScanTask = Task { [weak self] in
             guard let self else { return }
             defer {
                 self.isProcessing = false
-                self.processingTask = nil
+                self.sourceScanTask = nil
                 self.startBatchQueueIfNeeded()
             }
             do {
@@ -879,10 +783,7 @@ final class AppStore: ObservableObject {
             }
             maskRegenerationTasks[page.id]?.cancel()
             translationPreviewTasks[page.id]?.cancel()
-            undoneMaskStrokes[page.id] = nil
-            undoneColorizationMaskStrokes[page.id] = nil
-            regionUndoHistory[page.id] = nil
-            regionRedoHistory[page.id] = nil
+            editingHistory.clear(pageID: page.id)
         }
         pages.removeAll { requested.contains($0.id) }
         normalizePageIndexes()
@@ -903,8 +804,7 @@ final class AppStore: ObservableObject {
         guard !isProcessing else { return }
         cancelMaskRegeneration()
         cancelTranslationPreviewRegeneration()
-        undoneMaskStrokes = [:]
-        undoneColorizationMaskStrokes = [:]
+        editingHistory.clearAll()
         excludedSourceRelativePaths.formUnion(pages.compactMap(\.relativeSourcePath))
         pages = []
         selectedPageID = nil
@@ -933,8 +833,7 @@ final class AppStore: ObservableObject {
             maskRegenerationTasks[page.id] = nil
             translationPreviewTasks[page.id]?.cancel()
             translationPreviewTasks[page.id] = nil
-            undoneMaskStrokes[page.id] = nil
-            undoneColorizationMaskStrokes[page.id] = nil
+            editingHistory.clear(pageID: page.id)
 
             do {
                 try removeGeneratedFiles(for: page)
@@ -999,8 +898,7 @@ final class AppStore: ObservableObject {
            ) {
             generatedURLs.insert(outputURL.standardizedFileURL)
         }
-        let artifactDirectoryURL = applicationRoot?
-            .appendingPathComponent("Artifacts", isDirectory: true)
+        let artifactDirectoryURL = runtimeEnvironment?.artifactsRoot
             .appendingPathComponent(page.id.uuidString, isDirectory: true)
             .standardizedFileURL
         if let artifactDirectoryURL { generatedURLs.insert(artifactDirectoryURL) }
@@ -1083,18 +981,6 @@ final class AppStore: ObservableObject {
             statusMessage = "請先選取至少一張漫畫頁面。"
             return nil
         }
-        // 同一批頁面在同一操作尚未完成時，不重複建立工作。除了避免
-        // 使用者快速連點，也能防止 WebUI 狀態尚未回推時把同一批翻譯送出兩次。
-        let orderedIDSet = Set(orderedIDs)
-        if let existingJob = batchJobs.last(where: { job in
-            guard job.projectID == activeProjectID,
-                  [.queued, .running].contains(job.status),
-                  job.operation == operation else { return false }
-            return Set(job.pageIDs) == orderedIDSet
-        }) {
-            statusMessage = "這批頁面已在處理中，沿用現有工作。"
-            return existingJob.id
-        }
         guard pipeline != nil else {
             statusMessage = "漫畫處理 Runtime 尚未就緒。"
             return nil
@@ -1138,11 +1024,16 @@ final class AppStore: ObservableObject {
             forceRecalculation: forceRecalculation,
             pageIDs: Array(orderedIDs)
         )
-        batchJobs.append(job)
-        statusMessage = "已將 \(job.pageIDs.count) 頁加入工作佇列。"
-        schedulePersistence()
-        startBatchQueueIfNeeded()
-        return job.id
+        switch batchWorkflowCoordinator.enqueue(job) {
+        case let .existing(existingJob):
+            statusMessage = "這批頁面已在處理中，沿用現有工作。"
+            return existingJob.id
+        case let .added(addedJob):
+            statusMessage = "已將 \(addedJob.pageIDs.count) 頁加入工作佇列。"
+            schedulePersistence()
+            startBatchQueueIfNeeded()
+            return addedJob.id
+        }
     }
 
     /// 只在這次工作真的會產生新譯文時要求翻譯模型；既有譯文重排與輸出不受影響。
@@ -1207,16 +1098,12 @@ final class AppStore: ObservableObject {
     }
 
     private func hasConfiguredModel(_ capability: ModelCapability) -> Bool {
-        loadedModels.contains(where: { $0.capability == capability })
-            || preferredModelPaths[capability] != nil
+        modelLifecycleCoordinator.hasConfiguredModel(capability)
     }
 
     /// 翻譯只支援多模態模型；模型不在啟動時常駐，真正翻譯前才延遲載入。
     private func effectiveTranslationModelMethod() -> TranslationModelMethod? {
-        if hasConfiguredModel(.imageToText) {
-            return .imageToText
-        }
-        return nil
+        modelLifecycleCoordinator.effectiveTranslationModelMethod()
     }
 
     private func ensureTranslationModelLoaded() async throws {
@@ -1234,141 +1121,27 @@ final class AppStore: ObservableObject {
         _ capability: ModelCapability,
         purpose: String
     ) async throws {
-        guard let models else { throw AppWorkflowError.runtimeUnavailable }
-        let path = preferredModelPaths[capability].map {
-            URL(fileURLWithPath: $0).standardizedFileURL
-        }
-        let loaded = await models.loadedModels().first(where: { $0.capability == capability })
-        if let loaded {
-            if let path,
-               let manifest = try? ModelManifest.load(from: path),
-               loaded.matchesModel(
-                   id: manifest.id,
-                   capability: capability,
-                   at: path
-               ) {
-                loadedModels = await models.loadedModels()
-                return
-            }
-            await models.unloadModel(capability: capability)
-            loadedModels = await models.loadedModels()
-        }
-        guard let path else {
-            throw ModelRuntimeError.capabilityNotLoaded(capability)
-        }
-        applicationLog.append(
-            .info,
-            category: "Model",
-            message: "Lazy-loading \(capability.rawValue) model for \(purpose)."
-        )
-        _ = try await loadRuntimeModel(
-            from: path,
-            models: models,
-            sessionID: UUID(),
-            currentIndex: 1,
-            totalCount: 1
-        )
-        loadedModels = await models.loadedModels()
-    }
-
-    /// 在大型模型載入前釋放其他 runtime，讓 MLX／Metal 能取得連續的工作記憶體。
-    /// 偏好模型路徑仍保留，下一次真正使用時會再延遲載入。
-    private func releaseLoadedModelsForMemoryPressure(
-        models: ModelRuntimeHub,
-        reason: String,
-        preservingModelID: String? = nil,
-        preservingCapability: ModelCapability? = nil,
-        preservingLocation: URL? = nil
-    ) async {
-        let loaded = await models.loadedModels()
-        guard !loaded.isEmpty else { return }
-        var releasedCount = 0
-        for model in loaded {
-            if let preservingModelID,
-               let preservingCapability,
-               let preservingLocation,
-               model.matchesModel(
-                   id: preservingModelID,
-                   capability: preservingCapability,
-                   at: preservingLocation
-               ) {
-                continue
-            }
-            await models.unloadModel(capability: model.capability)
-            releasedCount += 1
-        }
-        guard releasedCount > 0 else { return }
-        loadedModels = await models.loadedModels()
-        systemMetrics = SystemMetricsReader.read()
-        applicationLog.append(
-            .warning,
-            category: "Model",
-            message: "Released \(releasedCount) loaded model runtime(s) before loading \(reason) because RAM usage was high."
-        )
-        // 讓 runtime 的 ARC／Metal 資源釋放完成，再建立下一個大型模型。
-        await Task.yield()
-        try? await Task.sleep(for: .milliseconds(120))
-    }
-
-    private func shouldReleaseModelsBeforeLoad(modelDirectoryURL: URL) -> Bool {
-        if let usage = SystemMetricsReader.read().ramUsage,
-           usage >= Self.modelLoadMemoryPressureThreshold {
-            return true
-        }
-
-        // Qwen3.8-27B 4-bit 等大型權重約 15 GiB。即使目前使用率尚未達 80%，
-        // 也先釋放其他 runtime，避免權重與 Metal 工作 buffer 疊加後才 OOM。
-        guard let enumerator = FileManager.default.enumerator(
-            at: modelDirectoryURL,
-            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return false }
-        var totalWeightBytes: UInt64 = 0
-        for case let fileURL as URL in enumerator
-        where fileURL.pathExtension.lowercased() == "safetensors" {
-            guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
-                  values.isRegularFile == true,
-                  let fileSize = values.fileSize else { continue }
-            totalWeightBytes += UInt64(max(fileSize, 0))
-            if totalWeightBytes >= Self.largeModelWeightThresholdBytes {
-                return true
-            }
-        }
-        return false
-    }
-
-    private func isLikelyMemoryLoadError(_ error: Error) -> Bool {
-        let description = error.localizedDescription.lowercased()
-        return description.contains("memory")
-            || description.contains("allocation")
-            || description.contains("out of") && description.contains("resource")
-            || description.contains("metal") && description.contains("buffer")
+        try await modelLifecycleCoordinator.ensureLoaded(capability, purpose: purpose)
     }
 
     func cancelProcessing() {
         regionRecognitionTask?.cancel()
-        let cancelledPages = batchJobs.compactMap { job -> (UUID, BatchOperation)? in
-            guard job.status == .running, let pageID = job.currentPageID else { return nil }
-            return (pageID, job.operation)
+        let hadSourceScan = sourceScanTask != nil
+        sourceScanTask?.cancel()
+        let cancellation = batchWorkflowCoordinator.cancel()
+        cancellation.activePages.forEach { processingActivities[$0.pageID] = nil }
+        cancellation.activePages.forEach { processingRegionProgress[$0.pageID] = nil }
+        cancellation.activePages.forEach {
+            restoreStablePageStateAfterCancellation($0.pageID, operation: $0.operation)
         }
-        let now = Date()
-        for index in batchJobs.indices where [.queued, .running].contains(batchJobs[index].status) {
-            batchJobs[index].status = .cancelled
-            batchJobs[index].currentPageID = nil
-            batchJobs[index].finishedAt = now
-        }
-        processingTask?.cancel()
-        cancelledPages.forEach { processingActivities[$0.0] = nil }
-        cancelledPages.forEach { processingRegionProgress[$0.0] = nil }
-        cancelledPages.forEach { restoreStablePageStateAfterCancellation($0.0, operation: $0.1) }
-        statusMessage = processingTask == nil
+        statusMessage = !hadSourceScan && !cancellation.hadActiveTask
             ? "目前沒有執行中的工作。"
             : "工作已取消，正在停止目前運算…"
         schedulePersistence()
     }
 
     func retryFailedBatchJob(_ jobID: UUID) {
-        guard let job = batchJobs.first(where: { $0.id == jobID }),
+        guard let job = batchWorkflowCoordinator.job(id: jobID),
               job.projectID == activeProjectID else {
             statusMessage = "只能在原專案內重試失敗頁面。"
             return
@@ -1381,7 +1154,7 @@ final class AppStore: ObservableObject {
     }
 
     func clearFinishedBatchJobs() {
-        batchJobs.removeAll { $0.status != .queued && $0.status != .running }
+        batchWorkflowCoordinator.clearFinishedJobs()
         schedulePersistence()
     }
 
@@ -1400,124 +1173,59 @@ final class AppStore: ObservableObject {
     }
 
     private func startBatchQueueIfNeeded() {
-        guard processingTask == nil,
-              batchJobs.contains(where: { $0.status == .queued }) else { return }
-        isProcessing = true
-        processingTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                self.isProcessing = false
-                self.processingTask = nil
-                self.schedulePersistence()
-            }
-
-            while let jobID = self.batchJobs.first(where: { $0.status == .queued })?.id {
-                guard !Task.isCancelled else { break }
-                guard let jobIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }) else {
-                    continue
-                }
-                guard self.batchJobs[jobIndex].projectID == self.activeProjectID else {
-                    self.batchJobs[jobIndex].status = .cancelled
-                    self.batchJobs[jobIndex].finishedAt = Date()
-                    continue
-                }
-
-                self.batchJobs[jobIndex].status = .running
-                self.batchJobs[jobIndex].startedAt = Date()
-                let operation = self.batchJobs[jobIndex].operation
-                let forceRecalculation = self.batchJobs[jobIndex].forceRecalculation
-                let pageIDs = self.batchJobs[jobIndex].pageIDs
-                self.applicationLog.append(
+        guard sourceScanTask == nil else { return }
+        batchWorkflowCoordinator.startIfNeeded(
+            activeProjectID: activeProjectID,
+            executePage: { [weak self] operation, pageID, forceRecalculation in
+                guard let self else { throw CancellationError() }
+                try await self.run(
+                    operation,
+                    pageID: pageID,
+                    forceRecalculation: forceRecalculation
+                )
+            },
+            jobDidStart: { [weak self] job in
+                self?.applicationLog.append(
                     .info,
                     category: "Workflow",
-                    message: "Started \(operation.rawValue) for \(pageIDs.count) page(s)."
+                    message: "Started \(job.operation.rawValue) for \(job.pageIDs.count) page(s)."
                 )
-
-                for pageID in pageIDs {
-                    guard !Task.isCancelled,
-                          let currentIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }),
-                          self.batchJobs[currentIndex].status == .running else { break }
-                    self.batchJobs[currentIndex].currentPageID = pageID
-                    self.processingActivities[pageID] = .preparingPage
-                    self.processingRegionProgress[pageID] = nil
-                    do {
-                        try await self.run(
-                            operation,
-                            pageID: pageID,
-                            forceRecalculation: forceRecalculation
-                        )
-                        try Task.checkCancellation()
-                        guard let resultIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }),
-                              self.batchJobs[resultIndex].status == .running else {
-                            self.processingActivities[pageID] = nil
-                            self.processingRegionProgress[pageID] = nil
-                            break
-                        }
-                        self.batchJobs[resultIndex].completedPageIDs.append(pageID)
-                    } catch is CancellationError {
-                        self.applicationLog.append(
-                            .warning,
-                            category: "Workflow",
-                            message: "Cancelled \(operation.rawValue) for page \(pageID.uuidString)."
-                        )
-                        self.processingActivities[pageID] = nil
-                        self.processingRegionProgress[pageID] = nil
-                        break
-                    } catch {
-                        self.applicationLog.append(
-                            .error,
-                            category: "Workflow",
-                            message: "\(operation.rawValue) failed for page \(pageID.uuidString): \(error.localizedDescription)"
-                        )
-                        guard let resultIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }),
-                              self.batchJobs[resultIndex].status == .running else {
-                            self.processingActivities[pageID] = nil
-                            self.processingRegionProgress[pageID] = nil
-                            break
-                        }
-                        self.batchJobs[resultIndex].failures.append(
-                            BatchPageFailure(pageID: pageID, message: error.localizedDescription)
-                        )
-                        self.markFailed(
-                            pageID: pageID,
-                            operation: operation,
-                            message: error.localizedDescription
-                        )
-                    }
-                    self.processingActivities[pageID] = nil
-                    self.processingRegionProgress[pageID] = nil
-                    self.schedulePersistence()
-                }
-
-                guard let finalIndex = self.batchJobs.firstIndex(where: { $0.id == jobID }) else {
-                    if Task.isCancelled { break }
-                    continue
-                }
-                guard self.batchJobs[finalIndex].status == .running else {
-                    if Task.isCancelled { break }
-                    continue
-                }
-                self.batchJobs[finalIndex].currentPageID = nil
-                self.batchJobs[finalIndex].finishedAt = Date()
-                if Task.isCancelled {
-                    self.batchJobs[finalIndex].status = .cancelled
-                    break
-                }
-                self.batchJobs[finalIndex].status = self.batchJobs[finalIndex].failures.isEmpty
-                    ? .completed
-                    : .completedWithErrors
+            },
+            pageDidStart: { [weak self] pageID in
+                self?.processingActivities[pageID] = .preparingPage
+                self?.processingRegionProgress[pageID] = nil
+            },
+            pageDidCancel: { [weak self] pageID, operation in
+                self?.applicationLog.append(
+                    .warning,
+                    category: "Workflow",
+                    message: "Cancelled \(operation.rawValue) for page \(pageID.uuidString)."
+                )
+            },
+            pageDidFail: { [weak self] pageID, operation, error in
+                guard let self else { return }
+                self.applicationLog.append(
+                    .error,
+                    category: "Workflow",
+                    message: "\(operation.rawValue) failed for page \(pageID.uuidString): \(error.localizedDescription)"
+                )
+                self.markFailed(
+                    pageID: pageID,
+                    operation: operation,
+                    message: error.localizedDescription
+                )
+            },
+            pageDidFinish: { [weak self] pageID in
+                self?.processingActivities[pageID] = nil
+                self?.processingRegionProgress[pageID] = nil
+                self?.schedulePersistence()
+            },
+            queueDidFinish: { [weak self] cancelled in
+                guard let self else { return }
+                self.statusMessage = cancelled ? "工作已取消。" : "工作佇列已完成。"
+                self.schedulePersistence()
             }
-
-            if Task.isCancelled {
-                for index in self.batchJobs.indices where self.batchJobs[index].status == .queued {
-                    self.batchJobs[index].status = .cancelled
-                    self.batchJobs[index].finishedAt = Date()
-                }
-                self.statusMessage = "工作已取消。"
-            } else {
-                self.statusMessage = "工作佇列已完成。"
-            }
-        }
+        )
     }
 
     // MARK: - 頁面與遮罩編輯
@@ -1630,7 +1338,7 @@ final class AppStore: ObservableObject {
             return
         }
         let stroke = pages[pageIndex].regions[regionIndex].maskStrokes.removeLast()
-        undoneMaskStrokes[pageID, default: [:]][regionID, default: []].append(stroke)
+        editingHistory.pushMaskRedoStroke(stroke, pageID: pageID, regionID: regionID)
         markPageEdited(at: pageIndex)
         scheduleMaskRegeneration(pageID: pageID)
     }
@@ -1638,21 +1346,12 @@ final class AppStore: ObservableObject {
     func redoMaskStroke(pageID: UUID, regionID: UUID) {
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
               let regionIndex = pages[pageIndex].regions.firstIndex(where: { $0.id == regionID }),
-              var pageHistory = undoneMaskStrokes[pageID],
-              var regionHistory = pageHistory[regionID],
-              let stroke = regionHistory.popLast() else {
+              let stroke = editingHistory.popMaskRedoStroke(
+                  pageID: pageID,
+                  regionID: regionID
+              ) else {
             statusMessage = "這個區域沒有可重做的遮罩筆劃。"
             return
-        }
-        if regionHistory.isEmpty {
-            pageHistory[regionID] = nil
-        } else {
-            pageHistory[regionID] = regionHistory
-        }
-        if pageHistory.isEmpty {
-            undoneMaskStrokes[pageID] = nil
-        } else {
-            undoneMaskStrokes[pageID] = pageHistory
         }
         pages[pageIndex].regions[regionIndex].maskStrokes.append(stroke)
         markPageEdited(at: pageIndex)
@@ -1660,9 +1359,7 @@ final class AppStore: ObservableObject {
     }
 
     func maskRedoRegionIDs(pageID: UUID) -> [UUID] {
-        undoneMaskStrokes[pageID]?.compactMap { regionID, strokes in
-            strokes.isEmpty ? nil : regionID
-        } ?? []
+        editingHistory.maskRedoRegionIDs(pageID: pageID)
     }
 
     func appendColorizationMaskStroke(
@@ -1686,7 +1383,7 @@ final class AppStore: ObservableObject {
             stage: .maskReady,
             progress: 0.25
         )
-        undoneColorizationMaskStrokes[pageID] = nil
+        editingHistory.clearColorizationRedo(pageID: pageID)
         statusMessage = "已更新第 \(pages[pageIndex].index) 頁的上色遮罩。"
         schedulePersistence()
     }
@@ -1706,14 +1403,13 @@ final class AppStore: ObservableObject {
             stage: .maskReady,
             progress: 0.25
         )
-        undoneColorizationMaskStrokes[pageID, default: []].append(stroke)
+        editingHistory.pushColorizationRedoStroke(stroke, pageID: pageID)
         schedulePersistence()
     }
 
     func redoColorizationMaskStroke(pageID: UUID) {
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
-              var history = undoneColorizationMaskStrokes[pageID],
-              let stroke = history.popLast() else {
+              let stroke = editingHistory.popColorizationRedoStroke(pageID: pageID) else {
             statusMessage = "這一頁沒有可重做的上色遮罩筆劃。"
             return
         }
@@ -1727,12 +1423,11 @@ final class AppStore: ObservableObject {
             stage: .maskReady,
             progress: 0.25
         )
-        undoneColorizationMaskStrokes[pageID] = history.isEmpty ? nil : history
         schedulePersistence()
     }
 
     func colorizationMaskRedoAvailable(pageID: UUID) -> Bool {
-        !(undoneColorizationMaskStrokes[pageID]?.isEmpty ?? true)
+        editingHistory.hasColorizationRedo(pageID: pageID)
     }
 
     func resetColorizationPages(_ pageIDs: [UUID]) {
@@ -1756,7 +1451,7 @@ final class AppStore: ObservableObject {
             pages[pageIndex].colorizationState = nil
             processingActivities[pageID] = nil
             processingRegionProgress[pageID] = nil
-            undoneColorizationMaskStrokes[pageID] = nil
+            editingHistory.clearColorizationRedo(pageID: pageID)
             resetCount += 1
         }
         guard resetCount > 0 else {
@@ -1775,8 +1470,7 @@ final class AppStore: ObservableObject {
         for url in urls where fileManager.fileExists(atPath: url.path) {
             try fileManager.removeItem(at: url)
         }
-        let artifactDirectoryURL = applicationRoot?
-            .appendingPathComponent("Artifacts", isDirectory: true)
+        let artifactDirectoryURL = runtimeEnvironment?.artifactsRoot
             .appendingPathComponent(page.id.uuidString, isDirectory: true)
         if let artifactDirectoryURL,
            fileManager.fileExists(atPath: artifactDirectoryURL.path) {
@@ -1790,13 +1484,11 @@ final class AppStore: ObservableObject {
     }
 
     func maskRevision(pageID: UUID) -> UInt64 {
-        maskRevisions[pageID] ?? 0
+        editingHistory.maskRevision(pageID: pageID)
     }
 
     private func clearMaskRedoHistory(pageID: UUID, regionID: UUID) {
-        guard var pageHistory = undoneMaskStrokes[pageID] else { return }
-        pageHistory[regionID] = nil
-        undoneMaskStrokes[pageID] = pageHistory.isEmpty ? nil : pageHistory
+        editingHistory.clearMaskRedo(pageID: pageID, regionID: regionID)
     }
 
     func removeRegion(pageID: UUID, regionID: UUID) {
@@ -1950,6 +1642,8 @@ final class AppStore: ObservableObject {
 
         var processingOptions = options
         processingOptions.translationModelMethod = translationModelMethod
+        // 二次校稿是整頁一致性修正；單區重新抽取／翻譯不啟動校稿流程。
+        processingOptions.translationQuality.reviewPassEnabled = false
         isProcessing = true
         processingActivities[pageID] = .preparingPage
         processingRegionProgress[pageID] = ProcessingRegionProgress(current: 0, total: 1)
@@ -2086,12 +1780,13 @@ final class AppStore: ObservableObject {
 
     func undoRegionEdit(pageID: UUID) {
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
-              var history = regionUndoHistory[pageID], let previous = history.popLast() else {
+              let previous = editingHistory.undoRegions(
+                  pageID: pageID,
+                  current: pages[pageIndex].regions
+              ) else {
             statusMessage = "沒有可復原的文字區域修改。"
             return
         }
-        regionUndoHistory[pageID] = history.isEmpty ? nil : history
-        regionRedoHistory[pageID, default: []].append(pages[pageIndex].regions)
         pages[pageIndex].regions = previous
         markPageEdited(at: pageIndex)
         scheduleMaskRegeneration(pageID: pageID)
@@ -2100,12 +1795,13 @@ final class AppStore: ObservableObject {
 
     func redoRegionEdit(pageID: UUID) {
         guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }),
-              var history = regionRedoHistory[pageID], let next = history.popLast() else {
+              let next = editingHistory.redoRegions(
+                  pageID: pageID,
+                  current: pages[pageIndex].regions
+              ) else {
             statusMessage = "沒有可重做的文字區域修改。"
             return
         }
-        regionRedoHistory[pageID] = history.isEmpty ? nil : history
-        regionUndoHistory[pageID, default: []].append(pages[pageIndex].regions)
         pages[pageIndex].regions = next
         markPageEdited(at: pageIndex)
         scheduleMaskRegeneration(pageID: pageID)
@@ -2113,22 +1809,18 @@ final class AppStore: ObservableObject {
     }
 
     private func recordRegionHistory(pageID: UUID, regions: [DialogueRegion]) {
-        var history = regionUndoHistory[pageID] ?? []
-        if history.last != regions { history.append(regions) }
-        if history.count > 50 { history.removeFirst(history.count - 50) }
-        regionUndoHistory[pageID] = history
-        regionRedoHistory[pageID] = nil
+        editingHistory.recordRegions(pageID: pageID, regions: regions)
     }
 
     // MARK: - 模型與設定
 
     func loadModel(from directoryURL: URL) {
-        guard let models else {
+        guard modelLifecycleCoordinator.isAvailable else {
             statusMessage = "Metal Runtime 尚未就緒。"
             return
         }
         Task {
-            await loadModelNow(from: directoryURL, models: models, persist: true)
+            await loadModelNow(from: directoryURL, persist: true)
         }
     }
 
@@ -2237,16 +1929,15 @@ final class AppStore: ObservableObject {
     func setModelThinkingEnabled(_ enabled: Bool) {
         guard modelThinkingEnabled != enabled else { return }
         modelThinkingEnabled = enabled
-        guard let models else { return }
         Task { @MainActor [weak self] in
-            await models.setThinkingEnabled(enabled)
-            self?.loadedModels = await models.loadedModels()
-            self?.applicationLog.append(
+            guard let self else { return }
+            await self.modelLifecycleCoordinator.setThinkingEnabled(enabled)
+            self.applicationLog.append(
                 .info,
                 category: "Model",
                 message: "Think Mode \(enabled ? "enabled" : "disabled"); text runtimes will reload on demand."
             )
-            self?.statusMessage = enabled
+            self.statusMessage = enabled
                 ? "Think Mode 已開啟；文字模型將在下次使用時重新載入。"
                 : "Think Mode 已關閉；文字模型將在下次使用時重新載入。"
         }
@@ -2410,81 +2101,43 @@ final class AppStore: ObservableObject {
     }
 
     private func hasColorizationData(pageID: UUID) -> Bool {
-        guard let page = pages.first(where: { $0.id == pageID }),
-              let previewURL = page.colorizationPreviewURL else { return false }
-        return FileManager.default.fileExists(atPath: previewURL.path)
+        guard let page = pages.first(where: { $0.id == pageID }) else { return false }
+        return WorkflowArtifactState.hasColorizationPreview(in: page)
     }
 
     private func hasCompletedColorizationOutput(pageID: UUID) -> Bool {
-        guard let page = pages.first(where: { $0.id == pageID }),
-              let outputURL = page.colorizationOutputURL else { return false }
-        return FileManager.default.fileExists(atPath: outputURL.path)
+        guard let page = pages.first(where: { $0.id == pageID }) else { return false }
+        return WorkflowArtifactState.hasCompletedColorizationOutput(in: page)
     }
 
     private func hasMaskData(pageID: UUID) -> Bool {
-        guard let page = pages.first(where: { $0.id == pageID }),
-              let maskURL = page.maskURL,
-              let backgroundURL = page.backgroundURL,
-              FileManager.default.fileExists(atPath: maskURL.path),
-              FileManager.default.fileExists(atPath: backgroundURL.path) else { return false }
-        return true
+        guard let page = pages.first(where: { $0.id == pageID }) else { return false }
+        return WorkflowArtifactState.hasMaskData(in: page)
     }
 
     private func hasTranslationData(pageID: UUID) -> Bool {
-        guard let page = pages.first(where: { $0.id == pageID }),
-              let previewURL = page.translationPreviewURL else { return false }
-        guard FileManager.default.fileExists(atPath: previewURL.path) else { return false }
-        return page.regions.isEmpty || hasTranslatedRegions(page)
+        guard let page = pages.first(where: { $0.id == pageID }) else { return false }
+        return WorkflowArtifactState.hasTranslationData(in: page, requiresRegions: false)
     }
 
     /// 步驟四只需要步驟三已產生排版預覽。個別區域缺少原文或譯文
     /// 會由 WebUI 先警告使用者，但不得阻擋其餘已完成區域的輸出。
     private func hasTranslationPreviewData(pageID: UUID) -> Bool {
-        guard let page = pages.first(where: { $0.id == pageID }),
-              let previewURL = page.translationPreviewURL else { return false }
-        return FileManager.default.fileExists(atPath: previewURL.path)
+        guard let page = pages.first(where: { $0.id == pageID }) else { return false }
+        return WorkflowArtifactState.hasTranslationPreview(in: page)
     }
 
     private func hasTranslatedRegions(_ page: ComicPage) -> Bool {
-        guard !page.regions.isEmpty else { return false }
-        return page.regions.allSatisfy {
-            !$0.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && !$0.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
+        WorkflowArtifactState.hasTranslatedRegions(in: page)
     }
 
     private func hasCompletedOutput(pageID: UUID) -> Bool {
-        guard let page = pages.first(where: { $0.id == pageID }),
-              page.stage == .completed,
-              let outputURL = page.outputURL else { return false }
-        return FileManager.default.fileExists(atPath: outputURL.path)
+        guard let page = pages.first(where: { $0.id == pageID }) else { return false }
+        return WorkflowArtifactState.hasCompletedOutput(in: page)
     }
 
     private static func completedArtifactStage(for page: ComicPage) -> PageProcessingStage {
-        let fileManager = FileManager.default
-        if let outputURL = page.colorizationOutputURL,
-           fileManager.fileExists(atPath: outputURL.path) {
-            return .completed
-        }
-        if let previewURL = page.colorizationPreviewURL,
-           fileManager.fileExists(atPath: previewURL.path) {
-            return .translationReady
-        }
-        if let outputURL = page.outputURL,
-           fileManager.fileExists(atPath: outputURL.path) {
-            return .completed
-        }
-        if let previewURL = page.translationPreviewURL,
-           fileManager.fileExists(atPath: previewURL.path) {
-            return .translationReady
-        }
-        if let maskURL = page.maskURL,
-           let backgroundURL = page.backgroundURL,
-           fileManager.fileExists(atPath: maskURL.path),
-           fileManager.fileExists(atPath: backgroundURL.path) {
-            return .maskReady
-        }
-        return .scanned
+        WorkflowArtifactState.completedStage(for: page)
     }
 
     private func runDetection(pageID: UUID) async throws {
@@ -2508,7 +2161,7 @@ final class AppStore: ObservableObject {
         )
         try Task.checkCancellation()
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
-        undoneMaskStrokes[pageID] = nil
+        editingHistory.clearMaskRedo(pageID: pageID)
         pages[index].regions = result.regions
         pages[index].maskURL = result.maskURL
         pages[index].backgroundURL = previewURL
@@ -2661,6 +2314,16 @@ final class AppStore: ObservableObject {
                 options: processingOptions,
                 glossary: glossary,
                 recognizeText: recognizeText,
+                draftsReady: { [weak self] draftRegions in
+                    guard let self else { throw CancellationError() }
+                    try await self.commitTranslationDraft(
+                        pageID: pageID,
+                        originalPage: page,
+                        cleanBackgroundURL: cleanBackgroundURL,
+                        regions: draftRegions,
+                        pipeline: pipeline
+                    )
+                },
                 activity: activityHandler(pageID: pageID),
                 regionProgress: regionProgressHandler(pageID: pageID),
                 progress: progressHandler(pageID: pageID)
@@ -2737,6 +2400,56 @@ final class AppStore: ObservableObject {
             ? "第 \(pages[index].index) 頁翻譯與自動排版完成，可逐區確認或調整。"
             : warnings.joined(separator: "\n")
         schedulePersistence()
+    }
+
+    /// 二次校稿前先提交整頁初稿。校稿取消或失敗時，已寫入的譯文與預覽不回滾。
+    private func commitTranslationDraft(
+        pageID: UUID,
+        originalPage: ComicPage,
+        cleanBackgroundURL: URL,
+        regions: [DialogueRegion],
+        pipeline: ComicTranslationPipeline
+    ) async throws {
+        guard let pageIndex = pages.firstIndex(where: { $0.id == pageID }) else {
+            throw AppWorkflowError.pageNotFound
+        }
+        pages[pageIndex].regions = regions
+        pages[pageIndex].translationPreviewURL = nil
+        pages[pageIndex].outputURL = nil
+        pages[pageIndex].colorizationPreviewURL = nil
+        pages[pageIndex].colorizationOutputURL = nil
+        pages[pageIndex].stage = .typesetting
+        pages[pageIndex].errorMessage = nil
+
+        // `.str` 先同步落地；即使後續排版或二次校稿被取消，初稿文字仍可復原。
+        try await persistStringTableNow(pageID: pageID)
+        schedulePersistence()
+        statusMessage = "第 \(pages[pageIndex].index) 頁翻譯初稿已儲存，正在產生預覽…"
+        updateProcessingActivity(pageID: pageID, activity: .typesettingTranslation)
+
+        let currentPage = pages[pageIndex]
+        let previewBackgroundURL = currentPage.superResolvedBackgroundURL.flatMap { url in
+            FileManager.default.fileExists(atPath: url.path) ? url : nil
+        } ?? cleanBackgroundURL
+        do {
+            let previewURL = try await pipeline.renderTranslationPreview(
+                page: originalPage,
+                backgroundURL: previewBackgroundURL,
+                regions: regions
+            )
+            guard let updatedIndex = pages.firstIndex(where: { $0.id == pageID }) else { return }
+            pages[updatedIndex].translationPreviewURL = previewURL
+            pages[updatedIndex].stage = .translationReady
+            pages[updatedIndex].progress = Self.totalProgress(stage: .translationReady, fraction: 1)
+            pages[updatedIndex].errorMessage = nil
+            schedulePersistence()
+            statusMessage = "第 \(pages[updatedIndex].index) 頁翻譯初稿已儲存，正在執行整頁二次校稿…"
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // 初稿文字已落地；暫時無法產生預覽不應阻止整頁校稿繼續。
+            statusMessage = "翻譯初稿已儲存，但初稿預覽產生失敗：\(error.localizedDescription)"
+        }
     }
 
     private func runSuperResolution(pageID: UUID) async throws {
@@ -2881,7 +2594,10 @@ final class AppStore: ObservableObject {
             relativeSourcePath: page.relativeSourcePath ?? page.sourceURL.lastPathComponent,
             outputDirectoryURL: outputDirectoryURL
         )
-        guard paths.outputURL.standardizedFileURL != page.sourceURL.standardizedFileURL else {
+        guard !OutputDirectoryPolicy.wouldOverwriteSource(
+            paths.outputURL,
+            source: page.sourceURL
+        ) else {
             throw AppWorkflowError.outputWouldOverwriteSource
         }
         let completedPreviewURL: URL
@@ -2921,7 +2637,7 @@ final class AppStore: ObservableObject {
             relativeSourcePath: page.relativeSourcePath ?? page.sourceURL.lastPathComponent,
             outputDirectoryURL: outputDirectoryURL
         )
-        guard outputURL.standardizedFileURL != page.sourceURL.standardizedFileURL else {
+        guard !OutputDirectoryPolicy.wouldOverwriteSource(outputURL, source: page.sourceURL) else {
             throw AppWorkflowError.outputWouldOverwriteSource
         }
         guard let initialIndex = pages.firstIndex(where: { $0.id == pageID }) else {
@@ -3058,9 +2774,11 @@ final class AppStore: ObservableObject {
 
     /// 區域編輯的唯一實作，與 MCP 端共用。
     private var regionEditor: PageRegionEditor? {
-        pipeline.map {
-            PageRegionEditor(pipeline: $0, bubbleSegmenter: Self.bundledBubbleSegmenter())
-        }
+        guard let pipeline else { return nil }
+        return PageRegionEditor(
+            pipeline: pipeline,
+            bubbleSegmenter: runtimeEnvironment?.bubbleSegmenter
+        )
     }
 
     private func scheduleMaskRegeneration(pageID: UUID, refineRegionID: UUID? = nil) {
@@ -3085,7 +2803,7 @@ final class AppStore: ObservableObject {
             do {
                 let outcome = try await PageRegionEditor(
                     pipeline: pipeline,
-                    bubbleSegmenter: Self.bundledBubbleSegmenter()
+                    bubbleSegmenter: runtimeEnvironment?.bubbleSegmenter
                 ).materialize(
                     regions: page.regions,
                     refining: refineRegionID.map { [$0] } ?? [],
@@ -3130,7 +2848,7 @@ final class AppStore: ObservableObject {
 
     private func advanceMaskRevision(pageID: UUID) {
         objectWillChange.send()
-        maskRevisions[pageID, default: 0] &+= 1
+        editingHistory.advanceMaskRevision(pageID: pageID)
     }
 
     private func persistEditedRegion(pageID: UUID) {
@@ -3360,9 +3078,7 @@ final class AppStore: ObservableObject {
 
     private func validateOutputDirectory(_ candidate: URL) throws {
         guard let sourceDirectoryURL else { return }
-        let sourcePath = sourceDirectoryURL.standardizedFileURL.path
-        let outputPath = candidate.standardizedFileURL.path
-        if outputPath == sourcePath || outputPath.hasPrefix(sourcePath + "/") {
+        if OutputDirectoryPolicy.isInsideSource(candidate, source: sourceDirectoryURL) {
             throw AppWorkflowError.outputInsideSource
         }
     }
@@ -3410,7 +3126,7 @@ final class AppStore: ObservableObject {
         do {
             if let library = try await libraryRepository.load() {
                 projects = library.projects
-                batchJobs = library.jobs.map { job in
+                let restoredJobs = library.jobs.map { job in
                     guard job.status == .queued || job.status == .running else { return job }
                     var value = job
                     value.status = .cancelled
@@ -3418,6 +3134,7 @@ final class AppStore: ObservableObject {
                     value.finishedAt = Date()
                     return value
                 }
+                batchWorkflowCoordinator.replaceJobs(restoredJobs)
                 guard !library.projects.isEmpty else {
                     activeProjectID = nil
                     return
@@ -3604,8 +3321,7 @@ final class AppStore: ObservableObject {
     private func apply(_ snapshot: WorkspaceSnapshot) {
         cancelMaskRegeneration()
         cancelTranslationPreviewRegeneration()
-        undoneMaskStrokes = [:]
-        undoneColorizationMaskStrokes = [:]
+        editingHistory.clearAll()
         activeProjectID = snapshot.projectID
         activeProjectCreatedAt = snapshot.createdAt
         var restoredOptions = snapshot.options
@@ -3644,8 +3360,7 @@ final class AppStore: ObservableObject {
     private func clearActiveProject() {
         cancelMaskRegeneration()
         cancelTranslationPreviewRegeneration()
-        undoneMaskStrokes = [:]
-        undoneColorizationMaskStrokes = [:]
+        editingHistory.clearAll()
         activeProjectID = nil
         activeProjectCreatedAt = Date()
         pages = []
@@ -3768,7 +3483,6 @@ final class AppStore: ObservableObject {
         imageColorizationPath: String?,
         superResolutionPath: String?
     ) async {
-        guard let models else { return }
         _ = await configureLazyPreferredModel(
             capability: .imageToText,
             path: imageToTextPath
@@ -3785,7 +3499,6 @@ final class AppStore: ObservableObject {
             capability: .superResolution,
             path: superResolutionPath
         )
-        loadedModels = await models.loadedModels()
     }
 
     /// 設定偏好模型但不載入 runtime。啟動與設定切換都只走這條路徑；
@@ -3794,60 +3507,27 @@ final class AppStore: ObservableObject {
         capability: ModelCapability,
         path: String?
     ) async -> Bool {
-        guard let models else { return false }
-        let normalizedPath = path.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
-        if preferredModelPaths[capability] == normalizedPath {
-            return true
-        }
-        await models.unloadModel(capability: capability)
-        guard let normalizedPath else {
-            preferredModelPaths.removeValue(forKey: capability)
-            applicationLog.append(
-                .info,
-                category: "Model",
-                message: "Cleared lazy \(capability.rawValue) model configuration."
-            )
-            return true
-        }
-        do {
-            let directoryURL = URL(fileURLWithPath: normalizedPath).standardizedFileURL
-            let manifest = try ModelManifest.load(from: directoryURL)
-            guard manifest.capability == capability else {
-                throw PreferredModelError.capabilityMismatch(expected: capability)
-            }
-            preferredModelPaths[capability] = normalizedPath
-            applicationLog.append(
-                .info,
-                category: "Model",
-                message: "Configured \(manifest.displayName) for lazy loading."
-            )
-            return true
-        } catch {
-            preferredModelPaths.removeValue(forKey: capability)
-            statusMessage = error.localizedDescription
-            applicationLog.append(.error, category: "Model", message: error.localizedDescription)
-            return false
-        }
+        await modelLifecycleCoordinator.configurePreferredModel(
+            capability: capability,
+            path: path
+        )
     }
 
     @discardableResult
     private func loadModelNow(
         from directoryURL: URL,
-        models: ModelRuntimeHub,
         persist: Bool,
         sessionID: UUID = UUID(),
         currentIndex: Int = 1,
         totalCount: Int = 1
     ) async -> Bool {
         do {
-            let info = try await loadRuntimeModel(
+            let info = try await modelLifecycleCoordinator.loadModel(
                 from: directoryURL,
-                models: models,
                 sessionID: sessionID,
                 currentIndex: currentIndex,
                 totalCount: totalCount
             )
-            loadedModels = await models.loadedModels()
             if persist {
                 let location = directoryURL.standardizedFileURL
                 if !activeModelDirectories.contains(location) {
@@ -3861,103 +3541,6 @@ final class AppStore: ObservableObject {
             statusMessage = error.localizedDescription
             applicationLog.append(.error, category: "Model", message: error.localizedDescription)
             return false
-        }
-    }
-
-    private func loadRuntimeModel(
-        from directoryURL: URL,
-        models: ModelRuntimeHub,
-        sessionID: UUID,
-        currentIndex: Int,
-        totalCount: Int
-    ) async throws -> LoadedModelInfo {
-        let safeTotalCount = max(1, totalCount)
-        let safeCurrentIndex = min(max(1, currentIndex), safeTotalCount)
-        let canonicalDirectoryURL = directoryURL.standardizedFileURL.resolvingSymlinksInPath()
-        let manifest = try ModelManifest.load(from: canonicalDirectoryURL)
-        guard manifest.capability != .textToText else {
-            throw AppWorkflowError.textToTextUnsupported
-        }
-        let displayName = manifest.displayName
-        if let loaded = await models.loadedModels().first(where: {
-            $0.matchesModel(
-                id: manifest.id,
-                capability: manifest.capability,
-                at: canonicalDirectoryURL
-            )
-        }) {
-            loadedModels = await models.loadedModels()
-            applicationLog.append(
-                .debug,
-                category: "Model",
-                message: "Skipped loading \(loaded.displayName) because it is already active."
-            )
-            return loaded
-        }
-        modelLoadingState = ModelLoadingState(
-            id: sessionID,
-            phase: .loading,
-            displayName: displayName,
-            currentIndex: safeCurrentIndex,
-            totalCount: safeTotalCount,
-            progress: Double(safeCurrentIndex - 1) / Double(safeTotalCount),
-            errorMessage: nil
-        )
-        statusMessage = "正在載入模型：\(displayName)…"
-
-        do {
-            let shouldPrepareMemory = shouldReleaseModelsBeforeLoad(
-                modelDirectoryURL: canonicalDirectoryURL
-            )
-            if shouldPrepareMemory {
-                await releaseLoadedModelsForMemoryPressure(
-                    models: models,
-                    reason: displayName,
-                    preservingModelID: manifest.id,
-                    preservingCapability: manifest.capability,
-                    preservingLocation: canonicalDirectoryURL
-                )
-            }
-
-            let info: LoadedModelInfo
-            do {
-                info = try await models.loadModel(at: canonicalDirectoryURL)
-            } catch {
-                // 大型模型可能在建立權重或 Metal buffer 時才回報記憶體不足；
-                // 即使載入前的比例尚未超過門檻，也清理一次並只重試一次。
-                guard isLikelyMemoryLoadError(error) else { throw error }
-                await releaseLoadedModelsForMemoryPressure(
-                    models: models,
-                    reason: displayName,
-                    preservingModelID: manifest.id,
-                    preservingCapability: manifest.capability,
-                    preservingLocation: canonicalDirectoryURL
-                )
-                info = try await models.loadModel(at: canonicalDirectoryURL)
-            }
-            guard modelLoadingState?.id == sessionID else { return info }
-            modelLoadingState?.displayName = info.displayName
-            modelLoadingState?.progress = Double(safeCurrentIndex) / Double(safeTotalCount)
-            if safeCurrentIndex == safeTotalCount {
-                modelLoadingState?.phase = .completed
-                try? await Task.sleep(for: .milliseconds(450))
-                if modelLoadingState?.id == sessionID,
-                   modelLoadingState?.phase == .completed {
-                    modelLoadingState = nil
-                }
-            }
-            return info
-        } catch {
-            modelLoadingState = ModelLoadingState(
-                id: sessionID,
-                phase: .failed,
-                displayName: displayName,
-                currentIndex: safeCurrentIndex,
-                totalCount: safeTotalCount,
-                progress: Double(safeCurrentIndex - 1) / Double(safeTotalCount),
-                errorMessage: error.localizedDescription
-            )
-            throw error
         }
     }
 
@@ -3992,23 +3575,7 @@ final class AppStore: ObservableObject {
     }
 
     private static func totalProgress(stage: PageProcessingStage, fraction: Double) -> Double {
-        let value = min(max(fraction, 0), 1)
-        return switch stage {
-        case .pending: 0
-        case .scanned: 0.02
-        case .detectingText: value * 0.25
-        case .maskReady: 0.25
-        case .translating: 0.25 + value * 0.4
-        case .translationReady: 0.65
-        case .superResolving: 0.65 + value * 0.35
-        case .composing: 0.65 + value * 0.35
-        case .recognizing: value * 0.15
-        case .masking: 0.55 + value * 0.05
-        case .restoringBackground: 0.6 + value * 0.25
-        case .typesetting: 0.85 + value * 0.15
-        case .completed: 1
-        case .failed: 0
-        }
+        PageWorkflowProgress.overall(stage: stage, fraction: fraction)
     }
 
     private static func makeApplicationRoot(dataDirectoryPath: String?) throws -> URL {
@@ -4023,17 +3590,6 @@ final class AppStore: ObservableObject {
                 guard !Task.isCancelled else { return }
                 self?.systemMetrics = SystemMetricsReader.read()
             }
-        }
-    }
-}
-
-private enum PreferredModelError: LocalizedError {
-    case capabilityMismatch(expected: ModelCapability)
-
-    var errorDescription: String? {
-        switch self {
-        case let .capabilityMismatch(expected):
-            "所選模型類型不符，預期為 \(expected.rawValue)。"
         }
     }
 }

@@ -6,14 +6,12 @@ struct MangaKitchenMCPServer {
     static func makeHTTPHost(
         port: Int,
         allowedClients: [String],
-        dataDirectoryPath: String?,
-        imageCompositingBackend: ImageCompositingBackend = .cpu,
+        runtimeEnvironment: MangaKitchenRuntimeEnvironment,
         stateChangeHandler: MCPWorkflowService.StateChangeHandler? = nil,
         stateProvider: MCPWorkflowService.StateProvider? = nil
     ) throws -> MangaKitchenMCPHTTPHost {
-        let service = try MCPWorkflowService(
-            dataDirectoryPath: dataDirectoryPath,
-            imageCompositingBackend: imageCompositingBackend,
+        let service = MCPWorkflowService(
+            runtimeEnvironment: runtimeEnvironment,
             stateChangeHandler: stateChangeHandler,
             stateProvider: stateProvider
         )
@@ -49,15 +47,25 @@ struct MangaKitchenMCPServer {
         await server.withMethodHandler(CallTool.self) { [weak server] request in
             do {
                 let arguments = request.arguments ?? [:]
-                switch request.name {
-                case "mangakitchen.contract.describe":
+                guard let toolName = MCPToolName(rawValue: request.name) else {
+                    return .init(
+                        content: [.text(
+                            text: "未知工具：\(request.name)",
+                            annotations: nil,
+                            _meta: nil
+                        )],
+                        isError: true
+                    )
+                }
+                switch toolName {
+                case .contractDescribe:
                     return try success("目前 MCP 契約版本。", await service.contractDescription())
 
-                case "mangakitchen.workspace.list":
+                case .workspaceList:
                     let states = await service.listWorkspaces()
                     return try success("目前共有 \(states.count) 個工作區。", states)
 
-                case "mangakitchen.workspace.open":
+                case .workspaceOpen:
                     let source = try requiredFileURL(arguments, "source_directory")
                     let output = try optionalFileURL(arguments, "output_directory")
                     let state = try await service.openWorkspace(
@@ -67,7 +75,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("工作區已開啟，共 \(state.pages.count) 頁。", state)
 
-                case "mangakitchen.workspace.pages":
+                case .workspacePages:
                     let workflow = try optionalEnum(
                         arguments,
                         "workflow",
@@ -83,23 +91,23 @@ struct MangaKitchenMCPServer {
                         list
                     )
 
-                case "mangakitchen.workspace.activate":
+                case .workspaceActivate:
                     let id = try requiredUUID(arguments, "workspace_id")
                     let state = try await service.activateWorkspace(workspaceID: id)
                     return try success("已切換目前工作區。", state)
 
-                case "mangakitchen.workspace.rescan":
+                case .workspaceRescan:
                     let id = try requiredUUID(arguments, "workspace_id")
                     let state = try await service.rescanWorkspace(workspaceID: id)
                     return try success("來源目錄已重新掃描，共 \(state.pages.count) 頁。", state)
 
-                case "mangakitchen.workspace.set_output":
+                case .workspaceSetOutput:
                     let id = try requiredUUID(arguments, "workspace_id")
                     let directory = try requiredFileURL(arguments, "output_directory")
                     let state = try await service.setOutputDirectory(workspaceID: id, directoryURL: directory)
                     return try success("輸出目錄已設定。", state)
 
-                case "mangakitchen.workspace.configure":
+                case .workspaceConfigure:
                     let id = try requiredUUID(arguments, "workspace_id")
                     let reading = try optionalEnum(arguments, "reading_direction", as: ReadingDirection.self)
                     let writing = try optionalEnum(arguments, "writing_direction", as: WritingDirection.self)
@@ -118,12 +126,12 @@ struct MangaKitchenMCPServer {
                         configuration
                     )
 
-                case "mangakitchen.glossary.list":
+                case .glossaryList:
                     let id = try requiredUUID(arguments, "workspace_id")
                     let entries = try await service.glossaryEntries(workspaceID: id)
                     return try success("專有名詞表共有 \(entries.count) 筆。", entries)
 
-                case "mangakitchen.glossary.upsert":
+                case .glossaryUpsert:
                     let entry = try await service.upsertGlossaryEntry(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         entryID: optionalUUID(arguments, "entry_id"),
@@ -133,26 +141,26 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("專有名詞詞條已儲存。", entry)
 
-                case "mangakitchen.glossary.remove":
+                case .glossaryRemove:
                     let entries = try await service.removeGlossaryEntry(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         entryID: requiredUUID(arguments, "entry_id")
                     )
                     return try success("專有名詞詞條已移除。", entries)
 
-                case "mangakitchen.model.load":
+                case .modelLoad:
                     let directory = try requiredFileURL(arguments, "model_directory")
                     let model = try await service.loadModel(directoryURL: directory)
                     return try success("模型已載入：\(model.displayName)", model)
 
-                case "mangakitchen.page.inspect":
+                case .pageInspect:
                     let inspection = try await service.inspectPage(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id")
                     )
                     return try success("頁面狀態與 revision 已讀取。", inspection)
 
-                case "mangakitchen.page.update":
+                case .pageUpdate:
                     let result = try await service.updatePage(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -162,7 +170,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("頁面資料已更新。", result)
 
-                case "mangakitchen.page.prepare_agent_task":
+                case .pagePrepareAgentTask:
                     let progress = progressReporter(request: request, server: server)
                     let payload = try await service.prepareAgentTask(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
@@ -187,7 +195,7 @@ struct MangaKitchenMCPServer {
                         isError: false
                     )
 
-                case "mangakitchen.page.submit_agent_result":
+                case .pageSubmitAgentResult:
                     let result = try await service.submitAgentResult(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -197,7 +205,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("Agent 結果已一次回寫，步驟三翻譯排字預覽完成。", result)
 
-                case "mangakitchen.page.render":
+                case .pageRender:
                     let result = try await service.renderPage(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -206,7 +214,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("步驟三預覽已儲存到輸出位置。", result)
 
-                case "mangakitchen.page.colorize":
+                case .pageColorize:
                     let result = try await service.colorizePage(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -215,7 +223,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("上色步驟三預覽已完成。", result)
 
-                case "mangakitchen.page.prepare_colorization_task":
+                case .pagePrepareColorizationTask:
                     let payload = try await service.prepareAgentColorizationTask(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -245,7 +253,7 @@ struct MangaKitchenMCPServer {
                         isError: false
                     )
 
-                case "mangakitchen.page.submit_colorization_result":
+                case .pageSubmitColorizationResult:
                     let result = try await service.submitAgentColorizationResult(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -256,7 +264,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("Agent 上色結果已寫回步驟三預覽。", result)
 
-                case "mangakitchen.page.render_colorization":
+                case .pageRenderColorization:
                     let result = try await service.renderColorizationPage(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -265,7 +273,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("上色步驟四輸出已儲存。", result)
 
-                case "mangakitchen.page.reset_colorization":
+                case .pageResetColorization:
                     let result = try await service.resetColorizationPage(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -273,7 +281,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("本頁上色遮罩修正、預覽、輸出與進度已清除。", result)
 
-                case "mangakitchen.region.batch_update":
+                case .regionBatchUpdate:
                     let result = try await service.batchUpdateRegions(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -282,7 +290,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("區域 patch 已原子套用。", result)
 
-                case "mangakitchen.region.reorder":
+                case .regionReorder:
                     let result = try await service.reorderRegions(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -291,7 +299,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("區域順序已更新。", result)
 
-                case "mangakitchen.page.detect_masks":
+                case .pageDetectMasks:
                     return try await runWorkflow(
                         .detectMasks,
                         request: request,
@@ -300,7 +308,7 @@ struct MangaKitchenMCPServer {
                         service: service
                     )
 
-                case "mangakitchen.page.translate":
+                case .pageTranslate:
                     return try await runWorkflow(
                         .translate,
                         request: request,
@@ -309,7 +317,7 @@ struct MangaKitchenMCPServer {
                         service: service
                     )
 
-                case "mangakitchen.page.compose":
+                case .pageCompose:
                     return try await runWorkflow(
                         .compose,
                         request: request,
@@ -318,7 +326,7 @@ struct MangaKitchenMCPServer {
                         service: service
                     )
 
-                case "mangakitchen.page.run_full":
+                case .pageRunFull:
                     return try await runWorkflow(
                         .fullPage,
                         request: request,
@@ -327,7 +335,7 @@ struct MangaKitchenMCPServer {
                         service: service
                     )
 
-                case "mangakitchen.page.supplement_regions":
+                case .pageSupplementRegions:
                     let result = try await service.supplementRegions(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -338,7 +346,7 @@ struct MangaKitchenMCPServer {
                         result
                     )
 
-                case "mangakitchen.region.create":
+                case .regionCreate:
                     let workspaceID = try requiredUUID(arguments, "workspace_id")
                     let pageID = try requiredUUID(arguments, "page_id")
                     let region = try await service.createRegion(
@@ -348,7 +356,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("已新增對話區域。", region)
 
-                case "mangakitchen.region.update":
+                case .regionUpdate:
                     let workspaceID = try requiredUUID(arguments, "workspace_id")
                     let pageID = try requiredUUID(arguments, "page_id")
                     let regionID = try requiredUUID(arguments, "region_id")
@@ -386,7 +394,7 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("對話區域已更新；未修改 bounds／bubble_bounds 時會保留既有遮罩。", region)
 
-                case "mangakitchen.region.remove":
+                case .regionRemove:
                     let page = try await service.removeRegion(
                         workspaceID: requiredUUID(arguments, "workspace_id"),
                         pageID: requiredUUID(arguments, "page_id"),
@@ -394,8 +402,6 @@ struct MangaKitchenMCPServer {
                     )
                     return try success("對話區域已移除並更新專案資料。", page)
 
-                default:
-                    return .init(content: [.text(text: "未知工具：\(request.name)", annotations: nil, _meta: nil)], isError: true)
                 }
             } catch is CancellationError {
                 return .init(content: [.text(text: "操作已取消。", annotations: nil, _meta: nil)], isError: true)
@@ -1113,7 +1119,7 @@ struct MangaKitchenMCPServer {
 
         return [
             Tool(
-                name: "mangakitchen.contract.describe",
+                name: MCPToolName.contractDescribe.rawValue,
                 title: "讀取 MCP 契約",
                 description: "讀取目前契約版本、座標系、限制、nullable 欄位、工具與不變量。",
                 inputSchema: objectSchema([:], required: []),
@@ -1121,7 +1127,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.workspace.list",
+                name: MCPToolName.workspaceList.rawValue,
                 title: "列出漫畫工作區",
                 description: "列出目前 MCP process 內已開啟的所有目錄專案與頁面狀態。",
                 inputSchema: objectSchema([:], required: []),
@@ -1129,7 +1135,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.workspace.open",
+                name: MCPToolName.workspaceOpen.rawValue,
                 title: "開啟漫畫工作區",
                 description: "遞迴掃描來源目錄並建立頁面列表；App 會自行載入既有專案資料。",
                 inputSchema: objectSchema([
@@ -1141,7 +1147,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.workspace.pages",
+                name: MCPToolName.workspacePages.rawValue,
                 title: "列出待處理頁面",
                 description: "唯讀頁面狀態摘要。next_action 與 nextActionInstruction 只描述缺少的產物，不是要求 Agent 自行迴圈、清理或重做資料；必須依步驟順序補齊產物。",
                 inputSchema: objectSchema([
@@ -1157,7 +1163,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.workspace.activate",
+                name: MCPToolName.workspaceActivate.rawValue,
                 title: "切換目前工作區",
                 description: "將指定 workspace_id 設為 current resource 使用的專案；其他工具仍可直接傳入任一 workspace_id。",
                 inputSchema: objectSchema(["workspace_id": workspaceID], required: ["workspace_id"]),
@@ -1165,7 +1171,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.workspace.rescan",
+                name: MCPToolName.workspaceRescan.rawValue,
                 title: "重新掃描來源",
                 description: "重新遞迴掃描來源目錄，保留路徑相同頁面的既有狀態。",
                 inputSchema: objectSchema(["workspace_id": workspaceID], required: ["workspace_id"]),
@@ -1173,7 +1179,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.workspace.set_output",
+                name: MCPToolName.workspaceSetOutput.rawValue,
                 title: "設定輸出目錄",
                 description: "設定最終圖片輸出位置並同步專案狀態；輸出不可位於來源目錄內。",
                 inputSchema: objectSchema([
@@ -1184,7 +1190,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.workspace.configure",
+                name: MCPToolName.workspaceConfigure.rawValue,
                 title: "設定漫畫工作流",
                 description: "調整目標語言、閱讀順序、預設排字方向、字型、遮罩擴張、圖生圖修補與區域來源。未指定 reading_direction 時預設為 rightToLeft（由右至左）。",
                 inputSchema: objectSchema([
@@ -1205,7 +1211,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.model.load",
+                name: MCPToolName.modelLoad.rawValue,
                 title: "載入本機模型",
                 description: "從含 mangakitchen-model.json 的本機目錄載入模型。MCP 翻譯由多模態 Agent 提供；本機 imageColorization 模型供 page.colorize 使用。模型載入不會自動執行工作流步驟。",
                 inputSchema: objectSchema([
@@ -1215,7 +1221,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.inspect",
+                name: MCPToolName.pageInspect.rawValue,
                 title: "檢查頁面",
                 description: "讀取完整頁面、產物、可用操作與 opaque revision；所有後續寫入都必須回傳此 revision。",
                 inputSchema: objectSchema([
@@ -1226,7 +1232,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.update",
+                name: MCPToolName.pageUpdate.rawValue,
                 title: "更新頁面資料",
                 description: "以 optimistic concurrency 更新頁面標題或一基準頁序；revision 不符時整筆拒絕。",
                 inputSchema: objectSchema([
@@ -1240,7 +1246,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.prepare_agent_task",
+                name: MCPToolName.pagePrepareAgentTask.rawValue,
                 title: "準備單頁 Agent 工作包",
                 description: "多模態步驟三入口。只封裝 App 已完成的步驟二區域、像素遮罩與去字背景，再一次回傳內嵌 regionData JSON 與原圖 image content；缺少任一前置產物時會停止並要求先回 App 完成步驟二。其中既有 sourceText／translatedText 是需要對照原圖校稿的草稿，既有排版欄位也可由 Agent 修正。Agent 必須讀取附帶原圖，不得降級成純文生文，也不得搜尋 .str 檔案、讀取額外 page resource、自行偵測或重建區域。",
                 inputSchema: objectSchema([
@@ -1251,7 +1257,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.submit_agent_result",
+                name: MCPToolName.pageSubmitAgentResult.rawValue,
                 title: "完成翻譯與排字預覽",
                 description: "步驟三：一次接收本頁全部既有 region_id 的原文、譯文與排版，保留 App 步驟二產物並建立翻譯排字預覽；不會儲存最終輸出。陣列必須完整，不可新增、刪除、合併或修改區域與遮罩。",
                 inputSchema: objectSchema([
@@ -1269,7 +1275,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.render",
+                name: MCPToolName.pageRender.rawValue,
                 title: "儲存頁面輸出",
                 description: "步驟四：只把步驟三已完成的翻譯排字預覽儲存到輸出目錄；不重新排字、翻譯、修補背景或重建遮罩。",
                 inputSchema: objectSchema([
@@ -1281,7 +1287,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.colorize",
+                name: MCPToolName.pageColorize.rawValue,
                 title: "建立上色預覽",
                 description: "上色步驟三：使用已載入的 imageColorization 模型立即建立預覽。輸入優先採用已存在的翻譯輸出，否則回退來源圖片；不會隱式執行翻譯或輸出。DDColor 目前不支援色彩範圍與上色模式調參。",
                 inputSchema: objectSchema([
@@ -1293,7 +1299,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.prepare_colorization_task",
+                name: MCPToolName.pagePrepareColorizationTask.rawValue,
                 title: "準備 Agent 上色工作包",
                 description: "上色步驟三的 Agent 入口：一次回傳工作包 JSON、實際上色輸入圖片與反對話框遮罩圖片。輸入優先使用既有翻譯輸出，否則回退來源圖片。此工具不執行 DDColor，也不修改頁面 revision。",
                 inputSchema: objectSchema([
@@ -1304,7 +1310,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.submit_colorization_result",
+                name: MCPToolName.pageSubmitColorizationResult.rawValue,
                 title: "回寫 Agent 上色結果",
                 description: "一次回寫 Agent 產生的完整頁面圖片並建立上色步驟三預覽。結果必須符合工作包像素尺寸，接受 PNG、JPEG、HEIC、TIFF 或 WebP Base64；App 會驗證並正規化為 PNG。此工具不寫入最終輸出。",
                 inputSchema: objectSchema([
@@ -1334,7 +1340,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.render_colorization",
+                name: MCPToolName.pageRenderColorization.rawValue,
                 title: "儲存上色輸出",
                 description: "上色步驟四：只把既有上色預覽儲存到輸出目錄，不重新執行 DDColor、翻譯或遮罩計算。",
                 inputSchema: objectSchema([
@@ -1346,7 +1352,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.page.reset_colorization",
+                name: MCPToolName.pageResetColorization.rawValue,
                 title: "清除本頁上色流程",
                 description: "清除本頁上色遮罩畫筆、預覽、輸出與獨立進度；保留來源圖、翻譯產物及對話區域。",
                 inputSchema: objectSchema([
@@ -1358,7 +1364,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.region.batch_update",
+                name: MCPToolName.regionBatchUpdate.rawValue,
                 title: "批次更新區域",
                 description: "先驗證完整批次，再一次套用 1...64 個 partial patch；任一筆無效時不寫入任何資料。",
                 inputSchema: objectSchema([
@@ -1376,7 +1382,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.region.reorder",
+                name: MCPToolName.regionReorder.rawValue,
                 title: "重排區域順序",
                 description: "以完整 region_id 陣列原子更新閱讀與 PSD 圖層順序。",
                 inputSchema: objectSchema([
@@ -1395,7 +1401,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.glossary.list",
+                name: MCPToolName.glossaryList.rawValue,
                 title: "列出專有名詞表",
                 description: "讀取指定工作區的一詞對多語言專有名詞對照。",
                 inputSchema: objectSchema(["workspace_id": workspaceID], required: ["workspace_id"]),
@@ -1403,7 +1409,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.glossary.upsert",
+                name: MCPToolName.glossaryUpsert.rawValue,
                 title: "新增或更新專有名詞",
                 description: "新增詞條，或以 entry_id 更新原詞、備註及完整的多語譯詞映射。",
                 inputSchema: objectSchema([
@@ -1417,7 +1423,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.glossary.remove",
+                name: MCPToolName.glossaryRemove.rawValue,
                 title: "移除專有名詞",
                 description: "從指定工作區移除一筆專有名詞詞條。",
                 inputSchema: objectSchema([
@@ -1428,7 +1434,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             workflowTool(
-                name: "mangakitchen.page.detect_masks",
+                name: MCPToolName.pageDetectMasks.rawValue,
                 title: "重建像素遮罩",
                 description: "步驟二，預設由 App 以內建 Manga109 Core ML 重新偵測氣泡 BBOX／形狀，再依原圖像素產生文字遮罩。完成後請讀取頁面區域與原圖，由 Agent 在步驟三抽取原文、翻譯並以 region.update 回傳文字及排版。明確使用 region_source=agent 時，此工具只重建已提交粗框的系統遮罩。Agent 不提交 mask_polygons。",
                 workspaceID: workspaceID,
@@ -1436,7 +1442,7 @@ struct MangaKitchenMCPServer {
                 annotations: idempotent
             ),
             Tool(
-                name: "mangakitchen.page.supplement_regions",
+                name: MCPToolName.pageSupplementRegions.rawValue,
                 title: "由 Agent 補完文字區域",
                 description: "補充遺漏區域或支援明確設定 region_source=agent 的相容後備。預設流程不要用它取代 page.detect_masks；App 應先用內建 Manga109 Core ML 建立氣泡區域與像素遮罩。需要補充時，Agent 可提交涵蓋完整原文的粗框及原文，後端仍負責產生與驗證遮罩，Agent 不提交 mask_polygons。",
                 inputSchema: objectSchema([
@@ -1454,7 +1460,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             workflowTool(
-                name: "mangakitchen.page.translate",
+                name: MCPToolName.pageTranslate.rawValue,
                 title: "翻譯對話文字",
                 description: "MCP 的步驟三由 Agent 接手，此相容工具不會呼叫 App 內建圖生文模型。請改用 page.prepare_agent_task 與 page.submit_agent_result 完成翻譯排字預覽。",
                 workspaceID: workspaceID,
@@ -1462,7 +1468,7 @@ struct MangaKitchenMCPServer {
                 annotations: idempotent
             ),
             workflowTool(
-                name: "mangakitchen.page.compose",
+                name: MCPToolName.pageCompose.rawValue,
                 title: "合成翻譯頁面",
                 description: "步驟四相容入口：只把既有步驟三翻譯排字預覽儲存成輸出圖片，不會修補背景、重新排字、重跑 detect_masks 或 translate。",
                 workspaceID: workspaceID,
@@ -1470,7 +1476,7 @@ struct MangaKitchenMCPServer {
                 annotations: idempotent
             ),
             workflowTool(
-                name: "mangakitchen.page.run_full",
+                name: MCPToolName.pageRunFull.rawValue,
                 title: "一鍵處理完整頁",
                 description: "相容的一鍵入口；只在步驟二與步驟三預覽都已完成時儲存輸出，不會自動重跑 detect_masks、翻譯或排字。缺少資料時請依錯誤提示補正後再執行。",
                 workspaceID: workspaceID,
@@ -1478,7 +1484,7 @@ struct MangaKitchenMCPServer {
                 annotations: idempotent
             ),
             Tool(
-                name: "mangakitchen.region.create",
+                name: MCPToolName.regionCreate.rawValue,
                 title: "新增對話區域",
                 description: "新增一個可編輯文字與遮罩的區域。",
                 inputSchema: objectSchema([
@@ -1490,7 +1496,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.region.update",
+                name: MCPToolName.regionUpdate.rawValue,
                 title: "更新對話區域",
                 description: "逐區寫入 Agent 抽取的原文、譯文、落點、字型、字級、字重、排字方向、對齊、顏色、描邊、透明度、旋轉與可見性。只要沒有修改 bounds 或 bubble_bounds，就直接保留步驟二已完成的像素遮罩；只有修改遮罩幾何時才會重建遮罩。",
                 inputSchema: objectSchema([
@@ -1519,7 +1525,7 @@ struct MangaKitchenMCPServer {
                 outputSchema: genericOutputSchema
             ),
             Tool(
-                name: "mangakitchen.region.remove",
+                name: MCPToolName.regionRemove.rawValue,
                 title: "移除對話區域",
                 description: "移除指定的對話區域、其文字映射與遮罩筆劃。",
                 inputSchema: objectSchema([

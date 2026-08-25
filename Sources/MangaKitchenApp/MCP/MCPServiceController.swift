@@ -20,9 +20,8 @@ final class MCPServiceController: ObservableObject {
     private var serviceTask: Task<Void, Never>?
     private var configurationTask: Task<Void, Never>?
     private var allowedClients: [String]
-    private var imageCompositingBackend: ImageCompositingBackend
     private let portOverride: Int?
-    private let dataDirectoryPath: String?
+    private let runtimeEnvironment: MangaKitchenRuntimeEnvironment?
     private let stateChangeHandler: MCPWorkflowService.StateChangeHandler
     private let stateProvider: MCPWorkflowService.StateProvider
 
@@ -31,16 +30,13 @@ final class MCPServiceController: ObservableObject {
         port: Int,
         portOverride: Int?,
         allowedClients: [String],
-        dataDirectoryPath: String?,
-        imageCompositingBackend: ImageCompositingBackend,
         store: AppStore
     ) {
         self.enabled = enabled
         self.port = port
         self.portOverride = portOverride
         self.allowedClients = allowedClients
-        self.dataDirectoryPath = dataDirectoryPath
-        self.imageCompositingBackend = imageCompositingBackend
+        runtimeEnvironment = store.runtimeEnvironment
         stateChangeHandler = { @MainActor [weak store] state in
             await store?.applyMCPState(state)
         }
@@ -53,15 +49,13 @@ final class MCPServiceController: ObservableObject {
     func configure(
         enabled: Bool,
         port: Int,
-        allowedClients: [String],
-        imageCompositingBackend: ImageCompositingBackend
+        allowedClients: [String]
     ) {
         let effectivePort = portOverride ?? port
         let normalizedClients = MCPClientAllowlist.normalizedEntries(allowedClients)
         guard enabled != self.enabled
                 || effectivePort != self.port
-                || normalizedClients != self.allowedClients
-                || imageCompositingBackend != self.imageCompositingBackend else { return }
+                || normalizedClients != self.allowedClients else { return }
         self.enabled = enabled
         configurationTask?.cancel()
         configurationTask = Task { [weak self] in
@@ -70,7 +64,6 @@ final class MCPServiceController: ObservableObject {
             guard !Task.isCancelled else { return }
             self.port = effectivePort
             self.allowedClients = normalizedClients
-            self.imageCompositingBackend = imageCompositingBackend
             if enabled { self.start() }
             self.configurationTask = nil
         }
@@ -102,11 +95,13 @@ final class MCPServiceController: ObservableObject {
         serviceTask = Task { [weak self] in
             guard let self else { return }
             do {
+                guard let runtimeEnvironment else {
+                    throw MCPServiceError.runtimeUnavailable
+                }
                 let host = try MangaKitchenMCPServer.makeHTTPHost(
                     port: port,
                     allowedClients: allowedClients,
-                    dataDirectoryPath: dataDirectoryPath,
-                    imageCompositingBackend: imageCompositingBackend,
+                    runtimeEnvironment: runtimeEnvironment,
                     stateChangeHandler: stateChangeHandler,
                     stateProvider: stateProvider
                 )

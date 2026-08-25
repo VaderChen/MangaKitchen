@@ -33,3 +33,5 @@ uv run python benchmark_coreml.py
 - `benchmark_coreml.py`：分別鎖定 Auto、ANE、GPU/Metal 與 CPU，輸出 warm latency 和 Core ML Compute Plan。
 
 完整結果請見 [REPORT.md](REPORT.md)。
+
+候選模型與 Medium 轉換路徑的比較請見 [OCR_CANDIDATE_EVALUATION.md](OCR_CANDIDATE_EVALUATION.md)。

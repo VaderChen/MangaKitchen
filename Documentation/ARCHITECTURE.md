@@ -85,6 +85,14 @@ Project
 
 ## Target 責任
 
+### MangaKitchenApplication
+
+- 只依賴 `MangaKitchenCore`，保存 GUI、MCP 與未來 CLI 共用的業務規則。
+- `WorkflowArtifactState` 統一判斷遮罩、翻譯預覽、上色預覽與最終輸出是否完整，入口層不得各自複製檔案狀態判斷。
+- `PageWorkflowProgress` 統一把各處理階段映射成頁面總進度。
+- `OutputDirectoryPolicy` 統一來源與輸出目錄的安全邊界。
+- 此層不依賴 AppKit、WebKit、Metal、Core ML、MLX、MCP SDK 或 SwiftNIO。
+
 ### MangaKitchenCore
 
 - 不依賴 AppKit、Metal 或 WebKit。
@@ -113,7 +121,7 @@ Project
 - `SoundEffectRegionDetecting`：預留給未來狀聲字流程的獨立契約，只能掃描既有對話區域之外的畫面；目前 `ComicTranslationPipeline` 不持有、不呼叫，也不把結果混入對話遮罩。
 - 外部 MCP Agent：翻譯的 `prepare_agent_task` 只在 App 步驟二區域、遮罩與去字背景均完成時，一次傳送指定頁原圖與完整遮罩 JSON；Agent 依既有 `region_id` 抽取原文、翻譯及排版，再由 `submit_agent_result` 建立步驟三預覽。上色的 `prepare_colorization_task` 則一次傳送實際上色輸入與反對話框遮罩，`submit_colorization_result` 驗證尺寸、正規化 PNG 並重新套用保護遮罩。兩條流程都只有在使用者要求輸出時才呼叫各自的 render 工具。
 - `MangaTextMaskRefiner`：先分析 Core ML BBOX 或 Agent 粗框；若已知 `bubbleMaskPolygons`，會先以氣泡形狀篩選元件。搜尋範圍不會直接成為遮罩，最後以 Otsu 閾值及八鄰域連通元件取得字形像素，並在像素層執行抗鋸齒遲滯與固定像素膨脹，再合併成二值遮罩矩形，避免向量描邊造成灰階毛邊；`bounds` 同步縮到未膨脹的字形外框。暗色背景上的亮字由系統覆蓋檢查回報，必要時由使用者在 App 內以畫筆修正。
-- `VLMRegionTranslationService`：GUI 固定接多模態 `imageToText` runtime，將整頁已確認的來源文字與圖片語境依閱讀順序送入模型；若回覆遺漏 UUID，只執行一次有界補翻並保留已成功結果，避免 timeout／fallback 重複翻譯。`TextOnlyImageToTextAdapter` 僅保留底層相容用途，不是可選 GUI 路徑。二次整頁校稿為可選且預設關閉，UI 會明確標示校稿階段；取消例外向外拋出以停止整體工作。
+- `VLMRegionTranslationService`：GUI 固定接多模態 `imageToText` runtime，將整頁已確認的來源文字與圖片語境依閱讀順序送入模型；若回覆遺漏 UUID，只執行一次有界補翻並保留已成功結果，避免 timeout／fallback 重複翻譯。`TextOnlyImageToTextAdapter` 僅保留底層相容用途，不是可選 GUI 路徑。二次整頁校稿為可選且預設關閉；啟用時先透過 `DraftRegionTranslating` 提交初稿，由 App 寫入 `.str`、專案快照與排版預覽，再以一次整頁請求校正既有譯文。校稿不得重新抽取 `sourceText` 或逐區重翻，取消時也不回滾已提交初稿。
 - `TranslationQualityOptions`：專案級控制整頁語境、可選二次校稿、QA、直譯稿保存、忠實／平衡／精簡長度策略與 4,000 字元風格指南。結果保存 `literalTranslatedText`、`speakerID`、`tone`、`translationConfidence` 與 `translationQAFlags`，人工改寫顯示譯文時會清除已過期的信心與 QA。
 - `CPUBubbleCleaner`／`MetalBubbleCleaner`：步驟二的傳統去字後端。`eraseColorHex == AUTO` 時由修補器估算底紙色；指定固定底紙色時由 CPU 精確填色，並清除遮罩外兩像素內的近底色 JPEG／掃描 halo。同一文字區域的斷開筆畫共用單一底色，避免紙紋取樣變成字形斑點。
 - `HTMLDialogueTypesetter`：將步驟三保存的 `translationBounds`、`translationAnchor`、字型、固定／自動字級、粗細及橫排／直排設定交給 WebKit；自動方向優先採用字形排列偵測結果，氣泡排版優先使用完全位於 `bubbleMaskPolygons` 內的 `bubbleLayoutBounds`。使用與 WebUI 相同的 HTML/CSS 與自動縮字演算法渲染背景及文字層，再輸出原圖像素尺寸的 PNG。GUI、批次與 MCP 共用此排版器，不再存在另一套 Core Text 輸出規則。
@@ -121,7 +129,11 @@ Project
 
 ### MangaKitchenApp
 
-- `AppStore`：多專案切換、作用中頁面、頁面複選及單一 GPU 批次工作佇列；分開維護翻譯與上色的步驟、預覽、輸出、遮罩畫筆與清除重來狀態。偏好模型只保存路徑，實際推論前才延遲載入；大型模型載入前讀取 RAM 使用率，必要時釋放其他 capability。步驟二不因文字模型缺席而改用全黑遮罩。
+- `MangaKitchenRuntimeEnvironment`：程序內唯一的組合根。GUI 與 MCP 共用同一個 `MetalContext`、`ModelRuntimeHub`、內建 Core ML runtime、`HTMLDialogueTypesetter`、工作流程 Pipeline 與 `Artifacts` 根目錄；MCP 不得自行建立第二套推論環境。
+- `AppStore`：協調多專案切換、作用中頁面、頁面複選及單一 GPU 批次工作佇列；翻譯與上色的步驟、預覽、輸出及清除重來狀態維持分離。偏好模型只保存路徑，實際推論前才延遲載入；大型模型載入前讀取 RAM 使用率，必要時釋放其他 capability。步驟二不因文字模型缺席而改用全黑遮罩。
+- `AppEditingHistory`：獨立保存遮罩畫筆、上色遮罩與文字區域的 undo／redo 歷程，以及遮罩 revision。切換、清除或重設專案／頁面時由 `AppStore` 明確清除對應歷程，歷程物件不修改頁面、不執行推論也不負責持久化。
+- `AppBatchWorkflowCoordinator`：擁有單一序列批次 Task、工作去重、queued／running／completed／cancelled 狀態轉移及逐頁失敗紀錄；實際 OCR、翻譯、上色與輸出動作由 `AppStore` 以閉包注入，因此佇列本身不依賴特定工作流程。
+- `AppModelLifecycleCoordinator`：管理 capability 偏好路徑、延遲載入、模型身分重用、Think Mode runtime 更新與 unified-memory 壓力卸載；下載進度與專案模型路徑持久化仍由 `AppStore` 負責。
 - `ApplicationLogStore`／`ModelReasoningStreamStore`：分開保存一般診斷與 transient reasoning。前者只存在記憶體且可清除；後者不進 LOG、不持久化，透過 `HybridBridgeController` 的 transient state 單獨更新 THINK 節點。
 - `SystemMetricsReader`：週期讀取 GPU 與 unified-memory 使用率；和畫布解析度／倍率一起只更新狀態列節點，不觸發 `AppStore.objectWillChange` 或重建編輯器 DOM。
 - `AppPreferencesController`：保存全域介面、色系、畫布框選顏色、資料位置、預設輸出根目錄、`imageToText`／`imageColorization`／`superResolution` 偏好模型與 MCP 網路設定；不寫入個別漫畫專案。
@@ -130,7 +142,9 @@ Project
 - `FontFamilyCatalog`：列出系統已安裝字型並提供 WebUI 預覽；專案預設字型變更時只同步仍使用舊預設值的區域，不覆蓋人工選字。
 - `GitHubReleaseChecker`：啟動時與「關於」頁手動檢查共用同一個 GitHub latest stable release 查詢與版本比較。對外開啟只允許官方 repository 根路徑與 Releases 子路徑，不自動下載或安裝。
 - `HTMLDialogueTypesetter`／`PSDExporter`：以相同 HTML/CSS 分別產生合併圖與透明文字 Raster Layer，再封裝為 PSD；SR 頁面依放大後實際尺寸渲染。
-- `HybridBridgeController`：白名單方式分派 WebUI 命令。
+- `HybridBridgeController`：負責 WebKit 狀態推送、生命週期與以 `WebBridgeMethod` 白名單分派命令；未知字串不會進入業務處理。
+- `WebBridgeCommandHandler`：擁有完整 `WebBridgeMethod` 白名單 switch，將命令分派至 `AppStore` 或控制器提供的原生能力；`HybridBridgeController` 不再同時負責 JSON-RPC transport 與業務命令路由。
+- `WebBridgeParameterDecoder`／`WebBridgePanelService`：前者統一把 JavaScript 弱型別參數轉成領域型別並檢查正規化座標，後者集中建立原生檔案／目錄選擇器；兩者都不執行 AppStore 業務流程。
 - `i18n.js`：管理 `AUTO`、`zh-Hant`、`en`、`ja`、`ko` 五種介面選項；WebUI local storage 作為啟動畫面快取，Swift 全域偏好是持久化來源，AUTO 依 WebKit/macOS 語言解析，未支援語言回退英文。
 - `NativeLocalization`：接收 WebUI 已解析的介面語言，讓原生目錄面板與 MCP menu bar 使用相同語言；介面語言屬於 App 全域偏好，不寫入個別漫畫專案，也不改變翻譯的 `targetLanguageCode`。
 - `TargetLanguageResolver`：AUTO 中文只有在語系明確含 `Hans`／`CN`／`SG` 時選簡體；`Hant`／`TW`／`HK`／`MO` 與資訊不足的 `zh` 均選繁體。翻譯寫入前另以 ICU 對 `zh-Hant`／`zh-Hans` 做 script 正規化，避免模型忽略 BCP-47 指示。
@@ -141,6 +155,9 @@ Project
 
 ### MangaKitchen MCP 模式
 
+- 每次工具操作前由 App 的最新專案快照更新工作內容，完成後再回寫 App；模型、Metal 與 Artifacts 則直接使用共用 `MangaKitchenRuntimeEnvironment`，不透過快照複製。
+- `MCPWorkflowService` 只協調目前作用中的工作區與頁面工作流；`MCPWorkspaceRegistry` 獨立保存多工作區快照索引、標準化來源路徑查找與名稱查詢，避免工作流服務直接操作字典儲存細節。
+- `MCPPageContractPresenter`：集中建立 page task、inspection、mutation result、resource JSON／MIME 表示及 opaque revision；工作流 actor 不再複製契約呈現與 optimistic concurrency 雜湊規則。
 - 使用官方 Swift MCP SDK 與標準 Streamable HTTP transport，監聽 `0.0.0.0`；預設 port 為 `12080`。
 - 每個 HTTP request 都以 TCP socket 的實際來源 IP 檢查 IPv4／IPv6／CIDR 白名單，不採信可偽造的轉送標頭；空白名單拒絕所有連線。
 - Tools 對應多工作區管理與單頁 Agent 工作包；翻譯以 `prepare_agent_task`／`submit_agent_result` 建立步驟三預覽，上色以 `prepare_colorization_task`／`submit_colorization_result` 建立獨立預覽，各自只有 `page.render`／`page.render_colorization` 才儲存步驟四輸出。Resources 提供工作區列表、目前工作區、頁面、原圖、系統遮罩、翻譯與上色產物供診斷；Agent 不需讀取 sidecar。
@@ -149,7 +166,7 @@ Project
 - 不建立第二個 executable；`MangaKitchen` 永遠啟動 GUI，MCP 開關、port 與白名單由全域設定管理，`--mcp=on|off` 與 `--mcp-port` 可覆寫本次啟動。
 - MCP 開啟時建立 macOS menu bar 狀態項目。主視窗關閉後 process 與 MCP 繼續運作，並可從 menu bar 重新開啟視窗或完整結束 App。
 - MCP JSON-RPC 僅存在 `MangaKitchenApp/MCP` adapter 目錄；模型 Runtime 與 Pipeline 不依賴 MCP。
-- MCP tool 名稱統一使用 `mangakitchen.*`，resource URI 使用 `mangakitchen://`。
+- MCP tool 名稱由 `MCPToolName` 集中定義並統一使用 `mangakitchen.*`，router 與 tool schema 共用相同 raw value；resource URI 使用 `mangakitchen://`。
 - 以標準 session header 管理 HTTP session；MCP process 可保留多個目錄工作區，工具參數仍顯式傳遞 `workspace_id`，避免操作依賴目前顯示中的專案。
 
 完整方法、`.str` schema 與 MCP URI 請見 [WORKFLOW_API.md](WORKFLOW_API.md)。

@@ -28,6 +28,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
     private var availableUpdate: GitHubReleaseUpdate?
     private var manualUpdateCheck: WebUpdateCheckState?
     private var pageReady = false
+    private lazy var commandHandler = WebBridgeCommandHandler(controller: self)
 
     init(
         preferences: AppPreferencesController,
@@ -128,378 +129,67 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
     }
 
-    private func handle(method: String, params: [String: Any]) throws -> Any? {
-        switch method {
-        case "bootstrap":
-            pushState()
-            startUpdateCheckIfNeeded()
-            return nil
-        case "getApplicationLogs":
-            let formatter = ISO8601DateFormatter()
-            return store.applicationLog.entries.map { entry in
-                [
-                    "id": entry.id.uuidString,
-                    "timestamp": formatter.string(from: entry.timestamp),
-                    "level": entry.level.rawValue,
-                    "category": entry.category,
-                    "message": entry.message,
-                ]
-            }
-        case "clearApplicationLogs":
-            store.applicationLog.clear()
-            return nil
-        case "appendApplicationLog":
-            guard let message = params["message"] as? String else {
-                throw BridgeError.invalidParameters
-            }
-            let level = (params["level"] as? String).flatMap(RuntimeLogLevel.init(rawValue:))
-                ?? .error
-            store.applicationLog.append(
-                level,
-                category: params["category"] as? String ?? "WebUI",
-                message: message
-            )
-            return nil
-        case "openExternalURL":
-            try openExternalURL(params)
-            return nil
-        case "checkForUpdates":
-            startManualUpdateCheck()
-            return nil
-        case "updateInterfaceLanguage":
-            guard let setting = params["setting"] as? String,
-                  AppPreferences.supportedInterfaceLanguages.contains(setting),
-                  let languageCode = params["resolvedLanguage"] as? String,
-                  let normalized = NativeLocalization.normalizedLanguageCode(languageCode) else {
-                throw BridgeError.invalidParameters
-            }
-            preferences.setInterfaceLanguage(setting)
-            interfaceLanguageCode = normalized
-            return nil
-        case "updateGlobalSettings":
-            try updateGlobalSettings(params)
-            return nil
-        case "chooseDataDirectory":
-            return chooseDirectory(
-                title: localized("dataDirectoryPanelTitle"),
-                prompt: localized("choose")
-            )
-        case "chooseDefaultOutputDirectory":
-            return chooseDirectory(
-                title: localized("outputPanelTitle"),
-                prompt: localized("choose")
-            )
-        case "choosePreferredModelDirectory":
-            return try choosePreferredModelDirectory(params)
-        case "chooseModelDownloadDirectory":
-            return try chooseModelDownloadDirectory(params)
-        case "downloadPreferredModel":
-            try downloadPreferredModel(params)
-            return nil
-        case "deleteInstalledModel":
-            try deleteInstalledModel(params)
-            return nil
-        case "importPages", "chooseSourceDirectory":
-            chooseSourceDirectory()
-            return nil
-        case "appendPages":
-            chooseAdditionalPages()
-            return nil
-        case "exportPSD":
-            try exportPSD(params)
-            return nil
-        case "switchProject":
-            guard let projectID = uuid(params["projectID"]) else {
-                throw BridgeError.invalidParameters
-            }
-            store.activateProject(projectID)
-            return nil
-        case "deleteProject":
-            guard let projectID = uuid(params["projectID"]) else {
-                throw BridgeError.invalidParameters
-            }
-            store.deleteProject(projectID)
-            return nil
-        case "renameProject":
-            guard let name = params["name"] as? String else {
-                throw BridgeError.invalidParameters
-            }
-            store.renameActiveProject(name)
-            return nil
-        case "rescanSourceDirectory":
-            store.rescanSourceDirectory()
-            return nil
-        case "resetPages":
-            guard let rawPageIDs = params["pageIDs"] as? [String] else {
-                throw BridgeError.invalidParameters
-            }
-            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
-            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
-            store.resetPages(pageIDs)
-            return nil
-        case "renamePage":
-            guard let pageID = uuid(params["pageID"]),
-                  let name = params["name"] as? String else {
-                throw BridgeError.invalidParameters
-            }
-            store.renamePage(pageID: pageID, name: name)
-            return nil
-        case "movePage":
-            guard let pageID = uuid(params["pageID"]),
-                  let offset = (params["offset"] as? NSNumber)?.intValue else {
-                throw BridgeError.invalidParameters
-            }
-            store.movePage(pageID: pageID, offset: offset)
-            return nil
-        case "removePages":
-            guard let rawPageIDs = params["pageIDs"] as? [String] else {
-                throw BridgeError.invalidParameters
-            }
-            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
-            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
-            store.removePages(pageIDs)
-            return nil
-        case "chooseOutputDirectory":
-            return chooseOutputDirectory()
-        case "chooseModel":
-            chooseModelDirectory()
-            return nil
-        case "selectPage":
-            guard let id = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
-            store.selectPage(id)
-            return nil
-        case "setPageSelection":
-            guard let rawPageIDs = params["pageIDs"] as? [String] else {
-                throw BridgeError.invalidParameters
-            }
-            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
-            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
-            store.setPageSelection(
-                pageIDs: pageIDs,
-                activePageID: uuid(params["activePageID"])
-            )
-            return nil
-        case "selectAllPages":
-            store.selectAllPages()
-            return nil
-        case "clearPageSelection":
-            store.clearPageSelection()
-            return nil
-        case "clearPages":
-            store.clearPages()
-            return nil
-        case "updateSettings":
-            try updateSettings(params)
-            return nil
-        case "samplePageColor":
-            return try samplePageColor(params)
-        case "upsertGlossaryEntry":
-            return try upsertGlossaryEntry(params)
-        case "removeGlossaryEntry":
-            guard let entryID = uuid(params["entryID"]) else {
-                throw BridgeError.invalidParameters
-            }
-            store.removeGlossaryEntry(entryID)
-            return nil
-        case "detectMasksAll":
-            store.detectMasksForAllPages()
-            return nil
-        case "detectMasksSelected":
-            store.detectMasksForSelectedPage()
-            return nil
-        case "translateAll":
-            store.translateAllPages()
-            return nil
-        case "translateSelected":
-            store.translateSelectedPage()
-            return nil
-        case "composeAll":
-            store.composeAllPages()
-            return nil
-        case "composeSelected":
-            store.composeSelectedPage()
-            return nil
-        case "superResolveSelected":
-            store.superResolveSelectedPage()
-            return nil
-        case "processAll":
-            store.processAllPages()
-            return nil
-        case "processSelected":
-            store.processSelectedPage()
-            return nil
-        case "runBatch":
-            guard let rawOperation = params["operation"] as? String,
-                  let operation = BatchOperation(rawValue: rawOperation),
-                  let rawPageIDs = params["pageIDs"] as? [String] else {
-                throw BridgeError.invalidParameters
-            }
-            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
-            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
-            let jobID = store.enqueueBatch(
-                operation: operation,
-                pageIDs: pageIDs,
-                forceRecalculation: params["forceRecalculation"] as? Bool ?? false
-            )
-            return jobID.map { ["jobID": $0.uuidString] } ?? [:]
-        case "cancelProcessing":
-            store.cancelProcessing()
-            return nil
-        case "retryFailedBatchJob":
-            guard let jobID = uuid(params["jobID"]) else { throw BridgeError.invalidParameters }
-            store.retryFailedBatchJob(jobID)
-            return nil
-        case "clearFinishedBatchJobs":
-            store.clearFinishedBatchJobs()
-            return nil
-        case "cancelModelDownload":
-            store.cancelModelDownload()
-            return nil
-        case "createRegion", "createMaskRegion":
-            return try createRegion(params)
-        case "duplicateRegion":
-            return try duplicateRegion(params)
-        case "appendMaskStroke":
-            try appendMaskStroke(params)
-            return nil
-        case "undoMaskStroke":
-            try undoMaskStroke(params)
-            return nil
-        case "redoMaskStroke":
-            try redoMaskStroke(params)
-            return nil
-        case "appendColorizationMaskStroke":
-            try appendColorizationMaskStroke(params)
-            return nil
-        case "undoColorizationMaskStroke":
-            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
-            store.undoColorizationMaskStroke(pageID: pageID)
-            return nil
-        case "redoColorizationMaskStroke":
-            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
-            store.redoColorizationMaskStroke(pageID: pageID)
-            return nil
-        case "resetColorizationPages":
-            guard let rawPageIDs = params["pageIDs"] as? [String] else {
-                throw BridgeError.invalidParameters
-            }
-            let pageIDs = rawPageIDs.compactMap(UUID.init(uuidString:))
-            guard pageIDs.count == rawPageIDs.count else { throw BridgeError.invalidParameters }
-            store.resetColorizationPages(pageIDs)
-            return nil
-        case "undoRegionEdit":
-            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
-            store.undoRegionEdit(pageID: pageID)
-            return nil
-        case "redoRegionEdit":
-            guard let pageID = uuid(params["pageID"]) else { throw BridgeError.invalidParameters }
-            store.redoRegionEdit(pageID: pageID)
-            return nil
-        case "removeRegion":
-            try removeRegion(params)
-            return nil
-        case "moveRegion":
-            guard let pageID = uuid(params["pageID"]),
-                  let regionID = uuid(params["regionID"]),
-                  let offset = (params["offset"] as? NSNumber)?.intValue else {
-                throw BridgeError.invalidParameters
-            }
-            store.moveRegion(pageID: pageID, regionID: regionID, offset: offset)
-            return nil
-        case "updateRegion":
-            try updateRegion(params)
-            return nil
-        case "reextractRegion":
-            guard let pageID = uuid(params["pageID"]),
-                  let regionID = uuid(params["regionID"]) else {
-                throw BridgeError.invalidParameters
-            }
-            return ["started": store.reextractRegion(pageID: pageID, regionID: regionID)]
-        case "revealOutput":
-            try revealOutput(params)
-            return nil
-        case "clearStatus":
-            store.statusMessage = nil
-            return nil
-        default:
-            throw BridgeError.unknownMethod(method)
-        }
+
+    func chooseSourceDirectory() {
+        guard let urls = WebBridgePanelService.chooseEntries(
+            title: localized("sourcePanelTitle"),
+            prompt: localized("createProject"),
+            allowsMultipleSelection: true,
+            canChooseFiles: true,
+            canChooseDirectories: true
+        ) else { return }
+        store.importPages(from: urls)
     }
 
-    private func chooseSourceDirectory() {
-        let panel = NSOpenPanel()
-        panel.title = localized("sourcePanelTitle")
-        panel.prompt = localized("createProject")
-        panel.allowsMultipleSelection = true
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        guard panel.runModal() == .OK else { return }
-        store.importPages(from: panel.urls)
+    func chooseAdditionalPages() {
+        guard let urls = WebBridgePanelService.chooseEntries(
+            title: localized("additionalPagesPanelTitle"),
+            prompt: localized("addPages"),
+            allowsMultipleSelection: true,
+            canChooseFiles: true,
+            canChooseDirectories: true
+        ) else { return }
+        store.appendPages(from: urls)
     }
 
-    private func chooseAdditionalPages() {
-        let panel = NSOpenPanel()
-        panel.title = localized("additionalPagesPanelTitle")
-        panel.prompt = localized("addPages")
-        panel.allowsMultipleSelection = true
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        guard panel.runModal() == .OK else { return }
-        store.appendPages(from: panel.urls)
-    }
-
-    private func exportPSD(_ params: [String: Any]) throws {
+    func exportPSD(_ params: [String: Any]) throws {
         let pageIDs = (params["pageIDs"] as? [String])?.compactMap(UUID.init(uuidString:)) ?? Array(store.selectedPageIDs)
         guard !pageIDs.isEmpty else { throw BridgeError.invalidParameters }
-        let panel = NSOpenPanel()
-        panel.title = "選擇 PSD 輸出資料夾"
-        panel.canCreateDirectories = true
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let url = WebBridgePanelService.chooseDirectory(
+            title: "選擇 PSD 輸出資料夾",
+            prompt: localized("choose")
+        ) else { return }
         store.exportPSD(pageIDs: pageIDs, to: url)
     }
 
-    private func chooseOutputDirectory() -> [String: Any]? {
-        let panel = NSOpenPanel()
-        panel.title = localized("outputPanelTitle")
-        panel.prompt = localized("choose")
-        panel.allowsMultipleSelection = false
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        let selectedURL = url.standardizedFileURL
+    func chooseOutputDirectory() -> [String: Any]? {
+        guard let selectedURL = WebBridgePanelService.chooseDirectory(
+            title: localized("outputPanelTitle"),
+            prompt: localized("choose")
+        ) else { return nil }
         store.setOutputDirectory(selectedURL)
         guard store.outputDirectoryURL == selectedURL else { return nil }
         return ["path": selectedURL.path]
     }
 
-    private func chooseModelDirectory() {
-        let panel = NSOpenPanel()
-        panel.title = localized("modelPanelTitle")
-        panel.prompt = localized("loadModel")
-        panel.allowsMultipleSelection = false
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+    func chooseModelDirectory() {
+        guard let url = WebBridgePanelService.chooseDirectory(
+            title: localized("modelPanelTitle"),
+            prompt: localized("loadModel"),
+            canCreateDirectories: false
+        ) else { return }
         store.loadModel(from: url)
     }
 
-    private func chooseDirectory(title: String, prompt: String) -> [String: Any]? {
-        let panel = NSOpenPanel()
-        panel.title = title
-        panel.prompt = prompt
-        panel.allowsMultipleSelection = false
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        return ["path": url.standardizedFileURL.path]
+    func chooseDirectory(title: String, prompt: String) -> [String: Any]? {
+        guard let url = WebBridgePanelService.chooseDirectory(
+            title: title,
+            prompt: prompt
+        ) else { return nil }
+        return ["path": url.path]
     }
 
-    private func choosePreferredModelDirectory(_ params: [String: Any]) throws -> [String: Any]? {
+    func choosePreferredModelDirectory(_ params: [String: Any]) throws -> [String: Any]? {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
               capability != .textToText else {
@@ -524,7 +214,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return selected
     }
 
-    private func chooseModelDownloadDirectory(_ params: [String: Any]) throws -> [String: Any]? {
+    func chooseModelDownloadDirectory(_ params: [String: Any]) throws -> [String: Any]? {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
               [.imageToText, .imageColorization, .superResolution].contains(capability) else {
@@ -555,7 +245,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return selected
     }
 
-    private func downloadPreferredModel(_ params: [String: Any]) throws {
+    func downloadPreferredModel(_ params: [String: Any]) throws {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
               [.imageToText, .imageColorization, .superResolution].contains(capability),
@@ -611,7 +301,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
     }
 
-    private func deleteInstalledModel(_ params: [String: Any]) throws {
+    func deleteInstalledModel(_ params: [String: Any]) throws {
         guard let rawCapability = params["capability"] as? String,
               let capability = ModelCapability(rawValue: rawCapability),
               [.imageToText, .imageColorization, .superResolution].contains(capability),
@@ -674,7 +364,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
     }
 
-    private func updateGlobalSettings(_ params: [String: Any]) throws {
+    func updateGlobalSettings(_ params: [String: Any]) throws {
         guard let interfaceLanguage = params["interfaceLanguage"] as? String,
               AppPreferences.supportedInterfaceLanguages.contains(interfaceLanguage),
               let colorScheme = params["colorScheme"] as? String,
@@ -777,7 +467,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
     }
 
-    private func updateSettings(_ params: [String: Any]) throws {
+    func updateSettings(_ params: [String: Any]) throws {
         var value = store.options
         let previousImageToTextModelPath = preferences.settings.imageToTextModelPath
         if let code = params["targetLanguageCode"] as? String {
@@ -875,7 +565,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         store.setOptions(value)
     }
 
-    private func samplePageColor(_ params: [String: Any]) throws -> [String: String] {
+    func samplePageColor(_ params: [String: Any]) throws -> [String: String] {
         guard let pageID = uuid(params["pageID"]),
               let page = store.pages.first(where: { $0.id == pageID }),
               let normalizedX = double(params["x"]), normalizedX.isFinite,
@@ -919,7 +609,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return ["hex": String(format: "#%02X%02X%02X", pixel[0], pixel[1], pixel[2])]
     }
 
-    private func upsertGlossaryEntry(_ params: [String: Any]) throws -> [String: Any] {
+    func upsertGlossaryEntry(_ params: [String: Any]) throws -> [String: Any] {
         guard let sourceTerm = params["sourceTerm"] as? String,
               let rawTranslations = params["translations"] as? [String: Any] else {
             throw BridgeError.invalidParameters
@@ -940,7 +630,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return ["entryID": entryID.uuidString]
     }
 
-    private func updateRegion(_ params: [String: Any]) throws {
+    func updateRegion(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let regionID = uuid(params["regionID"]) else {
             throw BridgeError.invalidParameters
@@ -987,7 +677,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         )
     }
 
-    private func createRegion(_ params: [String: Any]) throws -> [String: Any] {
+    func createRegion(_ params: [String: Any]) throws -> [String: Any] {
         guard let pageID = uuid(params["pageID"]),
               let bounds = normalizedRect(params["bounds"]),
               let regionID = store.createRegion(
@@ -1002,7 +692,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return ["regionID": regionID.uuidString]
     }
 
-    private func duplicateRegion(_ params: [String: Any]) throws -> [String: Any] {
+    func duplicateRegion(_ params: [String: Any]) throws -> [String: Any] {
         guard let pageID = uuid(params["pageID"]),
               let sourceRegionID = uuid(params["regionID"]),
               let regionID = store.duplicateRegion(pageID: pageID, regionID: sourceRegionID) else {
@@ -1011,7 +701,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return ["regionID": regionID.uuidString]
     }
 
-    private func appendMaskStroke(_ params: [String: Any]) throws {
+    func appendMaskStroke(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let regionID = uuid(params["regionID"]),
               let stroke = try? maskStroke(from: params) else {
@@ -1026,7 +716,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         )
     }
 
-    private func appendColorizationMaskStroke(_ params: [String: Any]) throws {
+    func appendColorizationMaskStroke(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let stroke = try? maskStroke(from: params) else {
             throw BridgeError.invalidParameters
@@ -1059,7 +749,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         return (mode, points, diameter)
     }
 
-    private func undoMaskStroke(_ params: [String: Any]) throws {
+    func undoMaskStroke(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let regionID = uuid(params["regionID"]) else {
             throw BridgeError.invalidParameters
@@ -1067,7 +757,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         store.undoMaskStroke(pageID: pageID, regionID: regionID)
     }
 
-    private func redoMaskStroke(_ params: [String: Any]) throws {
+    func redoMaskStroke(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let regionID = uuid(params["regionID"]) else {
             throw BridgeError.invalidParameters
@@ -1075,7 +765,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         store.redoMaskStroke(pageID: pageID, regionID: regionID)
     }
 
-    private func removeRegion(_ params: [String: Any]) throws {
+    func removeRegion(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let regionID = uuid(params["regionID"]) else {
             throw BridgeError.invalidParameters
@@ -1083,7 +773,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         store.removeRegion(pageID: pageID, regionID: regionID)
     }
 
-    private func revealOutput(_ params: [String: Any]) throws {
+    func revealOutput(_ params: [String: Any]) throws {
         guard let pageID = uuid(params["pageID"]),
               let page = store.pages.first(where: { $0.id == pageID }) else {
             throw BridgeError.invalidParameters
@@ -1096,58 +786,30 @@ final class HybridBridgeController: NSObject, ObservableObject {
     }
 
     private func uuid(_ value: Any?) -> UUID? {
-        (value as? String).flatMap(UUID.init(uuidString:))
+        WebBridgeParameterDecoder.uuid(value)
     }
 
     private func double(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber { return number.doubleValue }
-        if let string = value as? String { return Double(string) }
-        return nil
+        WebBridgeParameterDecoder.double(value)
     }
 
     private func integer(_ value: Any?) -> Int? {
-        if let number = value as? NSNumber { return number.intValue }
-        if let string = value as? String { return Int(string) }
-        return nil
+        WebBridgeParameterDecoder.integer(value)
     }
 
     private func normalizedRect(_ value: Any?) -> NormalizedRect? {
-        guard let raw = value as? [String: Any],
-              let x = double(raw["x"]),
-              let y = double(raw["y"]),
-              let width = double(raw["width"]),
-              let height = double(raw["height"]),
-              x.isFinite, y.isFinite, width.isFinite, height.isFinite else { return nil }
-        return NormalizedRect(x: x, y: y, width: width, height: height)
+        WebBridgeParameterDecoder.normalizedRect(value)
     }
 
     private func normalizedPoint(_ value: Any?) -> NormalizedPoint? {
-        guard let raw = value as? [String: Any],
-              let x = double(raw["x"]),
-              let y = double(raw["y"]),
-              x.isFinite, y.isFinite else { return nil }
-        return NormalizedPoint(x: x, y: y).clamped()
+        WebBridgeParameterDecoder.normalizedPoint(value)
     }
 
     private func normalizedPolygons(_ value: Any?) -> [[NormalizedPoint]]? {
-        guard let rawPolygons = value as? [Any] else { return nil }
-        var result: [[NormalizedPoint]] = []
-        for rawPolygon in rawPolygons {
-            guard let rawPoints = rawPolygon as? [Any], rawPoints.count >= 3 else { return nil }
-            var points: [NormalizedPoint] = []
-            for rawPoint in rawPoints {
-                guard let object = rawPoint as? [String: Any],
-                      let x = double(object["x"]),
-                      let y = double(object["y"]),
-                      x.isFinite, y.isFinite else { return nil }
-                points.append(NormalizedPoint(x: x, y: y).clamped())
-            }
-            result.append(points)
-        }
-        return result
+        WebBridgeParameterDecoder.normalizedPolygons(value)
     }
 
-    private func startUpdateCheckIfNeeded() {
+    func startUpdateCheckIfNeeded() {
         guard !hasStartedUpdateCheck else { return }
         hasStartedUpdateCheck = true
         let checker = GitHubReleaseChecker()
@@ -1161,7 +823,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
     }
 
-    private func startManualUpdateCheck() {
+    func startManualUpdateCheck() {
         hasStartedUpdateCheck = true
         updateCheckTask?.cancel()
         let checkID = UUID()
@@ -1193,7 +855,7 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
     }
 
-    private func openExternalURL(_ params: [String: Any]) throws {
+    func openExternalURL(_ params: [String: Any]) throws {
         guard let value = params["url"] as? String,
               let url = URL(string: value),
               url.scheme?.lowercased() == "https",
@@ -1211,8 +873,13 @@ final class HybridBridgeController: NSObject, ObservableObject {
         }
     }
 
-    private func localized(_ key: String) -> String {
+    func localized(_ key: String) -> String {
         NativeLocalization.text(key, languageCode: interfaceLanguageCode)
+    }
+
+    func applyInterfaceLanguage(setting: String, normalized: String) {
+        preferences.setInterfaceLanguage(setting)
+        interfaceLanguageCode = normalized
     }
 
     private func sendResponse(id: String, payload: Any?) {
@@ -1247,7 +914,7 @@ extension HybridBridgeController: WKScriptMessageHandler {
         let id = body["id"] as? String
         let params = body["params"] as? [String: Any] ?? [:]
         do {
-            let payload = try handle(method: method, params: params)
+            let payload = try commandHandler.handle(method: method, params: params)
             if let id { sendResponse(id: id, payload: payload) }
         } catch {
             sendError(id: id, message: error.localizedDescription)
@@ -1262,7 +929,7 @@ extension HybridBridgeController: WKNavigationDelegate {
     }
 }
 
-private enum BridgeError: LocalizedError {
+enum BridgeError: LocalizedError {
     case invalidParameters
     case unknownMethod(String)
     case modelCapabilityMismatch(String)

@@ -185,6 +185,7 @@ public actor ComicTranslationPipeline {
         options: ProcessingOptions,
         glossary: ProjectGlossary = ProjectGlossary(),
         recognizeText: Bool = true,
+        draftsReady: @escaping TranslationDraftHandler = { _ in },
         activity: @escaping PagePipelineActivity = { _ in },
         regionProgress: @escaping PageRegionProgress = { _, _ in },
         progress: @escaping PagePipelineProgress
@@ -227,17 +228,44 @@ public actor ComicTranslationPipeline {
         activity(.translatingRegions)
         let selectedTranslator = translators[options.translationModelMethod]
             ?? translator
-        let translatedCandidates = try await selectedTranslator.translate(
-            regions: translatableRegions,
-            pageURL: page.sourceURL,
-            targetLanguageCode: targetLanguageCode,
-            glossaryTerms: glossaryTerms,
-            readingDirection: options.readingDirection,
-            qualityOptions: options.translationQuality,
-            activity: activity,
-            regionProgress: regionProgress
-        ) { value in
+        let translationProgress: InferenceProgress = { value in
             progress(.translating, 0.4 + min(max(value, 0), 1) * 0.6)
+        }
+        let translatedCandidates: [DialogueRegion]
+        if let draftTranslator = selectedTranslator as? any DraftRegionTranslating {
+            translatedCandidates = try await draftTranslator.translate(
+                regions: translatableRegions,
+                pageURL: page.sourceURL,
+                targetLanguageCode: targetLanguageCode,
+                glossaryTerms: glossaryTerms,
+                readingDirection: options.readingDirection,
+                qualityOptions: options.translationQuality,
+                activity: activity,
+                regionProgress: regionProgress,
+                draftsReady: { draftCandidates in
+                    let draftsByID = draftCandidates.reduce(
+                        into: [UUID: DialogueRegion]()
+                    ) { result, region in
+                        result[region.id] = region
+                    }
+                    try await draftsReady(
+                        recognizedRegions.map { draftsByID[$0.id] ?? $0 }
+                    )
+                },
+                progress: translationProgress
+            )
+        } else {
+            translatedCandidates = try await selectedTranslator.translate(
+                regions: translatableRegions,
+                pageURL: page.sourceURL,
+                targetLanguageCode: targetLanguageCode,
+                glossaryTerms: glossaryTerms,
+                readingDirection: options.readingDirection,
+                qualityOptions: options.translationQuality,
+                activity: activity,
+                regionProgress: regionProgress,
+                progress: translationProgress
+            )
         }
         progress(.translationReady, 1)
         let translatedByID = translatedCandidates.reduce(into: [UUID: DialogueRegion]()) { result, region in

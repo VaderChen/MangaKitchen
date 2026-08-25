@@ -16,7 +16,7 @@
 - `Sources/MangaKitchenApp/Resources/Models/OCR/ppocrv6-small-rec-macos14.mlpackage` is included in the app bundle. It is a fixed-shape Core ML MLProgram converted from the Apache-2.0 PP-OCRv6 Small recognizer, with a `1×3×48×320` input and App model ID `ppocrv6-small-rec`.
 - The OCR character list, conversion notes, and complete upstream Apache-2.0 license are included beside the model. See [Documentation/THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the model [README](../Sources/MangaKitchenApp/Resources/Models/OCR/README.md).
 - The model weight file is approximately 10.5 MB. Its SHA-256 is `737e0cf4201e3d9af0f94a8ced930d0957387c5f97947468f18da5ed89d11f61`.
-- `Tests/Experiments/OCRPoC/` contains the PP-OCRv6 quality, Core ML conversion, and ANE/GPU/CPU benchmark scripts. `.artifacts/`, original model weights, and Python caches remain excluded from version control.
+- `Experiments/OCRPoC/` contains the PP-OCRv6 quality, Core ML conversion, and ANE/GPU/CPU benchmark scripts. `.artifacts/`, original model weights, and Python caches remain excluded from version control.
 
 ## Compatibility
 

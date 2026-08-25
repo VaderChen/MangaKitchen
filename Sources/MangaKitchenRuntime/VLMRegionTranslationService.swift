@@ -24,7 +24,7 @@ public actor TextOnlyImageToTextAdapter: ImageToTextGenerating {
     }
 }
 
-public actor VLMRegionTranslationService: RegionTranslating {
+public actor VLMRegionTranslationService: DraftRegionTranslating {
     private struct PromptRegion: Codable {
         var index: Int
         var id: UUID
@@ -73,6 +73,7 @@ public actor VLMRegionTranslationService: RegionTranslating {
         qualityOptions: TranslationQualityOptions,
         activity: @escaping PagePipelineActivity = { _ in },
         regionProgress: @escaping PageRegionProgress,
+        draftsReady: @escaping TranslationDraftHandler,
         progress: @escaping InferenceProgress
     ) async throws -> [DialogueRegion] {
         guard !regions.isEmpty else {
@@ -186,27 +187,49 @@ public actor VLMRegionTranslationService: RegionTranslating {
         }
         var reviewed = drafts
         if qualityOptions.reviewPassEnabled, !drafts.isEmpty {
+            let draftRegions = regions.map { region in
+                Self.applyingTranslation(
+                    drafts[region.id],
+                    draft: nil,
+                    to: region,
+                    targetLanguageCode: targetLanguageCode,
+                    glossaryTerms: glossaryTerms,
+                    qualityOptions: qualityOptions,
+                    detectsReviewAdjustment: false
+                )
+            }
+            try await draftsReady(draftRegions)
+            try Task.checkCancellation()
             log(.info, "Translation", "Starting second-pass review for \(drafts.count) draft(s).")
             activity(.reviewingTranslations)
-            regionProgress(0, regions.count)
+            // 校稿是單次整頁編輯，不是逐區 OCR／重翻；清除區域計數，UI 只顯示整頁階段。
+            regionProgress(0, 0)
             let reviewPayload = regions.compactMap { drafts[$0.id] }
-            if let reviewJSON = try? Self.json(reviewPayload),
-               let values = try? await generateItems(
-                   pageURL: pageURL,
-                   prompt: Self.reviewPrompt(
-                       targetLanguageCode: targetLanguageCode,
-                       readingDirection: readingDirection,
-                       glossaryJSON: glossaryJSON,
-                       regionsJSON: promptRegionsJSON,
-                       draftsJSON: reviewJSON,
-                       qualityOptions: qualityOptions,
-                       usesImageContext: usesImageContext
-                   ),
-                   expectedRegions: regions,
-                   regionProgress: regionProgress,
-                   progress: { value in progress(draftEnd + value * (0.9 - draftEnd)) }
-               ) {
+            do {
+                let reviewJSON = try Self.json(reviewPayload)
+                let values = try await generateItems(
+                    pageURL: pageURL,
+                    prompt: Self.reviewPrompt(
+                        targetLanguageCode: targetLanguageCode,
+                        readingDirection: readingDirection,
+                        glossaryJSON: glossaryJSON,
+                        regionsJSON: promptRegionsJSON,
+                        draftsJSON: reviewJSON,
+                        qualityOptions: qualityOptions,
+                        usesImageContext: usesImageContext
+                    ),
+                    expectedRegions: regions,
+                    progress: { value in progress(draftEnd + value * (0.9 - draftEnd)) }
+                )
                 reviewed.merge(values) { _, new in new }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                log(
+                    .warning,
+                    "Translation",
+                    "Second-pass review failed; keeping committed drafts: \(error.localizedDescription)"
+                )
             }
         }
         regionProgress(0, 0)
@@ -215,55 +238,75 @@ public actor VLMRegionTranslationService: RegionTranslating {
         translatedRegions.reserveCapacity(regions.count)
         for region in regions {
             try Task.checkCancellation()
-            var translated = region
-            if let item = reviewed[region.id], let rawDisplay = item.resolvedDisplayTranslation {
-                let display = Self.normalizedTranslation(
-                    Self.removingEditorialAnnotations(rawDisplay),
-                    targetLanguageCode: targetLanguageCode
-                )
-                let literal = item.literalTranslation.map {
-                    Self.normalizedTranslation(
-                        Self.removingEditorialAnnotations($0),
-                        targetLanguageCode: targetLanguageCode
-                    )
-                }
-                translated.literalTranslatedText = qualityOptions.preserveLiteralTranslation
-                    ? (literal?.isEmpty == false ? literal : display)
-                    : nil
-                translated.translatedText = display
-                translated.speakerID = Self.nonEmpty(item.speakerID)
-                translated.tone = Self.nonEmpty(item.tone.map {
-                    Self.normalizedTranslation($0, targetLanguageCode: targetLanguageCode)
-                })
-                translated.translationConfidence = item.confidence.map { min(max($0, 0), 1) }
-                var flags = Set((item.qaFlags ?? []).compactMap(TranslationQAFlag.init(rawValue:)))
-                if qualityOptions.reviewPassEnabled,
-                   drafts[region.id]?.resolvedDisplayTranslation.map({
-                       Self.normalizedTranslation(
-                           Self.removingEditorialAnnotations($0),
-                           targetLanguageCode: targetLanguageCode
-                       )
-                   }) != display {
-                    flags.insert(.reviewAdjusted)
-                }
-                if qualityOptions.qualityCheckEnabled {
-                    flags.formUnion(Self.qualityFlags(
-                        region: translated,
-                        glossaryTerms: glossaryTerms,
-                        lengthMode: qualityOptions.lengthMode
-                    ))
-                }
-                translated.translationQAFlags = flags.sorted { $0.rawValue < $1.rawValue }
-            } else {
-                var flags = Set(translated.translationQAFlags)
-                flags.insert(.missingTranslation)
-                translated.translationQAFlags = flags.sorted { $0.rawValue < $1.rawValue }
-            }
-            translatedRegions.append(translated)
+            translatedRegions.append(Self.applyingTranslation(
+                reviewed[region.id],
+                draft: drafts[region.id],
+                to: region,
+                targetLanguageCode: targetLanguageCode,
+                glossaryTerms: glossaryTerms,
+                qualityOptions: qualityOptions,
+                detectsReviewAdjustment: qualityOptions.reviewPassEnabled
+            ))
         }
 
         progress(1)
         return translatedRegions
+    }
+
+    private static func applyingTranslation(
+        _ item: TranslationItem?,
+        draft: TranslationItem?,
+        to region: DialogueRegion,
+        targetLanguageCode: String,
+        glossaryTerms: [ResolvedGlossaryTerm],
+        qualityOptions: TranslationQualityOptions,
+        detectsReviewAdjustment: Bool
+    ) -> DialogueRegion {
+        var translated = region
+        guard let item, let rawDisplay = item.resolvedDisplayTranslation else {
+            var flags = Set(translated.translationQAFlags)
+            flags.insert(.missingTranslation)
+            translated.translationQAFlags = flags.sorted { $0.rawValue < $1.rawValue }
+            return translated
+        }
+        let display = normalizedTranslation(
+            removingEditorialAnnotations(rawDisplay),
+            targetLanguageCode: targetLanguageCode
+        )
+        let literal = item.literalTranslation.map {
+            normalizedTranslation(
+                removingEditorialAnnotations($0),
+                targetLanguageCode: targetLanguageCode
+            )
+        }
+        translated.literalTranslatedText = qualityOptions.preserveLiteralTranslation
+            ? (literal?.isEmpty == false ? literal : display)
+            : nil
+        translated.translatedText = display
+        translated.speakerID = nonEmpty(item.speakerID)
+        translated.tone = nonEmpty(item.tone.map {
+            normalizedTranslation($0, targetLanguageCode: targetLanguageCode)
+        })
+        translated.translationConfidence = item.confidence.map { min(max($0, 0), 1) }
+        var flags = Set((item.qaFlags ?? []).compactMap(TranslationQAFlag.init(rawValue:)))
+        if detectsReviewAdjustment,
+           draft?.resolvedDisplayTranslation.map({
+               normalizedTranslation(
+                   removingEditorialAnnotations($0),
+                   targetLanguageCode: targetLanguageCode
+               )
+           }) != display {
+            flags.insert(.reviewAdjusted)
+        }
+        if qualityOptions.qualityCheckEnabled {
+            flags.formUnion(qualityFlags(
+                region: translated,
+                glossaryTerms: glossaryTerms,
+                lengthMode: qualityOptions.lengthMode
+            ))
+        }
+        translated.translationQAFlags = flags.sorted { $0.rawValue < $1.rawValue }
+        return translated
     }
 
     /// 整頁回覆失敗或缺漏時的唯一自動 fallback。所有待補區域合併成一次請求，
@@ -463,13 +506,15 @@ public actor VLMRegionTranslationService: RegionTranslating {
         usesImageContext: Bool
     ) -> String {
         let comparisonInstruction = usesImageContext
-            ? "Compare every draft against its sourceText and the page image."
-            : "Compare every draft against its sourceText and ordered page context; no page image is available."
+            ? "Use the page image only as whole-page context for speakers, relationships, tone and ambiguity."
+            : "Use the ordered page context for speakers, relationships, tone and ambiguity; no page image is available."
         return """
         You are the senior editor reviewing a complete comic-page translation into "\(targetLanguageCode)".
         \(VLMStructuredResponseDecoder.finalJSONInstruction)
         Target-language script rule: \(targetLanguageRequirement(for: targetLanguageCode))
-        \(comparisonInstruction) Review in "\(readingDirection.rawValue)"
+        Perform exactly one whole-page editorial pass; do not process regions as independent OCR or translation jobs.
+        Treat every supplied sourceText as authoritative. Do not re-transcribe, re-extract or replace sourceText.
+        \(comparisonInstruction) Review all drafts together in "\(readingDirection.rawValue)"
         reading order. Correct mistranslation, omitted meaning, pronouns, negation, numbers, terminology,
         inconsistent speaker IDs, forms of address, register, tone and unnatural dialogue.
         Keep literalTranslation semantically complete. Make displayTranslation natural and concise for the balloon,

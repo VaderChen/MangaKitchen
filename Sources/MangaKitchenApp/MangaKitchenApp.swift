@@ -63,8 +63,6 @@ private struct MangaKitchenApplication: App {
             port: configuration.mcpPort ?? settings.mcpPort,
             portOverride: configuration.mcpPort,
             allowedClients: settings.mcpAllowedClients,
-            dataDirectoryPath: settings.dataDirectoryPath,
-            imageCompositingBackend: settings.resolvedImageCompositingBackend,
             store: store
         )
         _preferences = StateObject(wrappedValue: preferences)
@@ -101,8 +99,7 @@ private struct MangaKitchenApplication: App {
                     mcpController.configure(
                         enabled: settings.mcpEnabled,
                         port: settings.mcpPort,
-                        allowedClients: settings.mcpAllowedClients,
-                        imageCompositingBackend: settings.resolvedImageCompositingBackend
+                        allowedClients: settings.mcpAllowedClients
                     )
                 }
         }

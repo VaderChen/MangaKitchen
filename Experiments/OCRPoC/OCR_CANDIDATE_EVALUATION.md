@@ -2,15 +2,14 @@
 
 評估日期：2026-08-22
 
-這份評估只比較候選模型與原生執行可行性；本次沒有把新模型加入 MangaKitchen 正式 OCR pipeline。
-目前 App 預設使用已驗證的 PP-OCRv6 Medium Core ML recognizer，Small 保留為 fallback。
+這份評估原本只比較候選模型與原生執行可行性；評估完成後，PP-OCRv6 Medium Core ML recognizer 已加入 MangaKitchen 正式 OCR pipeline 並成為預設，Small 保留為 fallback。
 
 ## 結論摘要
 
 | 候選 | 日文漫畫適配性 | 授權 | 原生 macOS／Swift 可行性 | 結論 |
 |---|---|---|---|---|
 | PP-OCRv6 Small（fallback） | 能處理日文、直排；已有漫畫 PoC 與 Core ML 驗證 | Apache-2.0 | Core ML MLProgram，已可用 | 保留為 fallback |
-| PP-OCRv6 Medium rec | 同系列較大的辨識模型；官方日文辨識指標高於 Small | Apache-2.0 | 直接 PyTorch→Core ML 會失敗；Paddle2ONNX→onnx2coreml 可產生 MLProgram 並完成 ANE PoC | 品質候選；尚未整合 |
+| PP-OCRv6 Medium rec | 同系列較大的辨識模型；官方日文辨識指標高於 Small | Apache-2.0 | 直接 PyTorch→Core ML 會失敗；Paddle2ONNX→onnx2coreml 可產生 MLProgram 並完成 ANE PoC | 已整合為預設 recognizer |
 | PP-OCRv5 mobile rec | 官方說明支援繁中、英文、日文、直排、手寫與稀有字；48×320、18,385 類別 | Apache-2.0 | PyTorch 可載入；Core ML 轉換目前失敗 | 最值得下一輪修轉換器的候選 |
 | Manga OCR base | 專為日文漫畫，訓練於 Manga109-s，支援直排、振假名、背景疊字與多字體 | Apache-2.0 | VisionEncoderDecoder + 自回歸 decoder；ONNX 也需 encoder／decoder／tokenizer loop | 品質候選，但不是目前無依賴的 Swift／Core ML 路徑 |
 | Manga OCR ONNX（mayocream / l0wgear） | 延續 Manga OCR 的日文漫畫能力 | Apache-2.0（mayocream；l0wgear 未在 metadata 標出） | 可由 ONNX Runtime 執行，但 App 目前沒有 ONNX Runtime；轉 Core ML 要處理 decoder 狀態 | 暫不整合 |
@@ -56,7 +55,7 @@
 5. Medium Core ML ANE warm median 約 `1.35 ms`（internal 約 `1.22 ms`）；作為比較，目前 Small 直接 Core ML recognizer 約 `0.56 ms`。Medium 約為 Small 的 2.4 倍，但仍是可接受的本機裁切辨識延遲。
 6. 28 條漫畫裁切實測為 `24/28` 完全一致、CER `3.2%`，與 PyTorch Medium 結果一致；輸出仍為 `1×40×18,710`，可沿用目前字典與 Swift 解碼器。
 
-這條路徑已證明技術上可行，但目前只完成獨立 PoC，尚未將轉換腳本、修補後 ONNX 或 37 MB 的 Core ML artifact 放進正式 App。後續若採用，必須把「固定輸入尺寸、Reshape 修補、模型 hash／版本」納入可重現的離線產製流程，再重新跑 App 回歸測試。
+這條路徑已證明技術上可行，37 MB 的 Core ML artifact 也已整合進正式 App。完整的 Paddle2ONNX、Reshape 修補與 `onnx2coreml` 產製鏈仍屬離線流程，尚未收進本 PoC；後續重新產製時，必須固定輸入尺寸並記錄模型 hash、工具版本與 graph 修補步驟，再重新執行 App 回歸測試。
 
 ### PP-OCRv5 mobile recognizer
 
