@@ -255,6 +255,7 @@ struct WebGlobalSettings: Encodable {
         var displayName: String
         var recommended: Bool
         var installed: Bool
+        var format: String
     }
 
     var interfaceLanguage: String
@@ -328,7 +329,8 @@ struct WebGlobalSettings: Encodable {
                         storageDirectoryURL: $0,
                         model: model
                     )
-                } != nil
+                } != nil,
+                format: model.format.rawValue
             )
         }
         imageToTextModelInstalled = imageToTextModelOptions.first {
@@ -354,7 +356,8 @@ struct WebGlobalSettings: Encodable {
                         storageDirectoryURL: $0,
                         model: model
                     )
-                } != nil
+                } != nil,
+                format: model.format.rawValue
             )
         }
         imageColorizationModelInstalled = imageColorizationModelOptions.first {
@@ -378,7 +381,8 @@ struct WebGlobalSettings: Encodable {
                         storageDirectoryURL: $0,
                         model: model
                     )
-                } != nil
+                } != nil,
+                format: model.format.rawValue
             )
         }
         superResolutionModelInstalled = superResolutionModelOptions.first {

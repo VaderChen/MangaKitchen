@@ -12,6 +12,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
     private let ggufQuantizationGroupSize: Int
+    private let ggufQuantizationProfile: GGUFQuantizationProfile
     private var textToTextRuntime: (any TextGenerating)?
     private var imageToTextRuntime: (any ImageToTextGenerating)?
     private var imageToImageRuntime: (any ImageToImageGenerating)?
@@ -26,12 +27,14 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     public init(
         metal: MetalContext,
         ggufQuantizationGroupSize: Int = 64,
+        ggufQuantizationProfile: GGUFQuantizationProfile = .quality,
         thinkingEnabled: Bool = false,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
     ) {
         self.metal = metal
         self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
+        self.ggufQuantizationProfile = ggufQuantizationProfile
         self.thinkingEnabled = thinkingEnabled
         self.log = log
         self.reasoningStream = reasoningStream
@@ -152,6 +155,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                     directoryURL: directoryURL,
                     manifest: manifest,
                     ggufQuantizationGroupSize: ggufQuantizationGroupSize,
+                    ggufQuantizationProfile: ggufQuantizationProfile,
                     thinkingEnabled: thinkingEnabled,
                     log: log,
                     reasoningStream: reasoningStream
@@ -164,6 +168,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                     directoryURL: directoryURL,
                     manifest: manifest,
                     ggufQuantizationGroupSize: ggufQuantizationGroupSize,
+                    ggufQuantizationProfile: ggufQuantizationProfile,
                     thinkingEnabled: thinkingEnabled,
                     log: log,
                     reasoningStream: reasoningStream

@@ -21,6 +21,13 @@ public enum GGUFMaterializationKind: String, Codable, Hashable, Sendable {
     case requantized8
 }
 
+/// GGUF 重新量化的品質／速度取捨。`.quality` 維持來源型別較高的精度；
+/// `.speed` 將 Q5_K／Q6_K 改以 INT4 儲存，以降低 decode 時的記憶體頻寬。
+public enum GGUFQuantizationProfile: String, Codable, Hashable, Sendable {
+    case quality
+    case speed
+}
+
 public struct GGUFTypeSupport: Codable, Hashable, Sendable {
     public let storageType: GGUFStorageType
     public let materialization: GGUFMaterializationKind
@@ -180,7 +187,27 @@ public enum GGUFStoragePolicy {
     ]
 
     public static func support(for sourceType: String) -> GGUFTypeSupport? {
-        supportByType[sourceType.uppercased()]
+        support(for: sourceType, profile: .quality)
+    }
+
+    public static func support(
+        for sourceType: String,
+        profile: GGUFQuantizationProfile
+    ) -> GGUFTypeSupport? {
+        let normalized = sourceType.uppercased()
+        guard let support = supportByType[normalized] else { return nil }
+        guard profile == .speed else { return support }
+        switch normalized {
+        case "Q5_K", "Q6_K":
+            return GGUFTypeSupport(
+                storageType: .int4,
+                materialization: .requantized4,
+                preservesSourceQuantization: false,
+                requiresConversion: true
+            )
+        default:
+            return support
+        }
     }
 
     public static func isMaterializable(_ sourceType: String) -> Bool {
@@ -195,20 +222,48 @@ public enum GGUFStoragePolicy {
         support(for: sourceType)?.storageType
     }
 
+    public static func storageType(
+        for sourceType: String,
+        profile: GGUFQuantizationProfile
+    ) -> GGUFStorageType? {
+        support(for: sourceType, profile: profile)?.storageType
+    }
+
     public static func targetStorageType(for sourceType: String) -> GGUFStorageType? {
+        targetStorageType(for: sourceType, profile: .quality)
+    }
+
+    public static func targetStorageType(
+        for sourceType: String,
+        profile: GGUFQuantizationProfile
+    ) -> GGUFStorageType? {
         let normalized = sourceType.uppercased()
         if fp8SourceTypeNames.contains(normalized) {
             return .int8
         }
-        return storageType(for: normalized)
+        return storageType(for: normalized, profile: profile)
     }
 
     public static func preservesSourceQuantization(for sourceType: String) -> Bool {
         support(for: sourceType)?.preservesSourceQuantization ?? false
     }
 
+    public static func preservesSourceQuantization(
+        for sourceType: String,
+        profile: GGUFQuantizationProfile
+    ) -> Bool {
+        support(for: sourceType, profile: profile)?.preservesSourceQuantization ?? false
+    }
+
     public static func requiresConversion(for sourceType: String) -> Bool {
         support(for: sourceType)?.requiresConversion ?? false
+    }
+
+    public static func requiresConversion(
+        for sourceType: String,
+        profile: GGUFQuantizationProfile
+    ) -> Bool {
+        support(for: sourceType, profile: profile)?.requiresConversion ?? false
     }
 }
 

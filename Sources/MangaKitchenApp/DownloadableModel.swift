@@ -45,6 +45,26 @@ enum DownloadableModelCatalog {
             recommended: true
         ),
         DownloadableModelDescriptor(
+            id: "qwen3.5-4b-q4-0-gguf",
+            displayName: "Qwen3.5-4B Q4_0 GGUF（多模態）",
+            repositoryID: "unsloth/Qwen3.5-4B-GGUF",
+            capability: .imageToText,
+            format: .ggufDirectory,
+            weightsFileName: "Qwen3.5-4B-Q4_0.gguf",
+            mmprojFileName: "mmproj-F16.gguf",
+            auxiliaryRepositoryID: "Qwen/Qwen3.5-4B",
+            auxiliaryFileNames: [
+                "config.json",
+                "chat_template.jinja",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "video_preprocessor_config.json",
+                "vocab.json",
+                "merges.txt"
+            ]
+        ),
+        DownloadableModelDescriptor(
             id: "qwen3.5-9b-4bit",
             displayName: "Qwen3.5-9B 4-bit",
             repositoryID: "lmstudio-community/Qwen3.5-9B-MLX-4bit",

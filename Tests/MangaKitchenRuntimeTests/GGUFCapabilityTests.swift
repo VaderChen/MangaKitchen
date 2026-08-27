@@ -38,6 +38,54 @@ final class GGUFCapabilityTests: XCTestCase {
         XCTAssertNil(GGUFStoragePolicy.storageType(for: "Q8_K"))
     }
 
+    func testSpeedProfileRequantizesQ5KAndQ6KToInt4() {
+        XCTAssertEqual(
+            GGUFStoragePolicy.support(for: "Q5_K", profile: .speed)?.materialization,
+            .requantized4
+        )
+        XCTAssertEqual(
+            GGUFStoragePolicy.support(for: "Q6_K", profile: .speed)?.materialization,
+            .requantized4
+        )
+        XCTAssertEqual(
+            GGUFStoragePolicy.storageType(for: "Q5_K", profile: .speed),
+            .int4
+        )
+        XCTAssertEqual(
+            GGUFStoragePolicy.storageType(for: "Q6_K", profile: .speed),
+            .int4
+        )
+        XCTAssertEqual(
+            GGUFStoragePolicy.storageType(for: "Q4_0", profile: .speed),
+            .int4
+        )
+    }
+
+    func testGGUFFloatWeightsUseBF16ExceptQwenSSMA() throws {
+        let ssmA = try makeFixture(
+            type: 0,
+            payloadSize: 4,
+            tensorName: "blk.0.ssm_a",
+            dimensions: [1]
+        )
+        let norm = try makeFixture(
+            type: 0,
+            payloadSize: 4,
+            tensorName: "blk.0.ssm_dt.bias",
+            dimensions: [1]
+        )
+        defer {
+            try? FileManager.default.removeItem(at: ssmA)
+            try? FileManager.default.removeItem(at: norm)
+        }
+
+        XCTAssertEqual(try MLXGGUFLoader.loadWeights(from: ssmA)["blk.0.ssm_a"]?.dtype, .float32)
+        XCTAssertEqual(
+            try MLXGGUFLoader.loadWeights(from: norm)["blk.0.ssm_dt.bias"]?.dtype,
+            .bfloat16
+        )
+    }
+
     func testFP8TargetPolicyUsesInt8WithoutClaimingUnsupportedGGUFMaterialization() {
         for sourceType in [
             "FP8", "FP8_E4M3", "FP8_E4M3FN", "FP8_E5M2", "F8", "F8_E4M3",
@@ -238,7 +286,7 @@ final class GGUFCapabilityTests: XCTestCase {
             XCTAssertTrue(tensor.requiresConversion)
             let weights = try MLXGGUFLoader.loadWeights(from: fixture)
             XCTAssertEqual(weights["test.weight"]?.dtype, .uint32)
-            XCTAssertEqual(weights["test.scales"]?.dtype, .float16)
+            XCTAssertEqual(weights["test.scales"]?.dtype, .bfloat16)
             XCTAssertNotNil(weights["test.biases"])
         }
     }
@@ -340,10 +388,10 @@ final class GGUFCapabilityTests: XCTestCase {
             dtype: .float32
         )
         let values = try XCTUnwrap(reconstructed.asArray(Float.self))
-        XCTAssertEqual(values[0], 0, accuracy: 0.001)
-        XCTAssertEqual(values[31], 0, accuracy: 0.001)
-        XCTAssertEqual(values[32], 2, accuracy: 0.001)
-        XCTAssertEqual(values[63], 2, accuracy: 0.001)
+        XCTAssertEqual(values[0], 0, accuracy: 0.01)
+        XCTAssertEqual(values[31], 0, accuracy: 0.01)
+        XCTAssertEqual(values[32], 2, accuracy: 0.01)
+        XCTAssertEqual(values[63], 2, accuracy: 0.01)
     }
 
     func testQ2KPreservesAllQuantizedSlicesBeforeRequantization() throws {
@@ -364,11 +412,11 @@ final class GGUFCapabilityTests: XCTestCase {
 
         let weights = try MLXGGUFLoader.loadWeights(from: fixture)
         let reconstructed = try reconstructedValues(from: weights, bits: 4)
-        XCTAssertEqual(reconstructed[0], 1, accuracy: 0.001)
-        XCTAssertEqual(reconstructed[16], 2, accuracy: 0.001)
-        XCTAssertEqual(reconstructed[32], 0, accuracy: 0.001)
-        XCTAssertEqual(reconstructed[128], 3, accuracy: 0.001)
-        XCTAssertEqual(reconstructed[144], 0, accuracy: 0.001)
+        XCTAssertEqual(reconstructed[0], 1, accuracy: 0.01)
+        XCTAssertEqual(reconstructed[16], 2, accuracy: 0.01)
+        XCTAssertEqual(reconstructed[32], 0, accuracy: 0.01)
+        XCTAssertEqual(reconstructed[128], 3, accuracy: 0.01)
+        XCTAssertEqual(reconstructed[144], 0, accuracy: 0.01)
     }
 
     func testQ4KIsInspectableAndMaterializable() throws {
@@ -438,7 +486,14 @@ final class GGUFCapabilityTests: XCTestCase {
             XCTAssertTrue(inspection.unsupportedTypes.isEmpty)
             let weights = try MLXGGUFLoader.loadWeights(from: fixture)
             XCTAssertEqual(weights["test.weight"]?.dtype, .uint32)
-            XCTAssertEqual(weights["test.scales"]?.dtype, .float16)
+            XCTAssertEqual(weights["test.scales"]?.dtype, .bfloat16)
+
+            let speedWeights = try MLXGGUFLoader.loadWeights(
+                from: fixture,
+                quantizationProfile: .speed
+            )
+            XCTAssertEqual(speedWeights["test.weight"]?.dtype, .uint32)
+            XCTAssertEqual(speedWeights["test.scales"]?.dtype, .bfloat16)
         }
     }
 
@@ -486,6 +541,7 @@ final class GGUFCapabilityTests: XCTestCase {
     private func makeFixture(
         type: UInt32,
         payloadSize: Int,
+        tensorName: String = "test.weight",
         dimensions: [UInt64] = [256],
         payload: Data? = nil
     ) throws -> URL {
@@ -495,6 +551,7 @@ final class GGUFCapabilityTests: XCTestCase {
             type: type,
             payloadSize: payloadSize,
             to: url,
+            tensorName: tensorName,
             dimensions: dimensions,
             payload: payload
         )

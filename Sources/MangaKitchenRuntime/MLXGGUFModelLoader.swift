@@ -468,7 +468,9 @@ enum MLXGGUFLoader {
 
     static func loadWeights(
         from url: URL,
-        targetGroupSize: Int = 32
+        targetGroupSize: Int = 32,
+        quantizationProfile: GGUFQuantizationProfile = .quality,
+        convertQwen35StateSpaceParameters: Bool = false
     ) throws -> [String: MLXArray] {
         guard targetGroupSize == 32 || targetGroupSize == 64 else {
             throw MLXGGUFLoaderError.invalidTensor("量化群組設定")
@@ -489,29 +491,39 @@ enum MLXGGUFLoader {
             let shape = tensor.dimensions.reversed()
             let mlxShape = Array(shape)
             let elementCount = try checkedProduct(mlxShape)
-            guard let support = GGUFStoragePolicy.support(for: ggufTypeName(tensor.type)) else {
+            guard let support = GGUFStoragePolicy.support(
+                for: ggufTypeName(tensor.type),
+                profile: quantizationProfile
+            ) else {
                 throw MLXGGUFLoaderError.unsupportedTensorType(tensor.type, tensor.name)
             }
             switch support.materialization {
             case .directFloat32:
+                let value = MLXArray(
+                    try dataSlice(data, tensor: tensor, dataOffset: tensorDataOffset,
+                                  byteCount: try checkedByteCount(elementCount, elementSize: 4)),
+                    mlxShape,
+                    dtype: .float32
+                )
                 try insert(
-                    MLXArray(
-                        try dataSlice(data, tensor: tensor, dataOffset: tensorDataOffset,
-                                      byteCount: try checkedByteCount(elementCount, elementSize: 4)),
-                        mlxShape,
-                        dtype: .float32
-                    ),
+                    convertQwen35StateSpaceParameters
+                        && Self.isFloat32AccumulatorTensorName(tensor.name)
+                        // GGUF stores Qwen3.5's A parameter as -exp(A_log),
+                        // while mlx-swift's GatedDeltaNet expects A_log.
+                        ? (-value).log()
+                        : value.asType(.bfloat16),
                     name: tensor.name,
                     into: &weights
                 )
             case .directFloat16:
+                let value = MLXArray(
+                    try dataSlice(data, tensor: tensor, dataOffset: tensorDataOffset,
+                                  byteCount: try checkedByteCount(elementCount, elementSize: 2)),
+                    mlxShape,
+                    dtype: .float16
+                )
                 try insert(
-                    MLXArray(
-                        try dataSlice(data, tensor: tensor, dataOffset: tensorDataOffset,
-                                      byteCount: try checkedByteCount(elementCount, elementSize: 2)),
-                        mlxShape,
-                        dtype: .float16
-                    ),
+                    value.asType(.bfloat16),
                     name: tensor.name,
                     into: &weights
                 )
@@ -592,6 +604,16 @@ enum MLXGGUFLoader {
             }
         }
         return weights
+    }
+
+    /// Qwen3.5 的 `blk.N.ssm_a` 對應 MLX 的 `linear_attn.A_log`，其參考
+    /// checkpoint 保留 F32；其餘 GGUF F32 權重統一降為 BF16 compute dtype。
+    private static func isFloat32AccumulatorTensorName(_ name: String) -> Bool {
+        let components = name.split(separator: ".")
+        return components.count == 3
+            && components[0] == "blk"
+            && Int(components[1]) != nil
+            && components[2] == "ssm_a"
     }
 
     private static func readInspectionData(
@@ -1409,11 +1431,12 @@ enum MLXGGUFLoader {
             }
         }
 
-        return MLXArray(
+        let valuesArray = MLXArray(
             Data(bytes: values, count: values.count * MemoryLayout<Float16>.stride),
             shape,
             dtype: .float16
         )
+        return valuesArray.asType(.bfloat16)
     }
 
     private static func dequantizeQ1_0(
@@ -1953,14 +1976,16 @@ enum MLXGGUFModelLoader {
     static func loadContainer(
         from directoryURL: URL,
         weightURL: URL,
-        quantizationGroupSize: Int = 64
+        quantizationGroupSize: Int = 64,
+        quantizationProfile: GGUFQuantizationProfile = .quality
     ) async throws -> ModelContainer {
         try await loadContainer(
             from: directoryURL,
             weightURL: weightURL,
             mmprojURL: nil,
             useVLMProcessor: false,
-            quantizationGroupSize: quantizationGroupSize
+            quantizationGroupSize: quantizationGroupSize,
+            quantizationProfile: quantizationProfile
         )
     }
 
@@ -1968,14 +1993,16 @@ enum MLXGGUFModelLoader {
         from directoryURL: URL,
         weightURL: URL,
         mmprojURL: URL,
-        quantizationGroupSize: Int = 64
+        quantizationGroupSize: Int = 64,
+        quantizationProfile: GGUFQuantizationProfile = .quality
     ) async throws -> ModelContainer {
         try await loadContainer(
             from: directoryURL,
             weightURL: weightURL,
             mmprojURL: mmprojURL,
             useVLMProcessor: true,
-            quantizationGroupSize: quantizationGroupSize
+            quantizationGroupSize: quantizationGroupSize,
+            quantizationProfile: quantizationProfile
         )
     }
 
@@ -1984,7 +2011,8 @@ enum MLXGGUFModelLoader {
         weightURL: URL,
         mmprojURL: URL?,
         useVLMProcessor: Bool,
-        quantizationGroupSize: Int
+        quantizationGroupSize: Int,
+        quantizationProfile: GGUFQuantizationProfile
     ) async throws -> ModelContainer {
         guard quantizationGroupSize == 32 || quantizationGroupSize == 64 else {
             throw MLXGGUFLoaderError.invalidTensor("量化群組設定")
@@ -2041,8 +2069,20 @@ enum MLXGGUFModelLoader {
 
         var weights = try MLXGGUFLoader.loadWeights(
             from: weightURL,
-            targetGroupSize: quantizationGroupSize
+            targetGroupSize: quantizationGroupSize,
+            quantizationProfile: quantizationProfile,
+            convertQwen35StateSpaceParameters: isQwen35Architecture(
+                baseConfiguration.modelType
+            )
         )
+        if isQwen35Architecture(baseConfiguration.modelType),
+           let linearAttentionLayout = linearAttentionLayout(from: configData) {
+            weights = reorderQwen35LinearAttentionWeights(
+                weights,
+                layout: linearAttentionLayout,
+                groupSize: quantizationGroupSize
+            )
+        }
         weights = try MLXGGUFWeightNameNormalizer.normalize(
             weights,
             maximumLayerIndex: mainLayerCount(from: configData)
@@ -2051,7 +2091,11 @@ enum MLXGGUFModelLoader {
             guard model is any VLMModel else {
                 throw MLXGGUFLoaderError.invalidConfiguration(configurationURL)
             }
-            let projectorWeights = try MLXGGUFLoader.loadWeights(from: mmprojURL)
+            let projectorWeights = try MLXGGUFLoader.loadWeights(
+                from: mmprojURL,
+                targetGroupSize: quantizationGroupSize,
+                quantizationProfile: quantizationProfile
+            )
             let mappedProjectorWeights = try MLXGGUFMultimodalWeightMapper.map(projectorWeights)
             for (name, value) in mappedProjectorWeights {
                 guard weights[name] == nil else {
@@ -2160,6 +2204,218 @@ enum MLXGGUFModelLoader {
         }
         guard let textConfig = root["text_config"] as? [String: Any] else { return nil }
         return textConfig["num_hidden_layers"] as? Int
+    }
+
+    private static func isQwen35Architecture(_ modelType: String) -> Bool {
+        modelType == "qwen3_5" || modelType == "qwen3_5_text"
+    }
+
+    private struct LinearAttentionLayout {
+        let numKeyHeads: Int
+        let numValueHeads: Int
+        let keyHeadDimension: Int
+        let valueHeadDimension: Int
+
+        var valuesPerKeyHead: Int {
+            numValueHeads / numKeyHeads
+        }
+
+        var keyRows: Int {
+            numKeyHeads * keyHeadDimension
+        }
+
+        var valueRows: Int {
+            numValueHeads * valueHeadDimension
+        }
+    }
+
+    /// GGUF's Qwen3.5 converter reorders value heads from grouped HF order to
+    /// tiled GGML order.  The mlx-swift model uses the original grouped order,
+    /// so reverse that permutation before sanitizing the weight names.
+    private static func linearAttentionLayout(from configurationData: Data)
+        -> LinearAttentionLayout?
+    {
+        guard let root = try? JSONSerialization.jsonObject(with: configurationData)
+                as? [String: Any] else { return nil }
+        let values = (root["text_config"] as? [String: Any]) ?? root
+        guard let numKeyHeads = values["linear_num_key_heads"] as? Int,
+              let numValueHeads = values["linear_num_value_heads"] as? Int,
+              let keyHeadDimension = values["linear_key_head_dim"] as? Int,
+              let valueHeadDimension = values["linear_value_head_dim"] as? Int,
+              numKeyHeads > 0,
+              numValueHeads > 0,
+              numValueHeads % numKeyHeads == 0,
+              keyHeadDimension > 0,
+              valueHeadDimension > 0 else { return nil }
+        return LinearAttentionLayout(
+            numKeyHeads: numKeyHeads,
+            numValueHeads: numValueHeads,
+            keyHeadDimension: keyHeadDimension,
+            valueHeadDimension: valueHeadDimension
+        )
+    }
+
+    private static func reorderQwen35LinearAttentionWeights(
+        _ weights: [String: MLXArray],
+        layout: LinearAttentionLayout,
+        groupSize: Int
+    ) -> [String: MLXArray] {
+        var reordered = weights
+        for (name, value) in weights {
+            let baseName: String
+            if name.hasSuffix(".scales") {
+                baseName = String(name.dropLast(".scales".count)) + ".weight"
+            } else if name.hasSuffix(".biases") {
+                baseName = String(name.dropLast(".biases".count)) + ".weight"
+            } else {
+                baseName = name
+            }
+
+            let transformed: MLXArray?
+            if baseName.hasSuffix(".attn_qkv.weight") {
+                transformed = reorderQKV(value, layout: layout)
+            } else if baseName.hasSuffix(".attn_gate.weight") {
+                transformed = reorderValueRows(
+                    value,
+                    layout: layout,
+                    headDimension: layout.valueHeadDimension
+                )
+            } else if baseName.hasSuffix(".ssm_alpha.weight")
+                        || baseName.hasSuffix(".ssm_beta.weight") {
+                transformed = reorderValueRows(
+                    value,
+                    layout: layout,
+                    headDimension: 1
+                )
+            } else if baseName.hasSuffix(".ssm_a")
+                        || baseName.hasSuffix(".ssm_dt.bias") {
+                transformed = reorderValueRows(
+                    value,
+                    layout: layout,
+                    headDimension: 1
+                )
+            } else if baseName.hasSuffix(".ssm_conv1d.weight") {
+                transformed = reorderConv1D(value, layout: layout)
+            } else if baseName.hasSuffix(".ssm_out.weight") {
+                transformed = reorderValueColumns(
+                    value,
+                    layout: layout,
+                    groupSize: groupSize
+                )
+            } else {
+                transformed = nil
+            }
+            if let transformed {
+                reordered[name] = transformed
+            }
+        }
+        return reordered
+    }
+
+    private static func reorderQKV(
+        _ value: MLXArray,
+        layout: LinearAttentionLayout
+    ) -> MLXArray {
+        guard value.ndim >= 2,
+              value.dim(0) == layout.keyRows * 2 + layout.valueRows else { return value }
+        // Qwen3.5's fused projection is [q, k, v].  Both q and k use
+        // keyRows; only the v rows need to be restored from GGUF's tiled
+        // order to the grouped order expected by mlx-swift-lm.
+        let keyRows = layout.keyRows
+        let keyPart = value[0..<(keyRows * 2), .ellipsis]
+        let valuePart = value[(keyRows * 2)..., .ellipsis]
+        let reorderedValue = reorderValueRows(
+            valuePart,
+            layout: layout,
+            headDimension: layout.valueHeadDimension
+        )
+        return concatenated([keyPart, reorderedValue], axis: 0)
+    }
+
+    private static func reorderConv1D(
+        _ value: MLXArray,
+        layout: LinearAttentionLayout
+    ) -> MLXArray {
+        guard value.ndim >= 2,
+              value.dim(0) == layout.keyRows * 2 + layout.valueRows else { return value }
+        let valueStart = layout.keyRows * 2
+        let prefix = value[0..<valueStart, .ellipsis]
+        let valuePart = value[valueStart..., .ellipsis]
+        let reorderedValue = reorderValueRows(
+            valuePart,
+            layout: layout,
+            headDimension: layout.valueHeadDimension
+        )
+        return concatenated([prefix, reorderedValue], axis: 0)
+    }
+
+    private static func reorderValueRows(
+        _ value: MLXArray,
+        layout: LinearAttentionLayout,
+        headDimension: Int
+    ) -> MLXArray {
+        guard value.ndim >= 1,
+              headDimension > 0,
+              value.dim(0) == layout.numValueHeads * headDimension else { return value }
+        return reorderHeadAxis(
+            value,
+            axis: 0,
+            headDimension: headDimension,
+            layout: layout
+        )
+    }
+
+    private static func reorderValueColumns(
+        _ value: MLXArray,
+        layout: LinearAttentionLayout,
+        groupSize: Int
+    ) -> MLXArray {
+        guard value.ndim >= 2, groupSize > 0 else { return value }
+        let dimensionLength = value.dim(-1)
+        let packingFactor: Int
+        if dimensionLength == layout.valueRows / 8 {
+            packingFactor = 8
+        } else if dimensionLength == layout.valueRows / 4 {
+            packingFactor = 4
+        } else if dimensionLength == layout.valueRows / groupSize {
+            // Scales and biases have one value per quantization group.
+            packingFactor = groupSize
+        } else {
+            return value
+        }
+        guard layout.valueHeadDimension % packingFactor == 0 else { return value }
+        return reorderHeadAxis(
+            value,
+            axis: value.ndim - 1,
+            headDimension: layout.valueHeadDimension / packingFactor,
+            layout: layout
+        )
+    }
+
+    private static func reorderHeadAxis(
+        _ value: MLXArray,
+        axis: Int,
+        headDimension: Int,
+        layout: LinearAttentionLayout
+    ) -> MLXArray {
+        let axis = axis >= 0 ? axis : value.ndim + axis
+        guard axis >= 0,
+              axis < value.ndim,
+              value.dim(axis) == layout.numValueHeads * headDimension else {
+            return value
+        }
+
+        var reshapedShape = value.shape
+        reshapedShape.replaceSubrange(
+            axis...axis,
+            with: [layout.valuesPerKeyHead, layout.numKeyHeads, headDimension]
+        )
+        let rank = reshapedShape.count
+        var permutation = Array(0..<rank)
+        permutation[axis] = axis + 1
+        permutation[axis + 1] = axis
+        let transposed = value.reshaped(reshapedShape).transposed(axes: permutation)
+        return transposed.reshaped(value.shape)
     }
 
     private static func quantizeGGUFModel(

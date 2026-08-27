@@ -5,6 +5,14 @@ import MLXLMCommon
 import MangaKitchenCore
 import Tokenizers
 
+private final class DiagnosticLMInputBox: @unchecked Sendable {
+    let value: LMInput
+
+    init(_ value: LMInput) {
+        self.value = value
+    }
+}
+
 /// 本機 Hugging Face MLX 純文字模型 runtime。目前先提供模型載入與文字生成
 /// 能力，翻譯管線將在另一步透過 `TextGenerating` 接入。
 actor MLXTextRuntime: TextGenerating {
@@ -14,6 +22,7 @@ actor MLXTextRuntime: TextGenerating {
     private let ggufWeightsURL: URL?
     private let generation: ModelManifest.Generation
     private let ggufQuantizationGroupSize: Int
+    private let ggufQuantizationProfile: GGUFQuantizationProfile
     private let thinkingEnabled: Bool
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
@@ -23,6 +32,7 @@ actor MLXTextRuntime: TextGenerating {
         directoryURL: URL,
         manifest: ModelManifest,
         ggufQuantizationGroupSize: Int = 64,
+        ggufQuantizationProfile: GGUFQuantizationProfile = .quality,
         thinkingEnabled: Bool = false,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
@@ -51,6 +61,7 @@ actor MLXTextRuntime: TextGenerating {
         )
         generation = manifest.generation ?? ModelManifest.Generation()
         self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
+        self.ggufQuantizationProfile = ggufQuantizationProfile
         self.thinkingEnabled = thinkingEnabled
         self.log = log
         self.reasoningStream = reasoningStream
@@ -125,6 +136,15 @@ actor MLXTextRuntime: TextGenerating {
             repetitionPenalty: max(generation.repetitionPenalty, 1),
             repetitionContextSize: 128
         )
+        if ProcessInfo.processInfo.environment["MANGAKITCHEN_DUMP_RAW_TOKENS"] == "1" {
+            let diagnosticOutput = try await generateRawTokenDiagnostic(
+                container: container,
+                input: prepared,
+                parameters: parameters
+            )
+            progress(1)
+            return diagnosticOutput
+        }
         let stream = try await container.generate(input: prepared, parameters: parameters)
         let generationStart = Date()
         let expectedChunks = min(maxTokens, 512)
@@ -248,6 +268,46 @@ actor MLXTextRuntime: TextGenerating {
         return output
     }
 
+    /// Diagnostic-only path used to separate model logits from text decoding.
+    /// The normal generation path intentionally remains unchanged; set
+    /// `MANGAKITCHEN_DUMP_RAW_TOKENS=1` for a single smoke run to print IDs and
+    /// decode the same IDs through the loaded Swift tokenizer.
+    private func generateRawTokenDiagnostic(
+        container: ModelContainer,
+        input: LMInput,
+        parameters: GenerateParameters
+    ) async throws -> String {
+        let boxedInput = DiagnosticLMInputBox(input)
+        let stream = try await container.perform { context in
+            try generateTokens(
+                input: boxedInput.value,
+                parameters: parameters,
+                context: context,
+                includeStopToken: false
+            )
+        }
+        var tokenIDs = [Int]()
+        for await event in stream {
+            if let token = event.token {
+                tokenIDs.append(token)
+            }
+            if let info = event.info {
+                log(
+                    .info,
+                    "Generation Metrics",
+                    "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                        + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                        + "tokensPerSecond=\(info.tokensPerSecond)"
+                )
+            }
+        }
+        let renderedIDs = tokenIDs.map(String.init).joined(separator: ",")
+        log(.info, "Raw Tokens", "ids=[\(renderedIDs)]")
+        let decoded = await container.decode(tokenIds: tokenIDs)
+        log(.info, "Raw Tokens", "swiftDecoded=\(decoded)")
+        return decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private static func isRepeatingTail(_ output: String) -> Bool {
         let sampleLength = 90
         guard output.count > sampleLength * 3 else { return false }
@@ -288,7 +348,8 @@ actor MLXTextRuntime: TextGenerating {
             loaded = try await MLXGGUFModelLoader.loadContainer(
                 from: modelDirectory,
                 weightURL: ggufWeightsURL,
-                quantizationGroupSize: ggufQuantizationGroupSize
+                quantizationGroupSize: ggufQuantizationGroupSize,
+                quantizationProfile: ggufQuantizationProfile
             )
         } else {
             loaded = try await LLMModelFactory.shared.loadContainer(

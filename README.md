@@ -136,6 +136,27 @@ The GUI always starts. When `--mcp` is omitted, the saved Settings value is used
 
 Data-location changes take effect after restart. Image-to-text, image-colorization, and super-resolution model changes are applied immediately. Changing the MCP switch, port, or allowlist restarts the listener.
 
+### SwiftPM and Metal build troubleshooting
+
+MLX depends on its bundled Metal resource (`default.metallib`). If `swift test` stops with `Failed to load the default metallib`, the test has failed while initializing MLX and has not reached the MangaKitchen GGUF loader. This is not a MangaKitchen or GGUF kernel error.
+
+Start with a clean SwiftPM dependency and build cache:
+
+```bash
+swift package clean
+swift package resolve
+swift test
+```
+
+Confirm that the Apple Metal command-line tools are available:
+
+```bash
+xcrun --find metal
+xcrun --find metallib
+```
+
+Both commands should print paths inside an Apple Metal toolchain. The supported environment is Apple Silicon running macOS 14 or later with a complete Xcode Command Line Tools／Metal installation. If the commands resolve but `default.metallib` is still missing, repair or reinstall the Command Line Tools, reopen the terminal, and repeat the clean build. A successful `swift build` confirms compilation; the MLX runtime tests additionally require the Metal resource to be present at test execution time.
+
 Project indexes, project states, and intermediate files are stored by default under:
 
 ```text
@@ -178,20 +199,21 @@ The `mlx-swift-lm` factory selects architecture from `config.json`, so a single 
 
 ### GGUF 權重
 
-`MLXTextRuntime` 與 `MLXVLMRuntime` 支援直接從模型目錄載入 `.gguf` 權重，不需要先轉成 Safetensors。正式 App 預設以 `group64` 直接從 GGUF raw block 建立 MLX `wq/scales/biases`：`Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 目標為 `INT4`，`Q8_0`／`Q5_K`／`Q6_K` 目標為 `INT8`，不會先建立 `group32` 再轉換，也不再配置整顆 `Float16` tensor。其他未列出的 GGUF 量化型別（包含 `Q8_K`）會在 inspect 與載入前明確回報不支援。llama.cpp bridge 僅保留在 `Tools/GGUFBackendPOC` 作為 parser 對照，不是 App 的正式載入依賴。
+`MLXTextRuntime` 與 `MLXVLMRuntime` 支援直接從模型目錄載入 `.gguf` 權重，不需要先轉成 Safetensors。正式 App 預設以 `group64`、`quality` profile 直接從 GGUF raw block 建立 MLX `wq/scales/biases`：`Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 目標為 `INT4`，`Q8_0`／`Q5_K`／`Q6_K` 目標為 `INT8`。開發者可用 `speed` profile 將 Q5_K／Q6_K 二次量化為 `INT4`，降低 decode 記憶體頻寬但可能降低品質；未指定時維持 `quality`。所有 GGUF F32／F16 compute 權重會轉為 BF16，唯一例外是 Qwen3.5 的 `blk.N.ssm_a`（`linear_attn.A_log`）保留 F32；mmproj 也會沿用相同 group size。其他未列出的 GGUF 量化型別（包含 `Q8_K`）會在 inspect 與載入前明確回報不支援。llama.cpp bridge 僅保留在 `Tools/GGUFBackendPOC` 作為 parser 對照，不是 App 的正式載入依賴。
 
 GGUF loader 會優先從主 `.gguf` 的 metadata 建立模型設定與 tokenizer；外部 `config.json`、`tokenizer.json`、`tokenizer_config.json` 僅作為 fallback。因而具備完整 GGUF metadata 的純文字模型可以只保留 `.gguf`，多模態模型仍必須提供配對的 `mmproj-*.gguf`；若 processor 設定不在目錄中，會由 `mmproj` metadata 建立基本設定。外部 tokenizer fallback 至少需要 `tokenizer.json`，`tokenizer_config.json` 可與內嵌或外部 tokenizer data 組合使用。
 
-`FP16` 與 `FP32` 會保留原型別；跨格式精度策略則將可辨識的 `FP8`（包含 `F8_E4M3`／`F8_E5M2` 變體）重新量化為 `INT8`。目前 llama.cpp 的標準 GGUF 型別表沒有獨立的 FP8 tensor type，因此 Swift loader 不會把未知的 GGUF type 假裝成 FP8；`GGUFStoragePolicy.targetStorageType(for:)` 已固定這項目標策略，待上游 parser 或其他 tensor 格式提供明確 FP8 encoding 後再接入實際解碼。這不會把 `FP16`／`FP32` 一併降級。
+`FP8`（包含 `F8_E4M3`／`F8_E5M2` 變體）仍採 `INT8` 重新量化；一般 GGUF `F16`／`F32` compute 權重則依上述規則轉成 BF16，僅 `blk.N.ssm_a` 保留 F32。目前 llama.cpp 的標準 GGUF 型別表沒有獨立的 FP8 tensor type，因此 Swift loader 不會把未知的 GGUF type 假裝成 FP8；`GGUFStoragePolicy.targetStorageType(for:)` 已固定 `quality` profile 的目標策略，`targetStorageType(for:profile:)` 可查詢速度 profile，待上游 parser 或其他 tensor 格式提供明確 FP8 encoding 後再接入實際解碼。
 
 ```bash
 swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-GGUF \
-  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128 \
+  --gguf-group-size 64 --gguf-profile quality
 swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-MLX-4bit \
   --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
 ```
 
-`GGUFSmoke` 與 `Tools/GGUFBackendPOC` 只供開發者進行格式、數值與效能驗證。它們的 benchmark 與 fixture 結果不會被 App 讀取，也不會決定 runtime 的模型選擇或品質門檻；正式載入只依 `GGUFStoragePolicy` 與 loader 的實際能力檢查。要比較不同格式，請在相同硬體與參數下分別執行上述命令，將結果視為當次測量，而非產品固定值。
+`GGUFSmoke` 與 `Tools/GGUFBackendPOC` 只供開發者進行格式、數值與效能驗證。`GGUFSmoke` 可用 `--gguf-profile quality|speed` 切換 Q5_K／Q6_K 的 INT8 或 INT4 目標；`quality` 是正式 App 預設值，`speed` 只適合在完成品質驗證後比較。它們的 benchmark 與 fixture 結果不會被 App 讀取，也不會決定 runtime 的模型選擇或品質門檻；正式載入只依 `GGUFStoragePolicy` 與 loader 的實際能力檢查。要比較不同格式，請在相同硬體與參數下分別執行上述命令，將結果視為當次測量，而非產品固定值。
 
 多模態 GGUF 不是只有主模型檔。模型目錄必須同時保留 `config.json`、Hugging Face tokenizer／chat template，以及與主模型配對的 `mmproj-*.gguf` 視覺投影檔；缺少 `mmproj` 時不會假裝以純文字模型載入。模型下載器會先檢查 repository 是否存在指定的 `mmproj`，只下載主 GGUF、該 `mmproj` 與必要的 Qwen 基礎設定檔，不會把其他 Q4／Q8 或 IQ GGUF 一起下載。
 

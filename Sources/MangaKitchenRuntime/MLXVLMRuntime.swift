@@ -16,6 +16,7 @@ actor MLXVLMRuntime: ImageToTextGenerating {
     private let mmprojURL: URL?
     private let generation: ModelManifest.Generation
     private let ggufQuantizationGroupSize: Int
+    private let ggufQuantizationProfile: GGUFQuantizationProfile
     private let thinkingEnabled: Bool
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
@@ -25,6 +26,7 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         directoryURL: URL,
         manifest: ModelManifest,
         ggufQuantizationGroupSize: Int = 64,
+        ggufQuantizationProfile: GGUFQuantizationProfile = .quality,
         thinkingEnabled: Bool = false,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
@@ -66,6 +68,7 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         self.ggufWeightsURL = ggufWeightsURL
         self.generation = manifest.generation ?? ModelManifest.Generation()
         self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
+        self.ggufQuantizationProfile = ggufQuantizationProfile
         self.thinkingEnabled = thinkingEnabled
         self.log = log
         self.reasoningStream = reasoningStream
@@ -312,7 +315,8 @@ actor MLXVLMRuntime: ImageToTextGenerating {
                 from: modelDirectory,
                 weightURL: ggufWeightsURL,
                 mmprojURL: mmprojURL,
-                quantizationGroupSize: ggufQuantizationGroupSize
+                quantizationGroupSize: ggufQuantizationGroupSize,
+                quantizationProfile: ggufQuantizationProfile
             )
         } else {
             loaded = try await VLMModelFactory.shared.loadContainer(

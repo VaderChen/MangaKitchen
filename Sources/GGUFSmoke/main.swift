@@ -81,10 +81,13 @@ struct GGUFSmoke {
         var mmprojPath: String?
         var shouldLoad = false
         var shouldBenchmark = false
+        var shouldPrintOutput = false
+        var shouldDumpConfiguration = false
         var imagePath: String?
         var prompt = "Describe this image in one short sentence."
         var maximumOutputTokens = 128
         var ggufQuantizationGroupSize = 32
+        var ggufQuantizationProfile: GGUFQuantizationProfile = .quality
         var index = 0
         while index < arguments.count {
             switch arguments[index] {
@@ -105,6 +108,10 @@ struct GGUFSmoke {
             case "--benchmark":
                 shouldLoad = true
                 shouldBenchmark = true
+            case "--print-output":
+                shouldPrintOutput = true
+            case "--dump-config":
+                shouldDumpConfiguration = true
             case "--image":
                 index += 1
                 guard index < arguments.count else { return usage() }
@@ -127,6 +134,12 @@ struct GGUFSmoke {
                       parsedGroupSize == 32 || parsedGroupSize == 64
                 else { return usage() }
                 ggufQuantizationGroupSize = parsedGroupSize
+            case "--gguf-profile":
+                index += 1
+                guard index < arguments.count,
+                      let parsedProfile = GGUFQuantizationProfile(rawValue: arguments[index])
+                else { return usage() }
+                ggufQuantizationProfile = parsedProfile
             case "--help", "-h":
                 return usage()
             default:
@@ -153,6 +166,20 @@ struct GGUFSmoke {
                     )
                     printInspection("mmproj", mmprojInspection)
                 }
+                if shouldDumpConfiguration {
+                    let configurationData = try backend.configurationData(
+                        fileURL: mainURL,
+                        mmprojURL: mmprojPath.map(URL.init(fileURLWithPath:))
+                    )
+                    guard let configuration = String(data: configurationData, encoding: .utf8) else {
+                        throw NSError(
+                            domain: "GGUFSmoke",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Generated GGUF configuration is not UTF-8."]
+                        )
+                    }
+                    print("configuration=\(configuration)")
+                }
                 directoryURL = mainURL.deletingLastPathComponent()
             } else if let directoryPath {
                 directoryURL = URL(fileURLWithPath: directoryPath)
@@ -163,13 +190,15 @@ struct GGUFSmoke {
             if shouldLoad {
                 print(
                     "mlxLoad=starting directory=\(directoryURL.path) "
-                        + "ggufGroupSize=\(ggufQuantizationGroupSize)"
+                        + "ggufGroupSize=\(ggufQuantizationGroupSize) "
+                        + "ggufProfile=\(ggufQuantizationProfile.rawValue)"
                 )
                 let metal = try MetalContext()
                 let metricsRecorder = BenchmarkMetricsRecorder()
                 let hub = ModelRuntimeHub(
                     metal: metal,
                     ggufQuantizationGroupSize: ggufQuantizationGroupSize,
+                    ggufQuantizationProfile: ggufQuantizationProfile,
                     log: { level, category, message in
                         metricsRecorder.record(category: category, message: message)
                         print("log=\(level.rawValue) category=\(category) message=\(message)")
@@ -186,17 +215,18 @@ struct GGUFSmoke {
                 printMeasurement(name: "load", seconds: loadSeconds, peakRSSBytes: peakRSSBytes)
                 if shouldBenchmark {
                     let benchmarkStart = Date()
+                    let generatedText: String
                     switch loaded.capability {
                     case .imageToText:
                         guard let imagePath else { return usage() }
-                        _ = try await hub.generateText(
+                        generatedText = try await hub.generateText(
                             imageURL: URL(fileURLWithPath: imagePath),
                             prompt: prompt,
                             maximumOutputTokens: maximumOutputTokens,
                             progress: { _ in }
                         )
                     case .textToText:
-                        _ = try await hub.generateText(
+                        generatedText = try await hub.generateText(
                             prompt: prompt,
                             maximumOutputTokens: maximumOutputTokens,
                             progress: { _ in }
@@ -206,6 +236,9 @@ struct GGUFSmoke {
                     }
                     let benchmarkSeconds = Date().timeIntervalSince(benchmarkStart)
                     print("benchmark=ok seconds=\(benchmarkSeconds)")
+                    if shouldPrintOutput {
+                        print("output=\(generatedText)")
+                    }
                     printMeasurement(
                         name: "generation",
                         seconds: benchmarkSeconds,
@@ -289,7 +322,8 @@ struct GGUFSmoke {
             "usage: GGUFSmoke (--file model.gguf [--mmproj mmproj.gguf] "
                 + "| --directory model-directory) [--load] "
                 + "[--benchmark --image image] [--prompt text] [--tokens count] "
-                + "[--gguf-group-size 32|64]"
+                + "[--gguf-group-size 32|64] [--gguf-profile quality|speed] "
+                + "[--print-output] [--dump-config]"
         )
     }
 }

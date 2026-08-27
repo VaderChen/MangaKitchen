@@ -795,6 +795,7 @@ figcaption { margin-bottom: 7px; color: #c9cace; font-weight: 600; }
 .settings-field input, .settings-field select { width: 100%; color: var(--text); }
 .settings-inline-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(150px, .55fr); align-items: end; gap: 16px; }
 .settings-inline-row > .settings-field { min-width: 0; }
+.model-format-version-row { grid-template-columns: minmax(140px, .45fr) minmax(0, 1fr); }
 .settings-actions { display: flex; gap: 7px; }
 .settings-notice { margin: 0; padding: 8px 10px; border-radius: 7px; color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
 .settings-path-group { display: grid; gap: 7px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--panel-raised); }

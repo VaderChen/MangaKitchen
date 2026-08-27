@@ -26,12 +26,22 @@ enum MLXGGUFEmbeddedAssets {
         let configuration: [String: Any]
         switch normalizedArchitecture(architecture) {
         case "qwen35":
+            let hasOutputWeight = try MLXGGUFLoader.inspect(from: weightURL)
+                .tensors
+                .contains { $0.name == "output.weight" }
+            // 優先沿用模型自己的 tie_word_embeddings 設定；只有 GGUF
+            // 沒有可用設定時，才以缺少 output.weight 作為保守 fallback。
+            let configuredTieWordEmbeddings = configuredTieWordEmbeddings(
+                in: weightURL.deletingLastPathComponent()
+            )
             configuration = try qwen35Configuration(
                 metadata: metadata,
                 projectorMetadata: try mmprojURL.map {
                     try MLXGGUFLoader.metadata(from: $0)
                 },
-                isVision: mmprojURL != nil
+                isVision: mmprojURL != nil,
+                configuredTieWordEmbeddings: configuredTieWordEmbeddings,
+                hasOutputWeight: hasOutputWeight
             )
         case "qwen3":
             configuration = try standardTextConfiguration(
@@ -147,14 +157,18 @@ enum MLXGGUFEmbeddedAssets {
     private static func qwen35Configuration(
         metadata: [String: MLXGGUFMetadataValue],
         projectorMetadata: [String: MLXGGUFMetadataValue]?,
-        isVision: Bool
+        isVision: Bool,
+        configuredTieWordEmbeddings: Bool?,
+        hasOutputWeight: Bool
     ) throws -> [String: Any] {
-        let textConfiguration = try qwen35TextConfiguration(metadata: metadata)
+        var textConfiguration = try qwen35TextConfiguration(metadata: metadata)
+        let tieWordEmbeddings = configuredTieWordEmbeddings ?? !hasOutputWeight
+        textConfiguration["tie_word_embeddings"] = tieWordEmbeddings
         guard isVision, let projectorMetadata else {
             return [
                 "model_type": "qwen3_5_text",
                 "architectures": ["Qwen3_5ForCausalLM"],
-                "tie_word_embeddings": false,
+                "tie_word_embeddings": tieWordEmbeddings,
                 "hidden_size": textConfiguration["hidden_size"]!,
                 "num_hidden_layers": textConfiguration["num_hidden_layers"]!,
                 "intermediate_size": textConfiguration["intermediate_size"]!,
@@ -179,7 +193,7 @@ enum MLXGGUFEmbeddedAssets {
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "text_config": textConfiguration,
             "vision_config": visionConfiguration,
-            "tie_word_embeddings": false
+            "tie_word_embeddings": tieWordEmbeddings
         ]
         for (metadataKey, configurationKey) in [
             ("<|image_pad|>", "image_token_id"),
@@ -195,6 +209,22 @@ enum MLXGGUFEmbeddedAssets {
             result["eos_token_id"] = eosTokenID
         }
         return result
+    }
+
+    /// GGUF metadata 通常沒有 tie_word_embeddings；若同目錄提供 Hugging
+    /// Face config.json，則以它作為常規設定來源。找不到設定時由呼叫端
+    /// 以 GGUF 是否含 output.weight 執行 fallback 判斷。
+    private static func configuredTieWordEmbeddings(in directoryURL: URL) -> Bool? {
+        let configurationURL = directoryURL.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configurationURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        if let textConfiguration = root["text_config"] as? [String: Any],
+           let value = textConfiguration["tie_word_embeddings"] as? Bool {
+            return value
+        }
+        return root["tie_word_embeddings"] as? Bool
     }
 
     private static func qwen35TextConfiguration(

@@ -49,6 +49,7 @@ const canvasBaseSizes = new WeakMap();
 const colorSchemeStorageKey = "mangakitchen.color-scheme";
 const inspectorTabStorageKey = "mangakitchen.inspector-tab";
 const modelTabStorageKey = "mangakitchen.model-tab";
+const imageToTextModelFormatStorageKey = "mangakitchen.image-to-text-model-format";
 
 const elements = {
   workflowBar: document.querySelector(".workflow-bar"),
@@ -169,6 +170,7 @@ const elements = {
   settingsDefaultOutputDirectory: document.querySelector("#settings-default-output-directory"),
   settingsModelThinking: document.querySelector("#settings-model-thinking"),
   settingsImageToTextModel: document.querySelector("#settings-image-to-text-model"),
+  settingsImageToTextModelFormat: document.querySelector("#settings-image-to-text-model-format"),
   settingsImageToTextModelVariant: document.querySelector("#settings-image-to-text-model-variant"),
   settingsImageToTextModelDownload: document.querySelector("#download-image-to-text-model"),
   settingsImageToTextModelClear: document.querySelector("#clear-image-to-text-model"),
@@ -3417,6 +3419,46 @@ function updateGlobalSettings(overrides) {
     });
 }
 
+function normalizedImageToTextModelFormat(value) {
+  return ["all", "mlxDirectory", "ggufDirectory"].includes(value) ? value : "all";
+}
+
+function imageToTextModelMatchesFormat(model, format) {
+  return format === "all" || (model.format ?? "mlxDirectory") === format;
+}
+
+function makeImageToTextModelOption(model) {
+  const option = document.createElement("option");
+  option.value = model.id;
+  const annotations = [];
+  if (model.recommended) annotations.push(t("recommended"));
+  if (model.installed) annotations.push(t("modelDownloaded"));
+  option.textContent = annotations.length > 0
+    ? `${model.displayName}（${annotations.join(" · ")}）`
+    : model.displayName;
+  return option;
+}
+
+function makeImageToTextModelOptionNodes(models, format) {
+  if (format !== "all") return models.map(makeImageToTextModelOption);
+
+  const knownFormats = ["mlxDirectory", "ggufDirectory"];
+  const groupedNodes = knownFormats.flatMap((groupFormat) => {
+    const groupModels = models.filter((model) =>
+      (model.format ?? "mlxDirectory") === groupFormat
+    );
+    if (groupModels.length === 0) return [];
+    const group = document.createElement("optgroup");
+    group.label = t(groupFormat === "ggufDirectory" ? "modelFormatGGUF" : "modelFormatMLX");
+    group.append(...groupModels.map(makeImageToTextModelOption));
+    return [group];
+  });
+  const unknownModels = models.filter((model) =>
+    !knownFormats.includes(model.format ?? "mlxDirectory")
+  );
+  return groupedNodes.concat(unknownModels.map(makeImageToTextModelOption));
+}
+
 function renderMCPWhitelist(settings) {
   elements.mcpWhitelist.replaceChildren();
   if (!settings.mcpAllowedClients.length) {
@@ -3466,45 +3508,57 @@ function renderGlobalSettings() {
   elements.dataDirectoryRestartNote.hidden = !settings.dataDirectoryRestartRequired;
   elements.settingsImageToTextModel.value = settings.imageToTextModelDownloadDirectoryPath ?? "";
   const modelOptions = settings.imageToTextModelOptions ?? [];
-  const modelOptionsSignature = modelOptions
+  const selectedModelFormat = normalizedImageToTextModelFormat(
+    localStorage.getItem(imageToTextModelFormatStorageKey)
+  );
+  elements.settingsImageToTextModelFormat.value = selectedModelFormat;
+  const filteredModelOptions = modelOptions.filter((model) =>
+    imageToTextModelMatchesFormat(model, selectedModelFormat)
+  );
+  const selectedModelIsVisible = filteredModelOptions.some(
+    (model) => model.id === settings.imageToTextModelVariant
+  );
+  const selectedModelVariantForUI = selectedModelIsVisible
+    ? settings.imageToTextModelVariant
+    : filteredModelOptions[0]?.id ?? settings.imageToTextModelVariant;
+  const modelOptionsSignature = `${selectedModelFormat}\n${filteredModelOptions
     .map((model) => [
       model.id,
       model.displayName,
       model.recommended,
       model.installed,
+      model.format,
       t("recommended"),
       t("modelDownloaded"),
     ].join(":"))
-    .join("\n");
+    .join("\n")}`;
   if (elements.settingsImageToTextModelVariant.dataset.optionsSignature !== modelOptionsSignature) {
-    elements.settingsImageToTextModelVariant.replaceChildren(...modelOptions.map((model) => {
-      const option = document.createElement("option");
-      option.value = model.id;
-      const annotations = [];
-      if (model.recommended) annotations.push(t("recommended"));
-      if (model.installed) annotations.push(t("modelDownloaded"));
-      option.textContent = annotations.length > 0
-        ? `${model.displayName}（${annotations.join(" · ")}）`
-        : model.displayName;
-      return option;
-    }));
+    elements.settingsImageToTextModelVariant.replaceChildren(
+      ...makeImageToTextModelOptionNodes(filteredModelOptions, selectedModelFormat)
+    );
     elements.settingsImageToTextModelVariant.dataset.optionsSignature = modelOptionsSignature;
   }
-  elements.settingsImageToTextModelVariant.value = settings.imageToTextModelVariant;
+  elements.settingsImageToTextModelVariant.value = selectedModelVariantForUI;
+  const selectedModelOption = modelOptions.find(
+    (model) => model.id === selectedModelVariantForUI
+  );
+  const selectedModelInstalled = selectedModelOption?.installed
+    ?? settings.imageToTextModelInstalled;
   const textModelDownload = settings.modelDownloadState?.capability === "imageToText"
     ? settings.modelDownloadState
     : null;
   const textModelDownloading = Boolean(textModelDownload);
   const textModelDirectorySelected = Boolean(settings.imageToTextModelDownloadDirectoryPath);
   elements.settingsImageToTextModelDownload.disabled = !textModelDirectorySelected
-    || settings.imageToTextModelInstalled
+    || selectedModelInstalled
     || textModelDownloading;
-  elements.settingsImageToTextModelDownload.textContent = settings.imageToTextModelInstalled
+  elements.settingsImageToTextModelDownload.textContent = selectedModelInstalled
     ? t("modelInstalled")
     : textModelDownloading
       ? t("downloadingModel")
       : t("downloadModel");
   elements.settingsImageToTextModelVariant.disabled = textModelDownloading;
+  elements.settingsImageToTextModelFormat.disabled = textModelDownloading;
   elements.settingsImageToTextModelClear.disabled = !textModelDownloading
     && !settings.imageToTextModelDownloadDirectoryPath
     && !settings.imageToTextModelPath;
@@ -3512,7 +3566,7 @@ function renderGlobalSettings() {
     ? t("stopDownload")
     : t("clear");
   elements.settingsImageToTextModelClear.classList.toggle("danger-text", textModelDownloading);
-  elements.settingsImageToTextModelDelete.hidden = !settings.imageToTextModelInstalled;
+  elements.settingsImageToTextModelDelete.hidden = !selectedModelInstalled;
   elements.settingsImageToTextModelDelete.disabled = textModelDownloading || state.isProcessing;
   elements.settingsImageToTextModelDownloadProgress.hidden = !textModelDownloading;
   if (textModelDownload) {
@@ -4704,6 +4758,27 @@ document.querySelector("#choose-image-to-text-model").addEventListener("click", 
     })
     .catch(showError);
 });
+elements.settingsImageToTextModelFormat.addEventListener("change", () => {
+  const format = normalizedImageToTextModelFormat(
+    elements.settingsImageToTextModelFormat.value
+  );
+  localStorage.setItem(imageToTextModelFormatStorageKey, format);
+  const settings = state?.globalSettings;
+  const filteredModelOptions = (settings?.imageToTextModelOptions ?? []).filter((model) =>
+    imageToTextModelMatchesFormat(model, format)
+  );
+  const currentVariant = settings?.imageToTextModelVariant;
+  const nextVariant = filteredModelOptions.some((model) => model.id === currentVariant)
+    ? currentVariant
+    : filteredModelOptions[0]?.id;
+  if (nextVariant && nextVariant !== currentVariant) {
+    elements.settingsImageToTextModelVariant.value = nextVariant;
+    updateGlobalSettings({ imageToTextModelVariant: nextVariant })
+      .then(() => renderGlobalSettings());
+  } else {
+    renderGlobalSettings();
+  }
+});
 elements.settingsImageToTextModelVariant.addEventListener("change", () => {
   updateGlobalSettings({
     imageToTextModelVariant: elements.settingsImageToTextModelVariant.value,
@@ -4738,7 +4813,7 @@ elements.settingsImageToTextModelDelete.addEventListener("click", () => {
     if (!confirmed) return;
     return invoke("deleteInstalledModel", {
       capability: "imageToText",
-      variantID: settings.imageToTextModelVariant,
+      variantID: elements.settingsImageToTextModelVariant.value,
     });
   }).catch(showError);
 });

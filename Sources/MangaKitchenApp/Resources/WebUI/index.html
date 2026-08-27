@@ -510,12 +510,22 @@
                     <button id="choose-image-to-text-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
                   </div>
                 </div>
-                <label class="settings-field">
-                  <span data-i18n="modelVersion">模型版本</span>
-                  <select id="settings-image-to-text-model-variant">
-                    <option value="qwen3.5-4b-4bit">Qwen3.5-4B 4-bit（推薦）</option>
-                  </select>
-                </label>
+                <div class="settings-inline-row model-format-version-row">
+                  <label class="settings-field">
+                    <span data-i18n="modelFormat">模型格式</span>
+                    <select id="settings-image-to-text-model-format">
+                      <option value="all" data-i18n="modelFormatAll">全部</option>
+                      <option value="mlxDirectory" data-i18n="modelFormatMLX">MLX</option>
+                      <option value="ggufDirectory" data-i18n="modelFormatGGUF">GGUF</option>
+                    </select>
+                  </label>
+                  <label class="settings-field">
+                    <span data-i18n="modelVersion">模型版本</span>
+                    <select id="settings-image-to-text-model-variant">
+                      <option value="qwen3.5-4b-4bit">Qwen3.5-4B 4-bit（推薦）</option>
+                    </select>
+                  </label>
+                </div>
                 <div class="settings-actions">
                   <button id="download-image-to-text-model" type="button" class="primary" data-i18n="downloadModel" disabled>下載</button>
                   <button id="clear-image-to-text-model" type="button" class="quiet" data-i18n="clear">清除</button>

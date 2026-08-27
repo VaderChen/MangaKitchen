@@ -11,9 +11,9 @@ enum MLXGGUFMetalQuantizer {
             uint source_bytes = sourceType == 8 ? 34 : sourceType == 3 ? 20 : 18;
             uint raw_offset = block * source_bytes;
             float scale = load_f16(raw, raw_offset);
-            scales[block] = half(scale);
+            scales[block] = bfloat(scale);
             if (sourceType == 3) {
-                biases[block] = half(load_f16(raw, raw_offset + 2));
+                biases[block] = bfloat(load_f16(raw, raw_offset + 2));
                 for (uint word = 0; word < 4; ++word) {
                     uint result = 0;
                     for (uint byte_index = 0; byte_index < 4; ++byte_index) {
@@ -29,7 +29,7 @@ enum MLXGGUFMetalQuantizer {
                     wq[block * 4 + word] = result;
                 }
             } else if (sourceType == 2) {
-                biases[block] = half(-8.0f * scale);
+                biases[block] = bfloat(-8.0f * scale);
                 for (uint word = 0; word < 4; ++word) {
                     uint result = 0;
                     for (uint byte_index = 0; byte_index < 4; ++byte_index) {
@@ -45,7 +45,7 @@ enum MLXGGUFMetalQuantizer {
                     wq[block * 4 + word] = result;
                 }
             } else {
-                biases[block] = half(-128.0f * scale);
+                biases[block] = bfloat(-128.0f * scale);
                 for (uint word = 0; word < 8; ++word) {
                     uint result = 0;
                     for (uint byte_index = 0; byte_index < 4; ++byte_index) {
@@ -97,8 +97,8 @@ enum MLXGGUFMetalQuantizer {
                 ? scale
                 : edge / initial_quantized_edge;
 
-            scales[group_index] = half(scale);
-            biases[group_index] = half(bias);
+            scales[group_index] = bfloat(scale);
+            biases[group_index] = bfloat(bias);
             for (uint word = 0; word < words_per_group(bits, targetGroupSize); ++word) {
                 wq[group_index * words_per_group(bits, targetGroupSize) + word] =
                     quantized_group_word(values, scale, bias, bits, word);
@@ -371,7 +371,7 @@ enum MLXGGUFMetalQuantizer {
             grid: (groupCount, 1, 1),
             threadGroup: (min(groupCount, 64), 1, 1),
             outputShapes: [targetWeightShape, targetScaleShape, targetScaleShape],
-            outputDTypes: [.uint32, .float16, .float16]
+            outputDTypes: [.uint32, .bfloat16, .bfloat16]
         )
         try checkedEval(output)
         return (output[0], output[1], output[2])
@@ -404,7 +404,7 @@ enum MLXGGUFMetalQuantizer {
             grid: (blockCount, 1, 1),
             threadGroup: (min(blockCount, 64), 1, 1),
             outputShapes: [targetWeightShape, targetScaleShape, targetScaleShape],
-            outputDTypes: [.uint32, .float16, .float16]
+            outputDTypes: [.uint32, .bfloat16, .bfloat16]
         )
         try checkedEval(output)
         return (output[0], output[1], output[2])
