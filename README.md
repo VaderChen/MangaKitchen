@@ -176,6 +176,42 @@ The App exposes `MLXVLMRuntime` for local multimodal translation models whose `m
 
 The `mlx-swift-lm` factory selects architecture from `config.json`, so a single safetensors file is not enough. Keep the tokenizer, processor, chat template, and config files together.
 
+### GGUF 權重
+
+`MLXTextRuntime` 與 `MLXVLMRuntime` 支援直接從模型目錄載入 `.gguf` 權重，不需要先轉成 Safetensors。正式 App 預設以 `group64` 直接從 GGUF raw block 建立 MLX `wq/scales/biases`：`Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 目標為 `INT4`，`Q8_0`／`Q5_K`／`Q6_K` 目標為 `INT8`，不會先建立 `group32` 再轉換，也不再配置整顆 `Float16` tensor。其他未列出的 GGUF 量化型別（包含 `Q8_K`）會在 inspect 與載入前明確回報不支援。llama.cpp bridge 僅保留在 `Tools/GGUFBackendPOC` 作為 parser 對照，不是 App 的正式載入依賴。
+
+GGUF loader 會優先從主 `.gguf` 的 metadata 建立模型設定與 tokenizer；外部 `config.json`、`tokenizer.json`、`tokenizer_config.json` 僅作為 fallback。因而具備完整 GGUF metadata 的純文字模型可以只保留 `.gguf`，多模態模型仍必須提供配對的 `mmproj-*.gguf`；若 processor 設定不在目錄中，會由 `mmproj` metadata 建立基本設定。外部 tokenizer fallback 至少需要 `tokenizer.json`，`tokenizer_config.json` 可與內嵌或外部 tokenizer data 組合使用。
+
+`FP16` 與 `FP32` 會保留原型別；跨格式精度策略則將可辨識的 `FP8`（包含 `F8_E4M3`／`F8_E5M2` 變體）重新量化為 `INT8`。目前 llama.cpp 的標準 GGUF 型別表沒有獨立的 FP8 tensor type，因此 Swift loader 不會把未知的 GGUF type 假裝成 FP8；`GGUFStoragePolicy.targetStorageType(for:)` 已固定這項目標策略，待上游 parser 或其他 tensor 格式提供明確 FP8 encoding 後再接入實際解碼。這不會把 `FP16`／`FP32` 一併降級。
+
+```bash
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-GGUF \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-MLX-4bit \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
+```
+
+`GGUFSmoke` 與 `Tools/GGUFBackendPOC` 只供開發者進行格式、數值與效能驗證。它們的 benchmark 與 fixture 結果不會被 App 讀取，也不會決定 runtime 的模型選擇或品質門檻；正式載入只依 `GGUFStoragePolicy` 與 loader 的實際能力檢查。要比較不同格式，請在相同硬體與參數下分別執行上述命令，將結果視為當次測量，而非產品固定值。
+
+多模態 GGUF 不是只有主模型檔。模型目錄必須同時保留 `config.json`、Hugging Face tokenizer／chat template，以及與主模型配對的 `mmproj-*.gguf` 視覺投影檔；缺少 `mmproj` 時不會假裝以純文字模型載入。模型下載器會先檢查 repository 是否存在指定的 `mmproj`，只下載主 GGUF、該 `mmproj` 與必要的 Qwen 基礎設定檔，不會把其他 Q4／Q8 或 IQ GGUF 一起下載。
+
+可在 `mangakitchen-model.json` 指定權重檔：
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "local-llama-q4",
+  "displayName": "Local Llama Q4",
+  "capability": "imageToText",
+  "backend": "mlxSwift",
+  "weightsFile": "model-q4_0.gguf",
+  "weightsFormat": "gguf",
+  "mmprojFile": "mmproj-F16.gguf"
+}
+```
+
+模型目錄同時保留兩個 Qwen3.8 27B 選項：原本的 [`lmstudio-community/Qwen3.8-27B-MLX-4bit`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-MLX-4bit) checkpoint，以及新增的 [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Qwen3.8-27B-Q4_0.gguf`。GGUF 選項會搭配同 repository 的 `mmproj-F16.gguf`，tokenizer 與模型設定由 [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) 提供。若目錄同時有 GGUF 與 Safetensors checkpoint，未以 `weightsFormat: "gguf"` 或 GGUF 的 `weightsFile` 明確指定時，仍會使用既有的 `LLMModelFactory`／`VLMModelFactory` checkpoint 載入流程。
+
 ## Qwen Image Edit Worker
 
 Image-to-image inference uses a separate Swift Package so large models can be fully released after completion or cancellation without raising the main app's deployment target. It currently requires macOS 26:

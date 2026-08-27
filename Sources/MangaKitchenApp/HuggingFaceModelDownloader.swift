@@ -41,7 +41,9 @@ struct HuggingFaceModelDownloader: Sendable {
             model: model,
             hub: hub
         ).sorted {
-            if $0.byteCount == $1.byteCount { return $0.filename < $1.filename }
+            if $0.byteCount == $1.byteCount {
+                return "\($0.repositoryID)/\($0.filename)" < "\($1.repositoryID)/\($1.filename)"
+            }
             return $0.byteCount > $1.byteCount
         }
         let progress = ModelDownloadProgressTracker(
@@ -64,7 +66,6 @@ struct HuggingFaceModelDownloader: Sendable {
         do {
             try await downloadFiles(
                 files,
-                repositoryID: model.repositoryID,
                 directoryURL: downloadedDirectoryURL,
                 progress: progress
             )
@@ -157,15 +158,49 @@ struct HuggingFaceModelDownloader: Sendable {
         model: DownloadableModelDescriptor,
         hub: HubApi
     ) async throws -> [RepositoryFile] {
+        let requests: [(repositoryID: String, filename: String)]
+        if model.format == .ggufDirectory {
+            guard let weightsFileName = model.weightsFileName,
+                  filenames.contains(weightsFileName) else {
+                throw ModelDownloadError.incompleteRepository(model.repositoryID)
+            }
+            var selected: [(String, String)] = [(model.repositoryID, weightsFileName)]
+            if let mmprojFileName = model.mmprojFileName {
+                guard filenames.contains(mmprojFileName) else {
+                    throw ModelDownloadError.incompleteRepository(model.repositoryID)
+                }
+                selected.append((model.repositoryID, mmprojFileName))
+            }
+
+            if let auxiliaryRepositoryID = model.auxiliaryRepositoryID {
+                let auxiliaryRepository = Hub.Repo(id: auxiliaryRepositoryID)
+                let auxiliaryFilenames = try await hub.getFilenames(from: auxiliaryRepository)
+                for filename in model.auxiliaryFileNames {
+                    guard auxiliaryFilenames.contains(filename) else {
+                        throw ModelDownloadError.incompleteRepository(auxiliaryRepositoryID)
+                    }
+                    selected.append((auxiliaryRepositoryID, filename))
+                }
+            } else {
+                selected.append(contentsOf: model.auxiliaryFileNames.map {
+                    (model.repositoryID, $0)
+                })
+            }
+            requests = selected
+        } else {
+            requests = filenames.map { (model.repositoryID, $0) }
+        }
+
         var files: [RepositoryFile] = []
-        files.reserveCapacity(filenames.count)
-        for filename in filenames {
+        files.reserveCapacity(requests.count)
+        for (repositoryID, filename) in requests {
             try Task.checkCancellation()
             let metadata = try await hub.getFileMetadata(
-                url: sourceURL(repositoryID: model.repositoryID, filename: filename)
+                url: sourceURL(repositoryID: repositoryID, filename: filename)
             )
             files.append(
                 RepositoryFile(
+                    repositoryID: repositoryID,
                     filename: filename,
                     byteCount: Int64(max(metadata.size ?? 1, 1))
                 )
@@ -178,6 +213,30 @@ struct HuggingFaceModelDownloader: Sendable {
         _ directoryURL: URL,
         model: DownloadableModelDescriptor
     ) throws {
+        if model.format == .ggufDirectory {
+            guard let weightsFileName = model.weightsFileName,
+                  FileManager.default.fileExists(
+                    atPath: directoryURL.appendingPathComponent(weightsFileName).path
+                  ) else {
+                throw ModelDownloadError.incompleteRepository(model.repositoryID)
+            }
+            let manifest = ModelManifest(
+                id: model.id,
+                displayName: model.displayName,
+                capability: model.capability,
+                backend: .mlxSwift,
+                weightsFile: weightsFileName,
+                weightsFormat: .gguf,
+                mmprojFile: model.mmprojFileName,
+                generation: ModelManifest.Generation()
+            )
+            let manifestURL = directoryURL.appendingPathComponent("mangakitchen-model.json")
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+            _ = try ModelManifest.load(from: directoryURL)
+            return
+        }
         if model.format == .mlxDirectory, model.capability == .superResolution {
             let modelFile = "model.safetensors"
             guard FileManager.default.fileExists(
@@ -339,7 +398,6 @@ struct HuggingFaceModelDownloader: Sendable {
 
     private func downloadFiles(
         _ files: [RepositoryFile],
-        repositoryID: String,
         directoryURL: URL,
         progress: ModelDownloadProgressTracker
     ) async throws {
@@ -376,7 +434,7 @@ struct HuggingFaceModelDownloader: Sendable {
                     to: &group,
                     segment: segment,
                     sourceURL: sourceURL(
-                        repositoryID: repositoryID,
+                        repositoryID: segment.repositoryID,
                         filename: segment.filename
                     ),
                     partDirectoryURL: partDirectoryURL
@@ -408,7 +466,7 @@ struct HuggingFaceModelDownloader: Sendable {
                         to: &group,
                         segment: segment,
                         sourceURL: sourceURL(
-                            repositoryID: repositoryID,
+                            repositoryID: segment.repositoryID,
                             filename: segment.filename
                         ),
                         partDirectoryURL: partDirectoryURL
@@ -455,6 +513,7 @@ struct HuggingFaceModelDownloader: Sendable {
     private static func segments(for file: RepositoryFile) -> [DownloadSegment] {
         guard file.byteCount > segmentByteCount else {
             return [DownloadSegment(
+                repositoryID: file.repositoryID,
                 filename: file.filename,
                 startOffset: 0,
                 endOffset: file.byteCount - 1,
@@ -465,6 +524,7 @@ struct HuggingFaceModelDownloader: Sendable {
         var startOffset: Int64 = 0
         while startOffset < file.byteCount {
             result.append(DownloadSegment(
+                repositoryID: file.repositoryID,
                 filename: file.filename,
                 startOffset: startOffset,
                 endOffset: min(startOffset + segmentByteCount, file.byteCount) - 1,
@@ -569,11 +629,13 @@ struct ModelDownloadProgressUpdate: Sendable {
 }
 
 private struct RepositoryFile: Sendable {
+    var repositoryID: String
     var filename: String
     var byteCount: Int64
 }
 
 private struct DownloadSegment: Sendable {
+    var repositoryID: String
     var filename: String
     var startOffset: Int64
     var endOffset: Int64

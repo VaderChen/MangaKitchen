@@ -4,6 +4,11 @@ import MangaKitchenCore
 /// 每個模型目錄都以此 manifest 描述 Core ML 的實際 feature 名稱。
 /// 這讓核心流程不需要針對每個模型寫死欄位。
 public struct ModelManifest: Codable, Hashable, Sendable {
+    public enum WeightsFormat: String, Codable, Hashable, Sendable {
+        case safetensors
+        case gguf
+    }
+
     public struct Inputs: Codable, Hashable, Sendable {
         public var image: String
         public var prompt: String?
@@ -108,6 +113,9 @@ public struct ModelManifest: Codable, Hashable, Sendable {
     public var capability: ModelCapability
     public var backend: ModelBackend
     public var modelFile: String?
+    public var weightsFile: String?
+    public var weightsFormat: WeightsFormat?
+    public var mmprojFile: String?
     public var inputs: Inputs?
     public var outputs: Outputs?
     public var colorization: Colorization?
@@ -122,6 +130,9 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         capability: ModelCapability,
         backend: ModelBackend = .coreML,
         modelFile: String? = nil,
+        weightsFile: String? = nil,
+        weightsFormat: WeightsFormat? = nil,
+        mmprojFile: String? = nil,
         inputs: Inputs? = nil,
         outputs: Outputs? = nil,
         colorization: Colorization? = nil,
@@ -135,6 +146,9 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         self.capability = capability
         self.backend = backend
         self.modelFile = modelFile
+        self.weightsFile = weightsFile
+        self.weightsFormat = weightsFormat
+        self.mmprojFile = mmprojFile
         self.inputs = inputs
         self.outputs = outputs
         self.colorization = colorization
@@ -146,7 +160,7 @@ public struct ModelManifest: Codable, Hashable, Sendable {
     public static func load(from directoryURL: URL) throws -> ModelManifest {
         let manifestURL = directoryURL.appendingPathComponent("mangakitchen-model.json")
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
-            if let inferredManifest = inferMLXLanguageManifest(from: directoryURL) {
+            if let inferredManifest = try inferMLXLanguageManifest(from: directoryURL) {
                 return inferredManifest
             }
             throw ModelRuntimeError.manifestNotFound(manifestURL)
@@ -155,28 +169,90 @@ public struct ModelManifest: Codable, Hashable, Sendable {
         guard manifest.schemaVersion == 1 else {
             throw ModelRuntimeError.unsupportedManifestVersion(manifest.schemaVersion)
         }
+        try manifest.validateRuntimeAssets(in: directoryURL)
         return manifest
+    }
+
+    private func validateRuntimeAssets(in directoryURL: URL) throws {
+        guard backend == .mlxSwift else { return }
+        let explicitlyUsesGGUF = weightsFormat == .gguf
+            || weightsFile?.lowercased().hasSuffix(".gguf") == true
+            || modelFile?.lowercased().hasSuffix(".gguf") == true
+        guard explicitlyUsesGGUF else { return }
+
+        guard let weightURL = try MLXGGUFModelSource.weightURL(
+            in: directoryURL,
+            manifest: self
+        ) else {
+            throw MLXGGUFLoaderError.ambiguousWeights(directoryURL)
+        }
+        let missingAssets = MLXGGUFModelSource.missingRuntimeAssetNames(
+            in: directoryURL,
+            weightURL: weightURL
+        )
+        guard missingAssets.isEmpty else {
+            throw ModelRuntimeError.ggufRuntimeAssetsMissing(directoryURL, missingAssets)
+        }
+        if capability == .imageToText,
+           try MLXGGUFModelSource.mmprojURL(in: directoryURL, manifest: self) == nil {
+            throw MLXGGUFLoaderError.missingMultimodalProjector(
+                directoryURL.appendingPathComponent("mmproj-F16.gguf")
+            )
+        }
     }
 
     /// 無 manifest 的 Hugging Face MLX 目錄會依 config 自動區分純文字 LLM
     /// 與 VLM，避免 Qwen3 純文字權重被誤判為圖生文。
-    private static func inferMLXLanguageManifest(from directoryURL: URL) -> ModelManifest? {
+    private static func inferMLXLanguageManifest(from directoryURL: URL) throws -> ModelManifest? {
         let fileManager = FileManager.default
         let configURL = directoryURL.appendingPathComponent("config.json")
         guard let entries = try? fileManager.contentsOfDirectory(
             at: directoryURL,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
-        ),
-        fileManager.fileExists(atPath: configURL.path),
-        entries.contains(where: { $0.pathExtension.lowercased() == "safetensors" }),
-        entries.contains(where: {
-            $0.lastPathComponent == "tokenizer.json"
-                || $0.lastPathComponent == "tokenizer_config.json"
-        }),
-        let configData = try? Data(contentsOf: configURL),
-        let configObject = try? JSONSerialization.jsonObject(with: configData),
-        let config = configObject as? [String: Any]
+        ) else {
+            return nil
+        }
+        let hasSafetensors = entries.contains { $0.pathExtension.lowercased() == "safetensors" }
+        let hasGGUF = entries.contains { $0.pathExtension.lowercased() == "gguf" }
+        guard hasSafetensors || hasGGUF else { return nil }
+        if hasGGUF {
+            let missingAssets = MLXGGUFModelSource.missingRuntimeAssetNames(in: directoryURL)
+            if !missingAssets.isEmpty {
+                throw ModelRuntimeError.ggufRuntimeAssetsMissing(directoryURL, missingAssets)
+            }
+        } else if !MLXGGUFModelSource.missingRuntimeAssetNames(in: directoryURL).isEmpty {
+            return nil
+        }
+        let mainGGUF = entries
+            .filter {
+                $0.pathExtension.lowercased() == "gguf"
+                    && !$0.lastPathComponent.lowercased().contains("mmproj")
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let mmprojGGUF = entries
+            .filter {
+                $0.pathExtension.lowercased() == "gguf"
+                    && $0.lastPathComponent.lowercased().contains("mmproj")
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let configData: Data
+        if hasGGUF, mainGGUF.count == 1,
+           let embeddedConfigData = try? MLXGGUFEmbeddedAssets.configurationData(
+               weightURL: mainGGUF[0],
+               mmprojURL: mmprojGGUF.count == 1 ? mmprojGGUF[0] : nil
+           ) {
+            configData = embeddedConfigData
+        } else if fileManager.fileExists(atPath: configURL.path) {
+            guard let externalConfigData = try? Data(contentsOf: configURL) else {
+                return nil
+            }
+            configData = externalConfigData
+        } else {
+            return nil
+        }
+        guard let configObject = try? JSONSerialization.jsonObject(with: configData),
+              let config = configObject as? [String: Any]
         else {
             return nil
         }
@@ -198,13 +274,37 @@ public struct ModelManifest: Codable, Hashable, Sendable {
             modelID = directoryName
         }
 
-        return ModelManifest(
+        let weightsFormat: WeightsFormat? =
+            hasGGUF && !hasSafetensors
+            ? .gguf
+            : nil
+        let inferredWeightsFile = hasSafetensors
+            ? nil
+            : mainGGUF.count == 1 ? mainGGUF[0].lastPathComponent : nil
+        let inferredMMProjFile = hasSafetensors
+            ? nil
+            : mmprojGGUF.count == 1 ? mmprojGGUF[0].lastPathComponent : nil
+
+        if let inferredWeightsFile, weightsFormat == .gguf {
+            let weightURL = directoryURL.appendingPathComponent(inferredWeightsFile)
+            let inspection = try MLXNativeGGUFBackend().inspect(fileURL: weightURL)
+            guard MLXNativeGGUFBackend().canMaterialize(inspection) else {
+                throw GGUFBackendError.unsupportedMaterialization(types: inspection.unsupportedTypes)
+            }
+        }
+
+        let manifest = ModelManifest(
             id: modelID,
             displayName: directoryName,
             capability: hasImageCapability ? .imageToText : .textToText,
             backend: .mlxSwift,
+            weightsFile: inferredWeightsFile,
+            weightsFormat: weightsFormat,
+            mmprojFile: inferredMMProjFile,
             generation: Generation()
         )
+        try manifest.validateRuntimeAssets(in: directoryURL)
+        return manifest
     }
 }
 
@@ -214,6 +314,7 @@ public enum ModelRuntimeError: LocalizedError, Sendable {
     case unsupportedBackend(ModelBackend)
     case unsupportedBackendCapability(ModelBackend, ModelCapability)
     case externalRuntimeConfigurationMissing
+    case ggufRuntimeAssetsMissing(URL, [String])
     case modelFileNotFound(URL)
     case capabilityNotLoaded(ModelCapability)
     case invalidCapability(expected: ModelCapability, actual: ModelCapability)
@@ -233,6 +334,8 @@ public enum ModelRuntimeError: LocalizedError, Sendable {
             "\(backend.rawValue) Adapter 尚未支援 \(capability.rawValue) 模型。"
         case .externalRuntimeConfigurationMissing:
             "externalRuntime manifest 缺少 externalRuntime 設定。"
+        case let .ggufRuntimeAssetsMissing(url, assets):
+            "GGUF 模型缺少必要的 Hugging Face runtime 資產（\(assets.joined(separator: ", "))）：\(url.path)"
         case let .modelFileNotFound(url):
             "找不到 Core ML 模型：\(url.path)"
         case let .capabilityNotLoaded(capability):

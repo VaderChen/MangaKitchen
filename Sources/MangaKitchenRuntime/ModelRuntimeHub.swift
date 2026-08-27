@@ -11,6 +11,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     private let metal: MetalContext
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
+    private let ggufQuantizationGroupSize: Int
     private var textToTextRuntime: (any TextGenerating)?
     private var imageToTextRuntime: (any ImageToTextGenerating)?
     private var imageToImageRuntime: (any ImageToImageGenerating)?
@@ -24,11 +25,13 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
 
     public init(
         metal: MetalContext,
+        ggufQuantizationGroupSize: Int = 64,
         thinkingEnabled: Bool = false,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
     ) {
         self.metal = metal
+        self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
         self.thinkingEnabled = thinkingEnabled
         self.log = log
         self.reasoningStream = reasoningStream
@@ -148,6 +151,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                 let runtime = try MLXTextRuntime(
                     directoryURL: directoryURL,
                     manifest: manifest,
+                    ggufQuantizationGroupSize: ggufQuantizationGroupSize,
                     thinkingEnabled: thinkingEnabled,
                     log: log,
                     reasoningStream: reasoningStream
@@ -159,6 +163,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                 let runtime = try MLXVLMRuntime(
                     directoryURL: directoryURL,
                     manifest: manifest,
+                    ggufQuantizationGroupSize: ggufQuantizationGroupSize,
                     thinkingEnabled: thinkingEnabled,
                     log: log,
                     reasoningStream: reasoningStream

@@ -5,6 +5,7 @@ import MangaKitchenRuntime
 struct DownloadableModelDescriptor: Hashable, Sendable {
     enum Format: String, Hashable, Sendable {
         case mlxDirectory
+        case ggufDirectory
         case coreMLZip
         case coreMLPackage
     }
@@ -24,6 +25,10 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
     var outputScale: Int? = nil
     var coreMLContract: CoreMLContract? = nil
     var colorizationInputSize: Int? = nil
+    var weightsFileName: String? = nil
+    var mmprojFileName: String? = nil
+    var auxiliaryRepositoryID: String? = nil
+    var auxiliaryFileNames: [String] = []
 
     var directoryName: String {
         repositoryID.split(separator: "/").last.map(String.init) ?? id
@@ -47,9 +52,30 @@ enum DownloadableModelCatalog {
         ),
         DownloadableModelDescriptor(
             id: "qwen3.8-27b-4bit",
-            displayName: "Qwen3.8-27B 4-bit (≈15 GB)",
+            displayName: "Qwen3.8-27B 4-bit",
             repositoryID: "lmstudio-community/Qwen3.8-27B-MLX-4bit",
             capability: .imageToText
+        ),
+        DownloadableModelDescriptor(
+            id: "qwen3.8-27b-q4-0-gguf",
+            displayName: "Qwen3.8-27B Q4_0 GGUF（多模態）",
+            repositoryID: "unsloth/Qwen3.8-27B-GGUF",
+            capability: .imageToText,
+            format: .ggufDirectory,
+            weightsFileName: "Qwen3.8-27B-Q4_0.gguf",
+            mmprojFileName: "mmproj-F16.gguf",
+            auxiliaryRepositoryID: "Qwen/Qwen3.8-27B",
+            auxiliaryFileNames: [
+                "config.json",
+                "generation_config.json",
+                "chat_template.jinja",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "video_preprocessor_config.json",
+                "vocab.json",
+                "merges.txt"
+            ]
         ),
         DownloadableModelDescriptor(
             id: "qwen3-vl-4b-4bit",
@@ -150,6 +176,22 @@ enum DownloadableModelCatalog {
         model: DownloadableModelDescriptor? = nil
     ) -> Bool {
         let fileManager = FileManager.default
+        if model?.format == .ggufDirectory {
+            guard let model,
+                  let weightsFileName = model.weightsFileName,
+                  fileManager.fileExists(
+                    atPath: directoryURL.appendingPathComponent("config.json").path
+                  ),
+                  fileManager.fileExists(atPath: directoryURL.appendingPathComponent(weightsFileName).path)
+            else { return false }
+            if let mmprojFileName = model.mmprojFileName,
+               !fileManager.fileExists(atPath: directoryURL.appendingPathComponent(mmprojFileName).path) {
+                return false
+            }
+            return model.auxiliaryFileNames.allSatisfy {
+                fileManager.fileExists(atPath: directoryURL.appendingPathComponent($0).path)
+            }
+        }
         if model?.format == .coreMLZip || model?.format == .coreMLPackage {
             guard let manifest = try? ModelManifest.load(from: directoryURL),
                   manifest.capability == model?.capability,

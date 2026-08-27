@@ -29,6 +29,7 @@
 - `BatchJob` 固定保存建立當下的 `projectID`、`operation`、`pageIDs` 與是否強制重算，執行途中切換專案會被阻止。
 - GPU 模型工作使用單一循序佇列；新工作可以排隊，但不會取消正在執行的前一筆工作。模型只在實際使用時載入；同模型 ID／capability／canonical path 直接重用，同 capability 的並行載入會序列化。
 - 載入大型模型前會讀取 unified-memory 使用率；超過壓力門檻時先釋放其他 runtime，但保留偏好路徑供下次延遲載入。
+- GGUF 與 Safetensors／MLX checkpoint 是並存格式。GGUF 正式載入只走 MLX 原生 loader；正式 App 預設以 `group64` 直接從 GGUF raw block 建立 MLX 權重：`Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 目標為 `INT4`，`Q8_0`／`Q5_K`／`Q6_K` 目標為 `INT8`，不先建立 `group32` 再轉換。其他 GGUF tensor type 會在 inspect、manifest 推斷與 runtime 選檔時拒絕。loader 優先使用 GGUF 內嵌 metadata 與 tokenizer，外部 `config.json`、`tokenizer.json`、`tokenizer_config.json` 僅作後備；完整 metadata 的純文字模型可只放單一 `.gguf`，多模態模型仍需配對的 `mmproj` 與 processor 資訊。
 - App 非正常結束後，原本為 `queued` 或 `running` 的紀錄會復原為 `cancelled`，不會未經確認自動重跑模型。
 - 每個等待 DLG 都顯示從開啟起算的累計時間（`MM:SS`）；逐區翻譯另顯示目前區域／總區域，進度條仍使用頁面與批次進度。
 
@@ -410,6 +411,20 @@ MCP 初始化與工具清單只描述能力，不代表應立即操作資料。�
 7. 使用者要求輸出時才帶入新 revision 呼叫 `page.render_colorization`；需清除重來時呼叫 `page.reset_colorization`。
 
 `page.colorize`、`page.submit_colorization_result`、`page.render_colorization` 與 `page.reset_colorization` 都使用 optimistic concurrency。DDColor 本機路徑目前固定採模型預設推論，MCP 不接受 `colorizationColorRange` 或 `colorizationMode`，避免宣稱無效參數已生效；Agent 路徑則由 Agent 自行選擇模型與 Provider，但仍必須遵守工作包尺寸、遮罩與分階段輸出契約。
+
+### MLX 權重格式
+
+`mangakitchen.model.load` 可載入使用 `.gguf` 權重的本機 MLX 純文字或多模態模型。唯一的 Swift `GGUFStoragePolicy` 會把 `Q4_0`／`Q4_1` 目標為 `INT4`、`Q8_0` 目標為 `INT8`；Unsloth Dynamic `Q4_0` 內混用的 `Q4_1` 也可直接載入。`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 依來源 block 直接產生 MLX `INT4` 的 `wq/scales/biases`；`Q5_K`／`Q6_K` 則直接產生 `INT8` 的 MLX affine 量化資料，不再先配置整顆 `Float16` 反量化 tensor。正式 App 的 `group64` 會對所有需量化的來源型別直接從 GGUF raw block 產生目標群組，不經 `group32` 中間結果；`Q8_K` 與其他未列入能力表的型別則明確回報不支援，不會在下載或載入十幾 GB 後才失敗。llama.cpp bridge 只在 `Tools/GGUFBackendPOC` 供 parser 對照，正式 App 不依賴外部執行檔。loader 會先讀 GGUF 內嵌的 model metadata、vocabulary、merges 與 special tokens；外部 `config.json`、`tokenizer.json`、`tokenizer_config.json` 只作 fallback。若 manifest 未指定 `weightsFile`，目錄只能有一個主 GGUF 權重檔。
+
+`FP16`／`FP32` 維持原型別；可辨識的 `FP8`（包含 `F8_E4M3`／`F8_E5M2` 變體）統一採 `INT8` 重新量化。由於 llama.cpp 標準 GGUF 目前沒有獨立的 FP8 tensor type，Swift loader 仍會拒絕未知的 GGUF type，不會誤宣稱已能載入 FP8；`GGUFStoragePolicy.targetStorageType(for:)` 已固定跨格式目標策略，待 parser 提供明確 encoding 後再接入實際解碼。這不會將 `FP16`／`FP32` 降級。
+
+目前 GGUF 的 tensor 整理由 Metal GPU 執行：`Q4_0`／`Q4_1`／`Q8_0` 的原生資料重排，以及其他需轉換型別的目標群組量化，都透過 `MLXFast.metalKernel` 直接從 GGUF raw block 產生 MLX `wq/scales/biases`；`group64` 不會先建立 `group32` 再轉換。CPU 僅負責檔案 I/O、GGUF metadata 解析與模型結構建立，不再以 Swift 逐 byte 或逐 group 計算。`GGUFSmoke` 的 `measurement=load` 會記錄載入耗時與當下 process peak RSS，`measurement=generation` 會記錄首 token 延遲、prompt tokens/sec 與 generation tokens/sec。這些測量與 `Tools/GGUFBackendPOC` 的合成 fixture 只屬於開發驗證，不會成為 App 的 runtime 設定、品質門檻或固定效能承諾。
+
+正式 runtime 不依賴 POC 的 C++ bridge、可執行檔、benchmark 數值或測試 fixture。主線只保留經能力檢查後的 MLX 原生 GGUF loader，並以 `GGUFStoragePolicy` 決定每個來源型別的材料化方式；POC 只作為可重跑的外部交叉驗證工具。
+
+多模態 GGUF 的主模型與 `mmproj` 視覺投影檔是不可分開的配對。管理下載目錄會保留原本的 `lmstudio-community/Qwen3.8-27B-MLX-4bit` checkpoint，並另外提供 `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf` 加上 `mmproj-F16.gguf` 的 GGUF 選項；必要的 `config.json`、tokenizer 與 processor 設定取自 `Qwen/Qwen3.8-27B`。下載器會先驗證兩個 repository 的指定檔案，只下載這組配對，不會下載同一 repository 內其他量化版本。
+
+既有 Safetensors checkpoint 載入方式會保留：若模型目錄含有 Safetensors 且沒有指定 `weightsFormat: "gguf"` 或 GGUF 的 `weightsFile`，runtime 仍使用原本的 `LLMModelFactory`／`VLMModelFactory` checkpoint loader。只有指定 GGUF 或目錄沒有 Safetensors 時，才會進入 Swift 原生 GGUF 解析與 MLX 量化權重路徑。
 
 ### Resources
 

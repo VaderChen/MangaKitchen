@@ -11,7 +11,9 @@ actor MLXTextRuntime: TextGenerating {
     let info: LoadedModelInfo
 
     private let modelDirectory: URL
+    private let ggufWeightsURL: URL?
     private let generation: ModelManifest.Generation
+    private let ggufQuantizationGroupSize: Int
     private let thinkingEnabled: Bool
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
@@ -20,6 +22,7 @@ actor MLXTextRuntime: TextGenerating {
     init(
         directoryURL: URL,
         manifest: ModelManifest,
+        ggufQuantizationGroupSize: Int = 64,
         thinkingEnabled: Bool = false,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
@@ -42,7 +45,12 @@ actor MLXTextRuntime: TextGenerating {
         }
 
         modelDirectory = directoryURL
+        ggufWeightsURL = try MLXGGUFModelSource.weightURL(
+            in: directoryURL,
+            manifest: manifest
+        )
         generation = manifest.generation ?? ModelManifest.Generation()
+        self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
         self.thinkingEnabled = thinkingEnabled
         self.log = log
         self.reasoningStream = reasoningStream
@@ -118,14 +126,33 @@ actor MLXTextRuntime: TextGenerating {
             repetitionContextSize: 128
         )
         let stream = try await container.generate(input: prepared, parameters: parameters)
+        let generationStart = Date()
         let expectedChunks = min(maxTokens, 512)
         var output = ""
         var chunks = 0
+        var didLogFirstToken = false
         var lastRepetitionCheck = 0
         var stoppedOnRepetition = false
         for await event in stream {
             try Task.checkCancellation()
+            if let info = event.info {
+                log(
+                    .info,
+                    "Generation Metrics",
+                    "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                        + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                        + "tokensPerSecond=\(info.tokensPerSecond)"
+                )
+            }
             guard case let .chunk(text) = event else { continue }
+            if !didLogFirstToken, !text.isEmpty {
+                didLogFirstToken = true
+                log(
+                    .info,
+                    "Generation Metrics",
+                    "phase=initial firstTokenLatency=\(Date().timeIntervalSince(generationStart))"
+                )
+            }
             output += text
             if let reasoningID {
                 reasoningStream(.updated(
@@ -180,10 +207,29 @@ actor MLXTextRuntime: TextGenerating {
                 input: finalPrepared,
                 parameters: finalParameters
             )
+            let finalGenerationStart = Date()
             var finalOutput = ""
+            var didLogFinalFirstToken = false
             for await event in finalStream {
                 try Task.checkCancellation()
+                if let info = event.info {
+                    log(
+                        .info,
+                        "Generation Metrics",
+                        "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                            + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                            + "tokensPerSecond=\(info.tokensPerSecond)"
+                    )
+                }
                 guard case let .chunk(text) = event else { continue }
+                if !didLogFinalFirstToken, !text.isEmpty {
+                    didLogFinalFirstToken = true
+                    log(
+                        .info,
+                        "Generation Metrics",
+                        "phase=finalization firstTokenLatency=\(Date().timeIntervalSince(finalGenerationStart))"
+                    )
+                }
                 finalOutput += text
                 progress(0.99)
             }
@@ -237,10 +283,19 @@ actor MLXTextRuntime: TextGenerating {
             return container
         }
         progress(0.01)
-        let loaded = try await LLMModelFactory.shared.loadContainer(
-            from: modelDirectory,
-            using: #huggingFaceTokenizerLoader()
-        )
+        let loaded: ModelContainer
+        if let ggufWeightsURL {
+            loaded = try await MLXGGUFModelLoader.loadContainer(
+                from: modelDirectory,
+                weightURL: ggufWeightsURL,
+                quantizationGroupSize: ggufQuantizationGroupSize
+            )
+        } else {
+            loaded = try await LLMModelFactory.shared.loadContainer(
+                from: modelDirectory,
+                using: #huggingFaceTokenizerLoader()
+            )
+        }
         progress(0.45)
         container = loaded
         return loaded

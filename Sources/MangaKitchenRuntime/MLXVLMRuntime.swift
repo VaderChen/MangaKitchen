@@ -12,7 +12,10 @@ actor MLXVLMRuntime: ImageToTextGenerating {
     let info: LoadedModelInfo
 
     private let modelDirectory: URL
+    private let ggufWeightsURL: URL?
+    private let mmprojURL: URL?
     private let generation: ModelManifest.Generation
+    private let ggufQuantizationGroupSize: Int
     private let thinkingEnabled: Bool
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
@@ -21,6 +24,7 @@ actor MLXVLMRuntime: ImageToTextGenerating {
     init(
         directoryURL: URL,
         manifest: ModelManifest,
+        ggufQuantizationGroupSize: Int = 64,
         thinkingEnabled: Bool = false,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
@@ -38,7 +42,30 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         }
 
         self.modelDirectory = directoryURL
+        let ggufWeightsURL = try MLXGGUFModelSource.weightURL(
+            in: directoryURL,
+            manifest: manifest
+        )
+        let mmprojURL = try MLXGGUFModelSource.mmprojURL(
+            in: directoryURL,
+            manifest: manifest
+        )
+        if manifest.weightsFormat == .gguf {
+            guard ggufWeightsURL != nil else {
+                throw ModelRuntimeError.modelFileNotFound(directoryURL)
+            }
+            guard let mmprojURL else {
+                throw MLXGGUFLoaderError.missingMultimodalProjector(
+                    directoryURL.appendingPathComponent("mmproj-F16.gguf")
+                )
+            }
+            self.mmprojURL = mmprojURL
+        } else {
+            self.mmprojURL = mmprojURL
+        }
+        self.ggufWeightsURL = ggufWeightsURL
         self.generation = manifest.generation ?? ModelManifest.Generation()
+        self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
         self.thinkingEnabled = thinkingEnabled
         self.log = log
         self.reasoningStream = reasoningStream
@@ -119,16 +146,35 @@ actor MLXVLMRuntime: ImageToTextGenerating {
             repetitionContextSize: 128
         )
         let stream = try await container.generate(input: prepared, parameters: parameters)
+        let generationStart = Date()
         let expectedChunks = min(maxTokens, 512)
         var result = ""
         var chunks = 0
+        var didLogFirstToken = false
 
         var lastRepetitionCheck = 0
         var stoppedOnRepetition = false
 
         for await event in stream {
             try Task.checkCancellation()
+            if let info = event.info {
+                log(
+                    .info,
+                    "Generation Metrics",
+                    "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                        + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                        + "tokensPerSecond=\(info.tokensPerSecond)"
+                )
+            }
             if case let .chunk(text) = event {
+                if !didLogFirstToken, !text.isEmpty {
+                    didLogFirstToken = true
+                    log(
+                        .info,
+                        "Generation Metrics",
+                        "phase=initial firstTokenLatency=\(Date().timeIntervalSince(generationStart))"
+                    )
+                }
                 result += text
                 if let reasoningID {
                     reasoningStream(.updated(
@@ -189,10 +235,29 @@ actor MLXVLMRuntime: ImageToTextGenerating {
                 input: finalPrepared,
                 parameters: finalParameters
             )
+            let finalGenerationStart = Date()
             var finalOutput = ""
+            var didLogFinalFirstToken = false
             for await event in finalStream {
                 try Task.checkCancellation()
+                if let info = event.info {
+                    log(
+                        .info,
+                        "Generation Metrics",
+                        "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                            + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                            + "tokensPerSecond=\(info.tokensPerSecond)"
+                    )
+                }
                 if case let .chunk(text) = event {
+                    if !didLogFinalFirstToken, !text.isEmpty {
+                        didLogFinalFirstToken = true
+                        log(
+                            .info,
+                            "Generation Metrics",
+                            "phase=finalization firstTokenLatency=\(Date().timeIntervalSince(finalGenerationStart))"
+                        )
+                    }
                     finalOutput += text
                     progress(0.99)
                 }
@@ -241,10 +306,20 @@ actor MLXVLMRuntime: ImageToTextGenerating {
             return container
         }
         progress(0.01)
-        let loaded = try await VLMModelFactory.shared.loadContainer(
-            from: modelDirectory,
-            using: #huggingFaceTokenizerLoader()
-        )
+        let loaded: ModelContainer
+        if let ggufWeightsURL, let mmprojURL {
+            loaded = try await MLXGGUFModelLoader.loadVLMContainer(
+                from: modelDirectory,
+                weightURL: ggufWeightsURL,
+                mmprojURL: mmprojURL,
+                quantizationGroupSize: ggufQuantizationGroupSize
+            )
+        } else {
+            loaded = try await VLMModelFactory.shared.loadContainer(
+                from: modelDirectory,
+                using: #huggingFaceTokenizerLoader()
+            )
+        }
         progress(0.45)
         container = loaded
         return loaded

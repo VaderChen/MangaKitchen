@@ -144,6 +144,7 @@ final class TargetLanguageSafetyTests: XCTestCase {
                 qualityCheckEnabled: false
             ),
             regionProgress: { _, _ in },
+            draftsReady: { _ in },
             progress: { _ in }
         )
 
@@ -185,6 +186,7 @@ final class TargetLanguageSafetyTests: XCTestCase {
                 qualityCheckEnabled: false
             ),
             regionProgress: { _, _ in },
+            draftsReady: { _ in },
             progress: { _ in }
         )
 
@@ -236,6 +238,7 @@ final class TargetLanguageSafetyTests: XCTestCase {
                 qualityCheckEnabled: false
             ),
             regionProgress: recorder.record,
+            draftsReady: { _ in },
             progress: { _ in }
         )
 
@@ -280,6 +283,7 @@ final class TargetLanguageSafetyTests: XCTestCase {
                 qualityCheckEnabled: false
             ),
             regionProgress: { _, _ in },
+            draftsReady: { _ in },
             progress: { _ in }
         )
 
@@ -314,6 +318,7 @@ final class TargetLanguageSafetyTests: XCTestCase {
             ),
             activity: recorder.record,
             regionProgress: { _, _ in },
+            draftsReady: { _ in },
             progress: { _ in }
         )
 
