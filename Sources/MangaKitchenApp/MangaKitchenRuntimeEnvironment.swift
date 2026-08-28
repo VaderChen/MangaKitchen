@@ -23,6 +23,8 @@ final class MangaKitchenRuntimeEnvironment: @unchecked Sendable {
         applicationRoot: URL,
         imageCompositingBackend: ImageCompositingBackend,
         modelThinkingEnabled: Bool,
+        dflashEnabled: Bool,
+        dflashBlockSize: Int,
         log: @escaping RuntimeLogHandler,
         reasoningStream: @escaping RuntimeReasoningStreamHandler
     ) throws {
@@ -36,6 +38,8 @@ final class MangaKitchenRuntimeEnvironment: @unchecked Sendable {
         let metal = try MetalContext()
         let models = ModelRuntimeHub(
             metal: metal,
+            dflashEnabled: dflashEnabled,
+            dflashBlockSize: dflashBlockSize,
             thinkingEnabled: modelThinkingEnabled,
             log: log,
             reasoningStream: reasoningStream
@@ -62,6 +66,11 @@ final class MangaKitchenRuntimeEnvironment: @unchecked Sendable {
         }
         let vlmTextRecognizer = VLMRegionTranscriptionService(model: models)
         let imageTranslator = VLMRegionTranslationService(model: models, log: log)
+        let textTranslator = VLMRegionTranslationService(
+            model: TextOnlyImageToTextAdapter(model: models),
+            usesImageContext: false,
+            log: log
+        )
 
         self.metal = metal
         self.models = models
@@ -81,7 +90,10 @@ final class MangaKitchenRuntimeEnvironment: @unchecked Sendable {
             ],
             maskRefiner: maskRefiner,
             translator: imageTranslator,
-            translators: [.imageToText: imageTranslator],
+            translators: [
+                .textToText: textTranslator,
+                .imageToText: imageTranslator
+            ],
             maskGenerator: maskGenerator,
             backgroundRestorer: backgroundRestorer,
             typesetter: htmlTypesetter,

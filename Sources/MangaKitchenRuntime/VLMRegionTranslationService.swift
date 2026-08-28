@@ -43,6 +43,71 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         var confidence: Double?
         var qaFlags: [String]?
 
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case literalTranslation
+            case displayTranslation
+            case translatedText
+            case speakerID
+            case tone
+            case confidence
+            case qaFlags
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            id = try values.decode(UUID.self, forKey: .id)
+            literalTranslation = try values.decodeIfPresent(String.self, forKey: .literalTranslation)
+            displayTranslation = try values.decodeIfPresent(String.self, forKey: .displayTranslation)
+            translatedText = try values.decodeIfPresent(String.self, forKey: .translatedText)
+            speakerID = try values.decodeIfPresent(String.self, forKey: .speakerID)
+            tone = try values.decodeIfPresent(String.self, forKey: .tone)
+            confidence = try Self.decodeConfidence(from: values)
+            qaFlags = Self.decodeQAFlags(from: values)
+        }
+
+        private static func decodeQAFlags(
+            from values: KeyedDecodingContainer<CodingKeys>
+        ) -> [String]? {
+            guard values.contains(.qaFlags), (try? values.decodeNil(forKey: .qaFlags)) != true else {
+                return nil
+            }
+            if let flags = try? values.decode([String].self, forKey: .qaFlags) {
+                return flags
+            }
+            guard let scalar = try? values.decode(String.self, forKey: .qaFlags) else {
+                return nil
+            }
+            return scalar
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+
+        private static func decodeConfidence(
+            from values: KeyedDecodingContainer<CodingKeys>
+        ) throws -> Double? {
+            guard values.contains(.confidence), !(try values.decodeNil(forKey: .confidence)) else {
+                return nil
+            }
+            if let number = try? values.decode(Double.self, forKey: .confidence) {
+                return number
+            }
+            let value = try values.decode(String.self, forKey: .confidence)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if let number = Double(value) {
+                return number
+            }
+            switch value {
+            case "very high", "high": return 0.9
+            case "medium", "moderate": return 0.65
+            case "low": return 0.35
+            case "very low": return 0.15
+            default: return nil
+            }
+        }
+
         var resolvedDisplayTranslation: String? {
             let value = displayTranslation ?? translatedText
             let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -115,6 +180,7 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
             do {
                 drafts = try await generateItems(
                     pageURL: pageURL,
+                    targetLanguageCode: targetLanguageCode,
                     prompt: Self.draftPrompt(
                         targetLanguageCode: targetLanguageCode,
                         readingDirection: readingDirection,
@@ -185,6 +251,14 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
                 progress: { value in progress(value * draftEnd) }
             )
         }
+        guard !drafts.isEmpty else {
+            log(
+                .error,
+                "Translation",
+                "No region received a valid translation; refusing to create an empty translation result."
+            )
+            throw TranslationRuntimeError.missingTranslations(regions.count)
+        }
         var reviewed = drafts
         if qualityOptions.reviewPassEnabled, !drafts.isEmpty {
             let draftRegions = regions.map { region in
@@ -209,6 +283,7 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
                 let reviewJSON = try Self.json(reviewPayload)
                 let values = try await generateItems(
                     pageURL: pageURL,
+                    targetLanguageCode: targetLanguageCode,
                     prompt: Self.reviewPrompt(
                         targetLanguageCode: targetLanguageCode,
                         readingDirection: readingDirection,
@@ -273,12 +348,20 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
             removingEditorialAnnotations(rawDisplay),
             targetLanguageCode: targetLanguageCode
         )
-        let literal = item.literalTranslation.map {
+        let rawLiteral = item.literalTranslation.map {
             normalizedTranslation(
                 removingEditorialAnnotations($0),
                 targetLanguageCode: targetLanguageCode
             )
         }
+        let literalContainsSourceText = rawLiteral.map {
+            Self.isLikelySourceTextLeak(
+                sourceText: region.sourceText,
+                translatedText: $0,
+                targetLanguageCode: targetLanguageCode
+            )
+        } ?? false
+        let literal = literalContainsSourceText ? display : rawLiteral
         translated.literalTranslatedText = qualityOptions.preserveLiteralTranslation
             ? (literal?.isEmpty == false ? literal : display)
             : nil
@@ -297,6 +380,9 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
                )
            }) != display {
             flags.insert(.reviewAdjusted)
+        }
+        if literalContainsSourceText {
+            flags.insert(.sourceTextLeak)
         }
         if qualityOptions.qualityCheckEnabled {
             flags.formUnion(qualityFlags(
@@ -334,6 +420,7 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         }
         return try await generateItems(
             pageURL: pageURL,
+            targetLanguageCode: targetLanguageCode,
             prompt: Self.draftPrompt(
                 targetLanguageCode: targetLanguageCode,
                 readingDirection: readingDirection,
@@ -373,6 +460,7 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
             do {
                 let values = try await generateItems(
                     pageURL: pageURL,
+                    targetLanguageCode: targetLanguageCode,
                     prompt: Self.draftPrompt(
                         targetLanguageCode: targetLanguageCode,
                         readingDirection: .topToBottom,
@@ -400,6 +488,7 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
 
     private func generateItems(
         pageURL: URL,
+        targetLanguageCode: String,
         prompt: String,
         expectedRegions: [DialogueRegion],
         regionProgress: PageRegionProgress? = nil,
@@ -422,6 +511,7 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
             }
         )
         let expectedIDs = Set(expectedRegions.map(\.id))
+        let expectedRegionsByID = Dictionary(uniqueKeysWithValues: expectedRegions.map { ($0.id, $0) })
         let candidates = VLMStructuredResponseDecoder.decodeArrays(TranslationItem.self, from: response)
         log(
             .debug,
@@ -430,7 +520,16 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         )
         for candidate in candidates {
             let items = candidate.filter {
-                expectedIDs.contains($0.id) && $0.resolvedDisplayTranslation != nil
+                guard expectedIDs.contains($0.id),
+                      let display = $0.resolvedDisplayTranslation,
+                      let region = expectedRegionsByID[$0.id] else {
+                    return false
+                }
+                return !Self.isLikelySourceTextLeak(
+                    sourceText: region.sourceText,
+                    translatedText: display,
+                    targetLanguageCode: targetLanguageCode
+                )
             }
             guard !items.isEmpty else { continue }
             log(
@@ -443,6 +542,23 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         }
         log(.error, "Translation", "The structured translation response was invalid; automatic retry is disabled.")
         throw TranslationRuntimeError.invalidModelResponse
+    }
+
+    static func isLikelySourceTextLeak(
+        sourceText: String,
+        translatedText: String,
+        targetLanguageCode _: String
+    ) -> Bool {
+        let source = comparableTranslationText(sourceText)
+        let translated = comparableTranslationText(translatedText)
+        return !source.isEmpty && source == translated
+    }
+
+    private static func comparableTranslationText(_ text: String) -> String {
+        text
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .filter { $0.isLetter || $0.isNumber }
+            .lowercased()
     }
 
     /// MLX VLM 在約 55% 前仍在載入與準備輸入，之後才開始串流輸出。整頁語境
@@ -476,6 +592,8 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         \(VLMStructuredResponseDecoder.finalJSONInstruction)
         Translate every sourceText into BCP-47 language "\(targetLanguageCode)".
         Target-language script rule: \(targetLanguageRequirement(for: targetLanguageCode))
+        Never copy sourceText unchanged into literalTranslation or displayTranslation. Every
+        non-empty source region must receive an actual translation in the target language.
         Read all regions together in index order using reading direction "\(readingDirection.rawValue)".
         \(contextInstruction)
         Keep the same speakerID for the same visible speaker. Use stable descriptive IDs when names are unknown.
@@ -486,10 +604,14 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         Project style guide: \(qualityOptions.styleGuide.isEmpty ? "No additional style guide." : qualityOptions.styleGuide)
         Terminology is authoritative; whenever sourceTerm occurs, use preferredTranslation exactly:
         \(glossaryJSON)
-        Return only one valid JSON array in the same index order, with every UUID unchanged,
-        in this exact shape:
-        [{"id":"UUID","literalTranslation":"...","displayTranslation":"...","speakerID":"...","tone":"...","confidence":0.0,"qaFlags":[]}]
-        confidence is 0...1. qaFlags may only contain missingTranslation, glossaryMismatch, numberMismatch,
+        Return only one valid JSON array in the same index order, with every UUID unchanged.
+        Each item must contain exactly these keys: id, literalTranslation, displayTranslation,
+        speakerID, tone, confidence and qaFlags. Fill every value from the supplied input; never
+        output placeholders such as "UUID", "...", "translated text", "speaker" or "tone".
+        literalTranslation and displayTranslation must be actual \(targetLanguageCode) text.
+        Use "unknown" for speakerID and "neutral" for tone when uncertain. confidence is a number
+        from 0 to 1. qaFlags must always be a JSON string array; use [] when there are no flags.
+        It may only contain missingTranslation, glossaryMismatch, numberMismatch,
         excessiveLength, modelUncertain or sourceTextLeak. Do not add explanations.
         Input regions:
         \(regionsJSON)
@@ -512,6 +634,8 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         You are the senior editor reviewing a complete comic-page translation into "\(targetLanguageCode)".
         \(VLMStructuredResponseDecoder.finalJSONInstruction)
         Target-language script rule: \(targetLanguageRequirement(for: targetLanguageCode))
+        Never copy sourceText unchanged into literalTranslation or displayTranslation. Every
+        non-empty source region must receive an actual translation in the target language.
         Perform exactly one whole-page editorial pass; do not process regions as independent OCR or translation jobs.
         Treat every supplied sourceText as authoritative. Do not re-transcribe, re-extract or replace sourceText.
         \(comparisonInstruction) Review all drafts together in "\(readingDirection.rawValue)"
@@ -528,6 +652,7 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         Drafts:
         \(draftsJSON)
         Return only the complete corrected JSON array in the same shape as the drafts. Keep every UUID.
+        qaFlags must always be a JSON string array; use [] when there are no flags.
         """
     }
 

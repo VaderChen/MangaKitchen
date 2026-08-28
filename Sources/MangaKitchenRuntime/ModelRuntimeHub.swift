@@ -13,6 +13,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     private let reasoningStream: RuntimeReasoningStreamHandler
     private let ggufQuantizationGroupSize: Int
     private let ggufQuantizationProfile: GGUFQuantizationProfile
+    private var dflashEnabled: Bool
+    private var dflashBlockSize: Int
     private var textToTextRuntime: (any TextGenerating)?
     private var imageToTextRuntime: (any ImageToTextGenerating)?
     private var imageToImageRuntime: (any ImageToImageGenerating)?
@@ -28,6 +30,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
         metal: MetalContext,
         ggufQuantizationGroupSize: Int = 64,
         ggufQuantizationProfile: GGUFQuantizationProfile = .quality,
+        dflashEnabled: Bool = false,
+        dflashBlockSize: Int = 5,
         thinkingEnabled: Bool = false,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
@@ -35,6 +39,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
         self.metal = metal
         self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
         self.ggufQuantizationProfile = ggufQuantizationProfile
+        self.dflashEnabled = dflashEnabled
+        self.dflashBlockSize = min(max(dflashBlockSize, 2), 256)
         self.thinkingEnabled = thinkingEnabled
         self.log = log
         self.reasoningStream = reasoningStream
@@ -157,6 +163,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                     ggufQuantizationGroupSize: ggufQuantizationGroupSize,
                     ggufQuantizationProfile: ggufQuantizationProfile,
                     thinkingEnabled: thinkingEnabled,
+                    dflashEnabled: dflashEnabled,
+                    dflashBlockSize: dflashBlockSize,
                     log: log,
                     reasoningStream: reasoningStream
                 )
@@ -170,6 +178,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                     ggufQuantizationGroupSize: ggufQuantizationGroupSize,
                     ggufQuantizationProfile: ggufQuantizationProfile,
                     thinkingEnabled: thinkingEnabled,
+                    dflashEnabled: dflashEnabled,
+                    dflashBlockSize: dflashBlockSize,
                     log: log,
                     reasoningStream: reasoningStream
                 )
@@ -229,6 +239,22 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     public func setThinkingEnabled(_ enabled: Bool) {
         guard thinkingEnabled != enabled else { return }
         thinkingEnabled = enabled
+        textToTextRuntime = nil
+        imageToTextRuntime = nil
+        modelInfos[.textToText] = nil
+        modelInfos[.imageToText] = nil
+    }
+
+    public func setDFlashConfiguration(
+        enabled: Bool,
+        blockSize: Int
+    ) {
+        let normalizedBlockSize = min(max(blockSize, 2), 256)
+        guard dflashEnabled != enabled || dflashBlockSize != normalizedBlockSize else {
+            return
+        }
+        dflashEnabled = enabled
+        dflashBlockSize = normalizedBlockSize
         textToTextRuntime = nil
         imageToTextRuntime = nil
         modelInfos[.textToText] = nil

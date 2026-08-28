@@ -117,26 +117,35 @@ enum MLXGGUFEmbeddedAssets {
         let tokenizerConfigURL = directoryURL.appendingPathComponent("tokenizer_config.json")
 
         let embeddedData = try? embeddedTokenizerData(from: metadata)
-        let embeddedConfiguration = try? embeddedTokenizerConfiguration(from: metadata)
-        let externalData = try? config(from: Data(contentsOf: tokenizerDataURL))
-        let externalConfiguration = try? config(from: Data(contentsOf: tokenizerConfigURL))
-        var candidates: [(data: Config, configuration: Config)] = []
-        if let embeddedData, let embeddedConfiguration {
-            candidates.append((embeddedData, embeddedConfiguration))
+        let chatTemplate = chatTemplate(in: directoryURL)
+        let embeddedConfiguration = (try? embeddedTokenizerConfiguration(from: metadata)).map {
+            configurationByAddingChatTemplate($0, chatTemplate: chatTemplate)
         }
-        if let embeddedData, let externalConfiguration {
-            candidates.append((embeddedData, externalConfiguration))
+        let externalData = try? config(from: Data(contentsOf: tokenizerDataURL))
+        let externalConfiguration = (try? config(from: Data(contentsOf: tokenizerConfigURL))).map {
+            configurationByAddingChatTemplate($0, chatTemplate: chatTemplate)
+        }
+        var candidates: [(data: Config, configuration: Config)] = []
+        if let externalData, let externalConfiguration {
+            candidates.append((externalData, externalConfiguration))
         }
         if let externalData, let embeddedConfiguration {
             candidates.append((externalData, embeddedConfiguration))
         }
-        if let externalData, let externalConfiguration {
-            candidates.append((externalData, externalConfiguration))
+        if let embeddedData, let externalConfiguration {
+            candidates.append((embeddedData, externalConfiguration))
+        }
+        if let embeddedData, let embeddedConfiguration {
+            candidates.append((embeddedData, embeddedConfiguration))
         }
 
         for candidate in candidates {
+            let tokenizerConfiguration = configurationWithUnknownTokenFallback(
+                candidate.configuration,
+                tokenizerData: candidate.data
+            )
             if let upstream = try? AutoTokenizer.from(
-                tokenizerConfig: candidate.configuration,
+                tokenizerConfig: tokenizerConfiguration,
                 tokenizerData: candidate.data,
                 strict: false
             ) {
@@ -152,6 +161,72 @@ enum MLXGGUFEmbeddedAssets {
             throw MLXGGUFLoaderError.missingTokenizer(tokenizerConfigURL)
         }
         throw MLXGGUFLoaderError.embeddedTokenizerUnavailable(weightURL)
+    }
+
+    private static func chatTemplate(in directoryURL: URL) -> String? {
+        let templateURL = directoryURL.appendingPathComponent("chat_template.jinja")
+        guard let template = try? String(contentsOf: templateURL, encoding: .utf8),
+              !template.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return template
+    }
+
+    private static func configurationByAddingChatTemplate(
+        _ configuration: Config,
+        chatTemplate: String?
+    ) -> Config {
+        guard let chatTemplate else { return configuration }
+        var values = configuration.dictionary(or: [:])
+        values[BinaryDistinctString("chat_template")] = Config(chatTemplate)
+        return Config(values)
+    }
+
+    private static func configurationWithUnknownTokenFallback(
+        _ configuration: Config,
+        tokenizerData: Config
+    ) -> Config {
+        let knownTokens = knownTokens(in: tokenizerData)
+        guard !knownTokens.isEmpty else { return configuration }
+
+        let configuredUnknownToken = configuration.unkToken.content.string()
+            ?? configuration.unkToken.string()
+        if let configuredUnknownToken, knownTokens.contains(configuredUnknownToken) {
+            return configuration
+        }
+
+        let configuredFallbacks = [
+            configuration.padToken.content.string() ?? configuration.padToken.string(),
+            configuration.eosToken.content.string() ?? configuration.eosToken.string(),
+            "<|endoftext|>"
+        ].compactMap { $0 }
+        let fallbackToken = configuredFallbacks.first(where: knownTokens.contains)
+            ?? knownTokens[0]
+        var values = configuration.dictionary(or: [:])
+        values[BinaryDistinctString("unk_token")] = Config(fallbackToken)
+        return Config(values)
+    }
+
+    private static func knownTokens(in tokenizerData: Config) -> [String] {
+        var tokens = [String]()
+        if let vocabulary = tokenizerData.model.vocab.dictionary() {
+            tokens.append(contentsOf: vocabulary
+                .sorted { ($0.value.integer() ?? .max) < ($1.value.integer() ?? .max) }
+                .map { $0.key.string })
+        }
+        for addedToken in tokenizerData.addedTokens.array(or: []) {
+            if let content = addedToken.content.string() {
+                tokens.append(content)
+            } else if let token = addedToken.string() {
+                tokens.append(token)
+            }
+        }
+        var uniqueTokens = [String]()
+        var seenTokens = Set<String>()
+        for token in tokens where seenTokens.insert(token).inserted {
+            uniqueTokens.append(token)
+        }
+        return uniqueTokens
     }
 
     private static func qwen35Configuration(
@@ -370,15 +445,17 @@ enum MLXGGUFEmbeddedAssets {
             integer("tokenizer.ggml.eos_token_id", in: metadata),
             integer("tokenizer.ggml.padding_token_id", in: metadata)
         ].compactMap { $0 })
-        let specialTokenIDs = Set(tokens.indices.filter { index in
-            specialIDs.contains(index)
-                || tokenTypes[safe: index]?.integerValue == 3
-                || tokenTypes[safe: index]?.integerValue == 4
-        })
         let vocabulary = tokens.enumerated().reduce(into: [String: Config]()) { result, item in
+            guard tokenTypes[safe: item.offset]?.integerValue == 1 else { return }
             result[item.element] = Config(item.offset)
         }
-        let addedTokens = specialTokenIDs.sorted().map { index in
+        let addedTokenIDs = tokens.indices.filter { index in
+            guard let tokenType = tokenTypes[safe: index]?.integerValue else {
+                return specialIDs.contains(index)
+            }
+            return tokenType == 3 || tokenType == 4 || specialIDs.contains(index)
+        }
+        let addedTokens = addedTokenIDs.map { index in
             Config([
                 "id": Config(index),
                 "content": Config(tokens[index]),
@@ -386,7 +463,7 @@ enum MLXGGUFEmbeddedAssets {
                 "lstrip": Config(false),
                 "rstrip": Config(false),
                 "normalized": Config(false),
-                "special": Config(true)
+                "special": Config(isEmbeddedSpecialToken(tokens[index]))
             ])
         }
         let preTokenizer = Config([
@@ -436,6 +513,15 @@ enum MLXGGUFEmbeddedAssets {
                 "merges": Config(merges.map { Config($0) })
             ])
         ])
+    }
+
+    private static func isEmbeddedSpecialToken(_ token: String) -> Bool {
+        token == "<|endoftext|>"
+            || token.hasPrefix("<|im_")
+            || token.hasPrefix("<|object_ref_")
+            || token.hasPrefix("<|box_")
+            || token.hasPrefix("<|quad_")
+            || token.hasPrefix("<|vision_")
     }
 
     private static func embeddedTokenizerConfiguration(

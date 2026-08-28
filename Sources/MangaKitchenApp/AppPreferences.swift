@@ -15,6 +15,14 @@ struct AppPreferences: Codable, Equatable, Sendable {
     var imageToTextModelPath: String?
     var imageToTextModelDownloadDirectoryPath: String?
     var imageToTextModelVariant: String?
+    var translationModelPath: String?
+    var translationModelDownloadDirectoryPath: String?
+    var translationModelVariant: String?
+    var dflashEnabled = false
+    var dflashBlockSize = 5
+    var agentModelPath: String?
+    var agentModelDownloadDirectoryPath: String?
+    var agentModelVariant: String?
     var modelThinkingEnabled = false
     var imageToImageModelPath: String?
     var imageColorizationModelPath: String?
@@ -38,6 +46,14 @@ struct AppPreferences: Codable, Equatable, Sendable {
         case imageToTextModelPath
         case imageToTextModelDownloadDirectoryPath
         case imageToTextModelVariant
+        case translationModelPath
+        case translationModelDownloadDirectoryPath
+        case translationModelVariant
+        case dflashEnabled
+        case dflashBlockSize
+        case agentModelPath
+        case agentModelDownloadDirectoryPath
+        case agentModelVariant
         case modelThinkingEnabled
         case imageToImageModelPath
         case imageColorizationModelPath
@@ -50,6 +66,10 @@ struct AppPreferences: Codable, Equatable, Sendable {
         case mcpEnabled
         case mcpPort
         case mcpAllowedClients
+    }
+
+    private enum LegacyCodingKeys: String, CodingKey {
+        case dflashDraftModelPath
     }
 
     init() {}
@@ -74,6 +94,26 @@ struct AppPreferences: Codable, Equatable, Sendable {
             forKey: .imageToTextModelDownloadDirectoryPath
         )
         imageToTextModelVariant = try values.decodeIfPresent(String.self, forKey: .imageToTextModelVariant)
+        translationModelPath = try values.decodeIfPresent(String.self, forKey: .translationModelPath)
+        translationModelDownloadDirectoryPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .translationModelDownloadDirectoryPath
+        )
+        translationModelVariant = try values.decodeIfPresent(String.self, forKey: .translationModelVariant)
+        let legacyValues = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        let legacyDFlashDraftModelPath = try legacyValues.decodeIfPresent(
+            String.self,
+            forKey: .dflashDraftModelPath
+        )
+        dflashEnabled = try values.decodeIfPresent(Bool.self, forKey: .dflashEnabled)
+            ?? !(legacyDFlashDraftModelPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        dflashBlockSize = try values.decodeIfPresent(Int.self, forKey: .dflashBlockSize) ?? 5
+        agentModelPath = try values.decodeIfPresent(String.self, forKey: .agentModelPath)
+        agentModelDownloadDirectoryPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .agentModelDownloadDirectoryPath
+        )
+        agentModelVariant = try values.decodeIfPresent(String.self, forKey: .agentModelVariant)
         modelThinkingEnabled = try values.decodeIfPresent(
             Bool.self,
             forKey: .modelThinkingEnabled
@@ -164,6 +204,77 @@ struct AppPreferences: Codable, Equatable, Sendable {
                 model: resolvedModel
             )?.path
         }
+        translationModelPath = Self.normalizedOptionalPath(translationModelPath)
+        translationModelDownloadDirectoryPath = Self.normalizedOptionalPath(
+            translationModelDownloadDirectoryPath
+        )
+        let selectedTranslationModel = translationModelVariant.flatMap {
+            DownloadableModelCatalog.translationModel(id: $0)
+        } ?? DownloadableModelCatalog.defaultTranslationModel
+        translationModelVariant = selectedTranslationModel.id
+        if translationModelDownloadDirectoryPath == nil,
+           let translationModelPath {
+            let modelURL = URL(fileURLWithPath: translationModelPath).standardizedFileURL
+            if let matchedModel = DownloadableModelCatalog.translationModel(matching: modelURL) {
+                translationModelDownloadDirectoryPath = modelURL.deletingLastPathComponent().path
+                translationModelVariant = matchedModel.id
+            }
+        }
+        if let translationModelDownloadDirectoryPath {
+            var storageURL = URL(fileURLWithPath: translationModelDownloadDirectoryPath)
+                .standardizedFileURL
+            if let directlySelectedModel = DownloadableModelCatalog.translationModel(matching: storageURL),
+               DownloadableModelCatalog.isCompleteModelDirectory(
+                   storageURL,
+                   model: directlySelectedModel
+               ) {
+                storageURL.deleteLastPathComponent()
+                self.translationModelDownloadDirectoryPath = storageURL.path
+                translationModelVariant = directlySelectedModel.id
+            }
+            let resolvedModel = DownloadableModelCatalog.translationModel(
+                id: translationModelVariant ?? selectedTranslationModel.id
+            ) ?? selectedTranslationModel
+            translationModelPath = DownloadableModelCatalog.installedModelDirectory(
+                storageDirectoryURL: storageURL,
+                model: resolvedModel
+            )?.path
+        }
+        dflashBlockSize = min(max(dflashBlockSize, 2), 256)
+        agentModelPath = Self.normalizedOptionalPath(agentModelPath)
+        agentModelDownloadDirectoryPath = Self.normalizedOptionalPath(agentModelDownloadDirectoryPath)
+        let selectedAgentModel = agentModelVariant.flatMap {
+            DownloadableModelCatalog.agentModel(id: $0)
+        } ?? DownloadableModelCatalog.defaultAgentModel
+        agentModelVariant = selectedAgentModel.id
+        if agentModelDownloadDirectoryPath == nil,
+           let agentModelPath {
+            let modelURL = URL(fileURLWithPath: agentModelPath).standardizedFileURL
+            if let matchedModel = DownloadableModelCatalog.agentModel(matching: modelURL) {
+                agentModelDownloadDirectoryPath = modelURL.deletingLastPathComponent().path
+                agentModelVariant = matchedModel.id
+            }
+        }
+        if let agentModelDownloadDirectoryPath {
+            var storageURL = URL(fileURLWithPath: agentModelDownloadDirectoryPath)
+                .standardizedFileURL
+            if let directlySelectedModel = DownloadableModelCatalog.agentModel(matching: storageURL),
+               DownloadableModelCatalog.isCompleteModelDirectory(
+                storageURL,
+                model: directlySelectedModel
+            ) {
+                storageURL.deleteLastPathComponent()
+                self.agentModelDownloadDirectoryPath = storageURL.path
+                agentModelVariant = directlySelectedModel.id
+            }
+            let resolvedModel = DownloadableModelCatalog.agentModel(
+                id: agentModelVariant ?? selectedAgentModel.id
+            ) ?? selectedAgentModel
+            agentModelPath = DownloadableModelCatalog.installedModelDirectory(
+                storageDirectoryURL: storageURL,
+                model: resolvedModel
+            )?.path
+        }
         imageToImageModelPath = Self.normalizedOptionalPath(imageToImageModelPath)
         imageColorizationModelPath = Self.normalizedOptionalPath(imageColorizationModelPath)
         imageColorizationModelDownloadDirectoryPath = Self.normalizedOptionalPath(
@@ -212,6 +323,16 @@ struct AppPreferences: Codable, Equatable, Sendable {
             id: imageToTextModelVariant ?? "",
             capability: .imageToText
         )?.id ?? DownloadableModelCatalog.defaultImageToTextModel.id
+    }
+
+    var resolvedAgentModelVariant: String {
+        DownloadableModelCatalog.agentModel(id: agentModelVariant ?? "")?.id
+            ?? DownloadableModelCatalog.defaultAgentModel.id
+    }
+
+    var resolvedTranslationModelVariant: String {
+        DownloadableModelCatalog.translationModel(id: translationModelVariant ?? "")?.id
+            ?? DownloadableModelCatalog.defaultTranslationModel.id
     }
 
     var resolvedSuperResolutionModelVariant: String {

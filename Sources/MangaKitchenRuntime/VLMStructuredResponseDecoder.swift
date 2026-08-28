@@ -29,6 +29,17 @@ enum VLMStructuredResponseDecoder {
     /// generate 結果只會包含 reasoning、`</think>` 與最終 JSON。結構化流程
     /// 必須以最後一個結束標記為準，不能假設回覆內一定有成對的起始標記。
     private static func stripReasoning(from response: String) -> String {
+        if let finalChannel = harmonyFinalChannel(from: response) {
+            return finalChannel
+        }
+        if response.contains("<|channel|>analysis") || response.contains("<|start|>assistant") {
+            // Harmony 回覆若尚未進入 final channel，所有內容都仍屬於
+            // reasoning，不能從其中誤撿 JSON 片段。
+            return ""
+        }
+        if let gemmaVisibleChannel = gemmaVisibleChannel(from: response) {
+            return gemmaVisibleChannel
+        }
         if let end = response.range(of: "</think>", options: .backwards) {
             let finalAnswer = String(response[end.upperBound...])
             // 最後一個 </think> 後又出現未關閉的 thinking，代表模型尚未
@@ -42,18 +53,95 @@ enum VLMStructuredResponseDecoder {
         return response
     }
 
+    private static func harmonyFinalChannel(from response: String) -> String? {
+        let marker: Range<String.Index>
+        if let fullMarker = response.range(
+            of: "<|channel|>final<|message|>",
+            options: .backwards
+        ) {
+            marker = fullMarker
+        } else if let shortMarker = response.range(of: "<|channel|>final", options: .backwards) {
+            marker = shortMarker
+        } else {
+            return nil
+        }
+
+        var value = String(response[marker.upperBound...])
+        for terminator in ["<|return|>", "<|end|>"] {
+            if let range = value.range(of: terminator) {
+                value = String(value[..<range.lowerBound])
+                break
+            }
+        }
+        return value
+    }
+
+    private static func gemmaVisibleChannel(from response: String) -> String? {
+        let hasThoughtChannel = response.contains("<|channel>thought")
+        let hasGemmaMarker = hasThoughtChannel
+            || response.contains("<|channel>")
+            || response.contains("<channel|>")
+            || response.contains("<|turn>model")
+            || response.contains("<turn|>")
+        guard hasGemmaMarker else { return nil }
+
+        var value = response
+        if hasThoughtChannel {
+            guard let close = value.range(of: "<channel|>", options: .backwards) else {
+                return ""
+            }
+            value = String(value[close.upperBound...])
+        } else if let close = value.range(of: "<channel|>", options: .backwards) {
+            value = String(value[close.upperBound...])
+        }
+        if let modelTurn = value.range(of: "<|turn>model") {
+            value = String(value[modelTurn.upperBound...])
+        }
+        for marker in ["<turn|>", "<|tool_response>", "<tool_response|>"] {
+            if let end = value.range(of: marker) {
+                value = String(value[..<end.lowerBound])
+                break
+            }
+        }
+        return value
+    }
+
     static let finalJSONInstruction = """
     The final answer must contain only the requested JSON. If the runtime enables a <think>
     phase, use only a brief lightweight analysis (at most about 256 tokens), finish it, and
     output the JSON immediately after </think>. Do not explore multiple alternatives.
     Never put the final JSON inside the thinking phase. After the thinking boundary, do not
     use Markdown fences, analysis, reasoning, commentary, or any text around the final JSON.
+    If your chat format uses Harmony channels, keep any analysis brief and put the complete JSON
+    only in the final channel. Never put the JSON in the analysis or commentary channel.
     """
 
     /// 用於 UI 即時顯示的 thinking 內容。Qwen chat template 可能已把
     /// `<think>` 放在 prompt，因此串流本身常常只有內容與 `</think>`。
     /// 最終 JSON 一定排除，避免將機器資料誤當推理文字。
     static func streamedReasoningText(from response: String) -> String {
+        if response.contains("<|channel|>analysis") || response.contains("<|channel|>final") {
+            guard let analysis = response.range(
+                of: "<|channel|>analysis<|message|>",
+                options: .backwards
+            ) else {
+                return ""
+            }
+            var value = String(response[analysis.upperBound...])
+            if let end = value.range(of: "<|end|>") {
+                value = String(value[..<end.lowerBound])
+            }
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if response.contains("<|channel>") || response.contains("<channel|>") {
+            guard let start = response.range(of: "<|channel>thought", options: .backwards) else {
+                return ""
+            }
+            let end = response.range(of: "<channel|>", range: start.upperBound..<response.endIndex)
+            let upperBound = end?.lowerBound ?? response.endIndex
+            return String(response[start.upperBound..<upperBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         var value = response
         if let end = value.range(of: "</think>") {
             value = String(value[..<end.lowerBound])
@@ -114,8 +202,9 @@ enum VLMStructuredResponseDecoder {
 
         IMPORTANT RETRY: The previous answer was invalid or incomplete. Finish any enabled thinking
         phase first, then return only the requested JSON array after </think>. Do not put the final
-        JSON inside reasoning. Do not use Markdown fences, analysis, commentary, or omit any
-        requested item.
+        JSON inside reasoning. Do not use Markdown fences, analysis, commentary, placeholders such
+        as "..." or "translated text", or omit any requested item. Every translation value must
+        be actual text in the requested target language.
         """
     }
 
@@ -142,7 +231,7 @@ enum VLMStructuredResponseDecoder {
             guard !trimmed.isEmpty else { return [] }
 
             var candidates: [String] = [trimmed]
-            var startIndex: String.Index?
+            var startIndices: [String.Index] = []
             var depth = 0
             var isInsideString = false
             var isEscaping = false
@@ -163,13 +252,12 @@ enum VLMStructuredResponseDecoder {
                 if character == "\"" {
                     isInsideString = true
                 } else if character == opening {
-                    if depth == 0 { startIndex = index }
+                    startIndices.append(index)
                     depth += 1
                 } else if character == closing, depth > 0 {
                     depth -= 1
-                    if depth == 0, let arrayStart = startIndex {
-                        candidates.append(String(trimmed[arrayStart...index]))
-                        startIndex = nil
+                    if let candidateStart = startIndices.popLast() {
+                        candidates.append(String(trimmed[candidateStart...index]))
                     }
                 }
             }

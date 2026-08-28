@@ -1,11 +1,26 @@
 import Foundation
 import ImageIO
+import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
 import MLXVLM
 import MangaKitchenCore
 import Tokenizers
 import UniformTypeIdentifiers
+
+private final class VLMGenerationInputBox: @unchecked Sendable {
+    let dflashInput: LMInput
+    let standardInput: LMInput
+
+    init(_ input: LMInput) {
+        dflashInput = input
+        standardInput = LMInput(
+            text: .init(tokens: input.text.tokens, mask: input.text.mask),
+            image: input.image,
+            video: input.video,
+            audio: input.audio)
+    }
+}
 
 /// 執行本機 Hugging Face MLX VLM 目錄；矩陣運算由 MLX 的 Metal 後端處理。
 actor MLXVLMRuntime: ImageToTextGenerating {
@@ -18,9 +33,13 @@ actor MLXVLMRuntime: ImageToTextGenerating {
     private let ggufQuantizationGroupSize: Int
     private let ggufQuantizationProfile: GGUFQuantizationProfile
     private let thinkingEnabled: Bool
+    private let generationProtocol: MLXGenerationProtocol
+    private let dflashEnabled: Bool
+    private let dflashBlockSize: Int
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
     private var container: ModelContainer?
+    private var dflashDrafter: (any DFlashDrafterModel)?
 
     init(
         directoryURL: URL,
@@ -28,6 +47,8 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         ggufQuantizationGroupSize: Int = 64,
         ggufQuantizationProfile: GGUFQuantizationProfile = .quality,
         thinkingEnabled: Bool = false,
+        dflashEnabled: Bool = false,
+        dflashBlockSize: Int = 5,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
     ) throws {
@@ -70,6 +91,9 @@ actor MLXVLMRuntime: ImageToTextGenerating {
         self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
         self.ggufQuantizationProfile = ggufQuantizationProfile
         self.thinkingEnabled = thinkingEnabled
+        self.generationProtocol = MLXGenerationProtocol.detect(in: directoryURL)
+        self.dflashEnabled = dflashEnabled
+        self.dflashBlockSize = min(max(dflashBlockSize, 2), 256)
         self.log = log
         self.reasoningStream = reasoningStream
         self.info = LoadedModelInfo(
@@ -148,61 +172,81 @@ actor MLXVLMRuntime: ImageToTextGenerating {
             repetitionPenalty: max(generation.repetitionPenalty, 1),
             repetitionContextSize: 128
         )
-        let stream = try await container.generate(input: prepared, parameters: parameters)
-        let generationStart = Date()
-        let expectedChunks = min(maxTokens, 512)
         var result = ""
-        var chunks = 0
-        var didLogFirstToken = false
-
-        var lastRepetitionCheck = 0
-        var stoppedOnRepetition = false
-
-        for await event in stream {
-            try Task.checkCancellation()
-            if let info = event.info {
-                log(
-                    .info,
-                    "Generation Metrics",
-                    "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
-                        + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
-                        + "tokensPerSecond=\(info.tokensPerSecond)"
-                )
+        if generationProtocol.requiresTokenAwareGeneration {
+            result = try await MLXProtocolTokenGenerator.generate(
+                protocol: generationProtocol,
+                container: container,
+                input: prepared,
+                parameters: parameters,
+                progressStart: 0.55,
+                progressEnd: 0.99,
+                phase: "initial",
+                progress: progress,
+                log: log
+            )
+            if let reasoningID {
+                reasoningStream(.updated(
+                    id: reasoningID,
+                    text: VLMStructuredResponseDecoder.streamedReasoningText(from: result)
+                ))
             }
-            if case let .chunk(text) = event {
-                if !didLogFirstToken, !text.isEmpty {
-                    didLogFirstToken = true
+        } else {
+            let stream = try await generateStream(
+                container: container,
+                input: prepared,
+                parameters: parameters)
+            let generationStart = Date()
+            let expectedChunks = min(maxTokens, 512)
+            var chunks = 0
+            var didLogFirstToken = false
+            var lastRepetitionCheck = 0
+            var stoppedOnRepetition = false
+
+            for await event in stream {
+                try Task.checkCancellation()
+                if let info = event.info {
                     log(
                         .info,
                         "Generation Metrics",
-                        "phase=initial firstTokenLatency=\(Date().timeIntervalSince(generationStart))"
+                        "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                            + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                            + "tokensPerSecond=\(info.tokensPerSecond)"
                     )
                 }
-                result += text
-                if let reasoningID {
-                    reasoningStream(.updated(
-                        id: reasoningID,
-                        text: VLMStructuredResponseDecoder.streamedReasoningText(from: result)
-                    ))
-                }
-                chunks += 1
-                progress(min(0.99, 0.55 + Double(chunks) / Double(expectedChunks) * 0.44))
-                // 小模型會卡進重複輸出迴圈，把同一筆 JSON 物件吐上十幾次，
-                // 整段生成因此空轉數十秒。偵測到就提早收工。
-                if chunks - lastRepetitionCheck >= 32, result.count > 400 {
-                    lastRepetitionCheck = chunks
-                    if Self.isRepeatingTail(result) {
-                        stoppedOnRepetition = true
-                        break
+                if case let .chunk(text) = event {
+                    if !didLogFirstToken, !text.isEmpty {
+                        didLogFirstToken = true
+                        log(
+                            .info,
+                            "Generation Metrics",
+                            "phase=initial firstTokenLatency=\(Date().timeIntervalSince(generationStart))"
+                        )
+                    }
+                    result += text
+                    if let reasoningID {
+                        reasoningStream(.updated(
+                            id: reasoningID,
+                            text: VLMStructuredResponseDecoder.streamedReasoningText(from: result)
+                        ))
+                    }
+                    chunks += 1
+                    progress(min(0.99, 0.55 + Double(chunks) / Double(expectedChunks) * 0.44))
+                    if chunks - lastRepetitionCheck >= 32, result.count > 400 {
+                        lastRepetitionCheck = chunks
+                        if Self.isRepeatingTail(result) {
+                            stoppedOnRepetition = true
+                            break
+                        }
                     }
                 }
+            }
+            if stoppedOnRepetition {
+                result = Self.repairedTruncatedArray(result)
             }
         }
 
         var output = result.trimmingCharacters(in: .whitespacesAndNewlines)
-        if stoppedOnRepetition {
-            output = Self.repairedTruncatedArray(output)
-        }
         if let reasoningID {
             reasoningStream(.finished(id: reasoningID))
             reasoningDidFinish = true
@@ -224,7 +268,10 @@ actor MLXVLMRuntime: ImageToTextGenerating {
                         images: [.url(preparedImage.url)]
                     )
                 ],
-                additionalContext: ["enable_thinking": false]
+                additionalContext: [
+                    "enable_thinking": false,
+                    "mangakitchen_force_final_channel": generationProtocol == .harmony
+                ]
             )
             let finalPrepared = try await container.prepare(input: finalInput)
             let finalParameters = GenerateParameters(
@@ -234,38 +281,54 @@ actor MLXVLMRuntime: ImageToTextGenerating {
                 repetitionPenalty: max(generation.repetitionPenalty, 1),
                 repetitionContextSize: 128
             )
-            let finalStream = try await container.generate(
-                input: finalPrepared,
-                parameters: finalParameters
-            )
-            let finalGenerationStart = Date()
-            var finalOutput = ""
-            var didLogFinalFirstToken = false
-            for await event in finalStream {
-                try Task.checkCancellation()
-                if let info = event.info {
-                    log(
-                        .info,
-                        "Generation Metrics",
-                        "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
-                            + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
-                            + "tokensPerSecond=\(info.tokensPerSecond)"
-                    )
-                }
-                if case let .chunk(text) = event {
-                    if !didLogFinalFirstToken, !text.isEmpty {
-                        didLogFinalFirstToken = true
+            if generationProtocol.requiresTokenAwareGeneration {
+                output = try await MLXProtocolTokenGenerator.generate(
+                    protocol: generationProtocol,
+                    container: container,
+                    input: finalPrepared,
+                    parameters: finalParameters,
+                    progressStart: 0.99,
+                    progressEnd: 0.99,
+                    phase: "finalization",
+                    startsInFinalChannel: generationProtocol == .harmony,
+                    progress: progress,
+                    log: log
+                )
+            } else {
+                let finalStream = try await generateStream(
+                    container: container,
+                    input: finalPrepared,
+                    parameters: finalParameters)
+                let finalGenerationStart = Date()
+                var finalOutput = ""
+                var didLogFinalFirstToken = false
+                for await event in finalStream {
+                    try Task.checkCancellation()
+                    if let info = event.info {
                         log(
                             .info,
                             "Generation Metrics",
-                            "phase=finalization firstTokenLatency=\(Date().timeIntervalSince(finalGenerationStart))"
+                            "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                                + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                                + "tokensPerSecond=\(info.tokensPerSecond)"
                         )
                     }
-                    finalOutput += text
-                    progress(0.99)
+                    if case let .chunk(text) = event {
+                        if !didLogFinalFirstToken, !text.isEmpty {
+                            didLogFinalFirstToken = true
+                            log(
+                                .info,
+                                "Generation Metrics",
+                                "phase=finalization firstTokenLatency=\(Date().timeIntervalSince(finalGenerationStart))"
+                            )
+                        }
+                        finalOutput += text
+                        progress(0.99)
+                    }
                 }
+                output = finalOutput
             }
-            output = finalOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            output = output.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard !output.isEmpty else { throw MLXVLMRuntimeError.emptyResponse }
         progress(1)
@@ -324,9 +387,58 @@ actor MLXVLMRuntime: ImageToTextGenerating {
                 using: #huggingFaceTokenizerLoader()
             )
         }
+        dflashDrafter = await DFlashDraftRuntimeLoader.loadIfEnabled(
+            enabled: dflashEnabled,
+            targetDirectory: modelDirectory,
+            targetDisplayName: info.displayName,
+            container: loaded,
+            log: log
+        )
         progress(0.45)
         container = loaded
         return loaded
+    }
+
+    private func generateStream(
+        container: ModelContainer,
+        input: LMInput,
+        parameters: GenerateParameters
+    ) async throws -> AsyncStream<Generation> {
+        let inputs = VLMGenerationInputBox(input)
+        guard let dflashDrafter else {
+            return try await container.generate(
+                input: inputs.standardInput,
+                parameters: parameters)
+        }
+        guard parameters.maxKVSize == nil,
+              parameters.kvBits == nil,
+              parameters.kvScheme == nil else {
+            log(
+                .warning,
+                "DFlash",
+                "Target KV Cache configuration is incompatible; using standard generation for \(info.displayName)."
+            )
+            return try await container.generate(
+                input: inputs.standardInput,
+                parameters: parameters)
+        }
+
+        do {
+            return try await container.generate(
+                input: inputs.dflashInput,
+                parameters: parameters,
+                dflashDrafter: dflashDrafter,
+                blockSize: dflashBlockSize)
+        } catch let error as DFlashError {
+            log(
+                .warning,
+                "DFlash",
+                "DFlash generation is unavailable for \(info.displayName); using standard generation: \(error.localizedDescription)"
+            )
+            return try await container.generate(
+                input: inputs.standardInput,
+                parameters: parameters)
+        }
     }
 
     private static func preparedImageURL(

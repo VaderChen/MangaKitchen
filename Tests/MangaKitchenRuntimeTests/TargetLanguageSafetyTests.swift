@@ -120,6 +120,169 @@ final class TargetLanguageSafetyTests: XCTestCase {
         )
     }
 
+    func testTranslationPromptDoesNotUseCopyablePlaceholderValues() async throws {
+        let regionID = UUID(uuidString: "00000000-0000-0000-0000-000000000321")!
+        let model = StubTranslationModel(response: """
+        [{"id":"\(regionID.uuidString)","literalTranslation":"兩位都辛苦了！","displayTranslation":"兩位都辛苦了！","speakerID":"unknown","tone":"neutral","confidence":0.9,"qaFlags":[]}]
+        """)
+        let service = VLMRegionTranslationService(model: model, usesImageContext: false)
+        let region = DialogueRegion(
+            id: regionID,
+            bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+            sourceText: "二人ともお疲れ様です！",
+            confidence: 1
+        )
+
+        _ = try await service.translate(
+            regions: [region],
+            pageURL: URL(fileURLWithPath: "/tmp/unused.png"),
+            targetLanguageCode: "zh-Hant",
+            glossaryTerms: [],
+            readingDirection: .rightToLeft,
+            qualityOptions: TranslationQualityOptions(
+                usePageContext: false,
+                reviewPassEnabled: false,
+                qualityCheckEnabled: false
+            ),
+            regionProgress: { _, _ in },
+            draftsReady: { _ in },
+            progress: { _ in }
+        )
+
+        let prompts = await model.prompts
+        let prompt = try XCTUnwrap(prompts.first)
+        XCTAssertTrue(prompt.contains("actual zh-Hant text"))
+        XCTAssertTrue(prompt.contains("placeholders such as"))
+        XCTAssertTrue(prompt.contains("qaFlags must always be a JSON string array"))
+        XCTAssertFalse(prompt.contains("\"id\":\"UUID\""))
+        XCTAssertFalse(prompt.contains("\"literalTranslation\":\"...\""))
+    }
+
+    func testTranslationAcceptsGPTOSSConfidenceAndRepairsLiteralSourceLeak() async throws {
+        let regionID = UUID(uuidString: "00000000-0000-0000-0000-000000000654")!
+        let model = StubTranslationModel(response: """
+        [{"id":"\(regionID.uuidString)","literalTranslation":"二人ともお疲れ様です！","displayTranslation":"兩位都辛苦了！","speakerID":null,"tone":"neutral","confidence":"high","qaFlags":[]}]
+        """)
+        let service = VLMRegionTranslationService(model: model, usesImageContext: false)
+        let region = DialogueRegion(
+            id: regionID,
+            bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+            sourceText: "二人ともお疲れ様です！",
+            confidence: 1
+        )
+
+        let translated = try await service.translate(
+            regions: [region],
+            pageURL: URL(fileURLWithPath: "/tmp/unused.png"),
+            targetLanguageCode: "zh-Hant",
+            glossaryTerms: [],
+            readingDirection: .rightToLeft,
+            qualityOptions: TranslationQualityOptions(
+                usePageContext: false,
+                reviewPassEnabled: false,
+                qualityCheckEnabled: false
+            ),
+            regionProgress: { _, _ in },
+            draftsReady: { _ in },
+            progress: { _ in }
+        )
+
+        XCTAssertEqual(translated.first?.translatedText, "兩位都辛苦了！")
+        XCTAssertEqual(translated.first?.literalTranslatedText, "兩位都辛苦了！")
+        XCTAssertEqual(translated.first?.translationConfidence, 0.9)
+        XCTAssertTrue(translated.first?.translationQAFlags.contains(.sourceTextLeak) == true)
+    }
+
+    func testTranslationAcceptsNestedArrayAndScalarQAFlagsFromVLM() async throws {
+        let regionID = UUID(uuidString: "00000000-0000-0000-0000-000000000655")!
+        let model = StubTranslationModel(response: """
+        [[{"id":"\(regionID.uuidString)","literalTranslation":"謝謝！","displayTranslation":"謝謝！","speakerID":"unknown","tone":"neutral","confidence":1.0,"qaFlags":""}]]
+        """)
+        let service = VLMRegionTranslationService(model: model)
+        let region = DialogueRegion(
+            id: regionID,
+            bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+            sourceText: "ありがとう！",
+            confidence: 1
+        )
+
+        let translated = try await service.translate(
+            regions: [region],
+            pageURL: URL(fileURLWithPath: "/tmp/unused.png"),
+            targetLanguageCode: "zh-Hant",
+            glossaryTerms: [],
+            readingDirection: .rightToLeft,
+            qualityOptions: TranslationQualityOptions(
+                usePageContext: false,
+                reviewPassEnabled: false,
+                qualityCheckEnabled: false
+            ),
+            regionProgress: { _, _ in },
+            draftsReady: { _ in },
+            progress: { _ in }
+        )
+
+        XCTAssertEqual(translated.first?.translatedText, "謝謝！")
+    }
+
+    func testUnchangedSourceTextIsRecognizedAsTranslationLeak() {
+        XCTAssertTrue(
+            VLMRegionTranslationService.isLikelySourceTextLeak(
+                sourceText: "二人とも0お疲れ様です！",
+                translatedText: "二人とも0お疲れ様です！",
+                targetLanguageCode: "zh-Hant"
+            )
+        )
+        XCTAssertFalse(
+            VLMRegionTranslationService.isLikelySourceTextLeak(
+                sourceText: "二人とも0お疲れ様です！",
+                translatedText: "兩位都辛苦了！",
+                targetLanguageCode: "zh-Hant"
+            )
+        )
+    }
+
+    func testTranslationRejectsUnchangedSourceText() async {
+        let regionID = UUID(uuidString: "00000000-0000-0000-0000-000000000789")!
+        let model = StubTranslationModel(response: """
+        [{"id":"\(regionID.uuidString)","literalTranslation":"二人とも0お疲れ様です！","displayTranslation":"二人とも0お疲れ様です！","confidence":0.9,"qaFlags":[]}]
+        """)
+        let service = VLMRegionTranslationService(model: model)
+        let region = DialogueRegion(
+            id: regionID,
+            bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+            sourceText: "二人とも0お疲れ様です！",
+            confidence: 1
+        )
+
+        do {
+            _ = try await service.translate(
+                regions: [region],
+                pageURL: URL(fileURLWithPath: "/tmp/unused.png"),
+                targetLanguageCode: "zh-Hant",
+                glossaryTerms: [],
+                readingDirection: .rightToLeft,
+                qualityOptions: TranslationQualityOptions(
+                    usePageContext: false,
+                    reviewPassEnabled: false,
+                    qualityCheckEnabled: false
+                ),
+                regionProgress: { _, _ in },
+                draftsReady: { _ in },
+                progress: { _ in }
+            )
+            XCTFail("Expected unchanged source text to be rejected")
+        } catch let error as TranslationRuntimeError {
+            guard case let .missingTranslations(count) = error else {
+                XCTFail("Unexpected translation error: \(error)")
+                return
+            }
+            XCTAssertEqual(count, 1)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testTranslationRejectsEditorialAnnotationsButPreservesRealQuotation() async throws {
         let regionID = UUID(uuidString: "00000000-0000-0000-0000-000000000124")!
         let model = StubTranslationModel(response: """
@@ -290,6 +453,49 @@ final class TargetLanguageSafetyTests: XCTestCase {
         let callCount = await model.callCount
         XCTAssertEqual(callCount, 2)
         XCTAssertEqual(translated.map(\.translatedText), ["譯文一", "譯文二", "譯文三"])
+    }
+
+    func testIndividualTranslationRejectsWhenEveryRegionResponseIsInvalid() async {
+        let ids = (1...2).map { value in
+            UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value))!
+        }
+        let model = SequencedTranslationModel(responses: ["模型沒有輸出 JSON"])
+        let regions = ids.enumerated().map { index, id in
+            DialogueRegion(
+                id: id,
+                bounds: NormalizedRect(x: Double(index) * 0.2, y: 0.1, width: 0.1, height: 0.2),
+                sourceText: "原文 \(index + 1)",
+                confidence: 1
+            )
+        }
+        let service = VLMRegionTranslationService(model: model)
+
+        do {
+            _ = try await service.translate(
+                regions: regions,
+                pageURL: URL(fileURLWithPath: "/tmp/unused.png"),
+                targetLanguageCode: "zh-Hant",
+                glossaryTerms: [],
+                readingDirection: .rightToLeft,
+                qualityOptions: TranslationQualityOptions(
+                    usePageContext: false,
+                    reviewPassEnabled: false,
+                    qualityCheckEnabled: false
+                ),
+                regionProgress: { _, _ in },
+                draftsReady: { _ in },
+                progress: { _ in }
+            )
+            XCTFail("Expected invalid individual responses to fail the translation")
+        } catch let error as TranslationRuntimeError {
+            guard case let .missingTranslations(count) = error else {
+                XCTFail("Unexpected translation error: \(error)")
+                return
+            }
+            XCTAssertEqual(count, regions.count)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 
     func testSecondPassReportsReviewActivitySeparatelyFromDraftTranslation() async throws {

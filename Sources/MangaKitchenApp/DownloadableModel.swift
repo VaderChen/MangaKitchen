@@ -2,6 +2,11 @@ import Foundation
 import MangaKitchenCore
 import MangaKitchenRuntime
 
+enum DownloadableModelRole: String, Hashable, Sendable {
+    case translation
+    case agent
+}
+
 struct DownloadableModelDescriptor: Hashable, Sendable {
     enum Format: String, Hashable, Sendable {
         case mlxDirectory
@@ -20,6 +25,7 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
     var displayName: String
     var repositoryID: String
     var capability: ModelCapability
+    var role: DownloadableModelRole? = nil
     var recommended: Bool = false
     var format: Format = .mlxDirectory
     var outputScale: Int? = nil
@@ -36,6 +42,78 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
 }
 
 enum DownloadableModelCatalog {
+    static let translationModels = [
+        DownloadableModelDescriptor(
+            id: "qwen3-4b-4bit",
+            displayName: "Qwen3 4B 4-bit（MLX）",
+            repositoryID: "mlx-community/Qwen3-4B-4bit",
+            capability: .textToText,
+            role: .translation,
+            recommended: true
+        ),
+        DownloadableModelDescriptor(
+            id: "qwen3-8b-4bit",
+            displayName: "Qwen3 8B 4-bit（MLX）",
+            repositoryID: "mlx-community/Qwen3-8B-4bit",
+            capability: .textToText,
+            role: .translation
+        ),
+        DownloadableModelDescriptor(
+            id: "gpt-oss-20b-mxfp4-q4-mlx",
+            displayName: "GPT-OSS 20B MXFP4 Q4（MLX／不推薦）",
+            repositoryID: "mlx-community/gpt-oss-20b-MXFP4-Q4",
+            capability: .textToText,
+            role: .translation
+        ),
+        DownloadableModelDescriptor(
+            id: "gpt-oss-20b-mxfp4-q8-mlx",
+            displayName: "GPT-OSS 20B MXFP4 Q8（MLX／不推薦）",
+            repositoryID: "mlx-community/gpt-oss-20b-MXFP4-Q8",
+            capability: .textToText,
+            role: .translation
+        ),
+        DownloadableModelDescriptor(
+            id: "gpt-oss-20b-q4-0-gguf-translation",
+            displayName: "GPT-OSS 20B Q4_0（GGUF／不推薦）",
+            repositoryID: "unsloth/gpt-oss-20b-GGUF",
+            capability: .textToText,
+            role: .translation,
+            format: .ggufDirectory,
+            weightsFileName: "gpt-oss-20b-Q4_0.gguf",
+            auxiliaryRepositoryID: "openai/gpt-oss-20b",
+            auxiliaryFileNames: [
+                "chat_template.jinja",
+                "config.json",
+                "generation_config.json",
+                "special_tokens_map.json",
+                "tokenizer.json",
+                "tokenizer_config.json"
+            ]
+        )
+    ]
+
+    static let agentModels = [
+        DownloadableModelDescriptor(
+            id: "gpt-oss-20b-q4-0-gguf",
+            displayName: "GPT-OSS 20B Q4_0 GGUF（Agent）",
+            repositoryID: "unsloth/gpt-oss-20b-GGUF",
+            capability: .textToText,
+            role: .agent,
+            recommended: true,
+            format: .ggufDirectory,
+            weightsFileName: "gpt-oss-20b-Q4_0.gguf",
+            auxiliaryRepositoryID: "openai/gpt-oss-20b",
+            auxiliaryFileNames: [
+                "chat_template.jinja",
+                "config.json",
+                "generation_config.json",
+                "special_tokens_map.json",
+                "tokenizer.json",
+                "tokenizer_config.json"
+            ]
+        )
+    ]
+
     static let imageToTextModels = [
         DownloadableModelDescriptor(
             id: "qwen3.5-4b-4bit",
@@ -45,8 +123,26 @@ enum DownloadableModelCatalog {
             recommended: true
         ),
         DownloadableModelDescriptor(
+            id: "gemma-4-e4b-it-4bit",
+            displayName: "Gemma 4 E4B 4-bit",
+            repositoryID: "mlx-community/gemma-4-e4b-it-4bit",
+            capability: .imageToText
+        ),
+        DownloadableModelDescriptor(
+            id: "gemma-4-e2b-it-4bit",
+            displayName: "Gemma 4 E2B 4-bit",
+            repositoryID: "mlx-community/gemma-4-e2b-it-4bit",
+            capability: .imageToText
+        ),
+        DownloadableModelDescriptor(
+            id: "gemma-4-12b-it-4bit",
+            displayName: "Gemma 4 12B 4-bit",
+            repositoryID: "mlx-community/gemma-4-12B-it-4bit",
+            capability: .imageToText
+        ),
+        DownloadableModelDescriptor(
             id: "qwen3.5-4b-q4-0-gguf",
-            displayName: "Qwen3.5-4B Q4_0 GGUF（多模態）",
+            displayName: "Qwen3.5-4B Q4_0 GGUF",
             repositoryID: "unsloth/Qwen3.5-4B-GGUF",
             capability: .imageToText,
             format: .ggufDirectory,
@@ -78,7 +174,7 @@ enum DownloadableModelCatalog {
         ),
         DownloadableModelDescriptor(
             id: "qwen3.8-27b-q4-0-gguf",
-            displayName: "Qwen3.8-27B Q4_0 GGUF（多模態）",
+            displayName: "Qwen3.8-27B Q4_0 GGUF",
             repositoryID: "unsloth/Qwen3.8-27B-GGUF",
             capability: .imageToText,
             format: .ggufDirectory,
@@ -151,6 +247,14 @@ enum DownloadableModelCatalog {
         imageToTextModels.first(where: \.recommended) ?? imageToTextModels[0]
     }
 
+    static var defaultAgentModel: DownloadableModelDescriptor {
+        agentModels.first(where: \.recommended) ?? agentModels[0]
+    }
+
+    static var defaultTranslationModel: DownloadableModelDescriptor {
+        translationModels.first(where: \.recommended) ?? translationModels[0]
+    }
+
     static var defaultSuperResolutionModel: DownloadableModelDescriptor {
         superResolutionModels.first(where: \.recommended) ?? superResolutionModels[0]
     }
@@ -160,16 +264,47 @@ enum DownloadableModelCatalog {
     }
 
     static var allModels: [DownloadableModelDescriptor] {
-        imageToTextModels + imageColorizationModels + superResolutionModels
+        translationModels + agentModels + imageToTextModels + imageColorizationModels + superResolutionModels
     }
 
-    static func model(id: String, capability: ModelCapability) -> DownloadableModelDescriptor? {
-        allModels.first { $0.id == id && $0.capability == capability }
+    static func translationModel(id: String) -> DownloadableModelDescriptor? {
+        translationModels.first { $0.id == id }
     }
 
-    static func model(matching directoryURL: URL, capability: ModelCapability) -> DownloadableModelDescriptor? {
+    static func agentModel(id: String) -> DownloadableModelDescriptor? {
+        agentModels.first { $0.id == id }
+    }
+
+    static func translationModel(matching directoryURL: URL) -> DownloadableModelDescriptor? {
+        translationModels.first {
+            $0.directoryName.caseInsensitiveCompare(directoryURL.lastPathComponent) == .orderedSame
+        }
+    }
+
+    static func agentModel(matching directoryURL: URL) -> DownloadableModelDescriptor? {
+        agentModels.first {
+            $0.directoryName.caseInsensitiveCompare(directoryURL.lastPathComponent) == .orderedSame
+        }
+    }
+
+    static func model(
+        id: String,
+        capability: ModelCapability,
+        role: DownloadableModelRole? = nil
+    ) -> DownloadableModelDescriptor? {
+        allModels.first {
+            $0.id == id && $0.capability == capability && (role == nil || $0.role == role)
+        }
+    }
+
+    static func model(
+        matching directoryURL: URL,
+        capability: ModelCapability,
+        role: DownloadableModelRole? = nil
+    ) -> DownloadableModelDescriptor? {
         allModels.first {
             $0.capability == capability
+                && (role == nil || $0.role == role)
                 && $0.directoryName.caseInsensitiveCompare(directoryURL.lastPathComponent) == .orderedSame
         }
     }

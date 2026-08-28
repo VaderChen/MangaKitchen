@@ -29,7 +29,7 @@ public enum TextLocalizationMethod: String, Codable, CaseIterable, Hashable, Sen
 
 /// 步驟三翻譯使用的本機模型類型。
 public enum TranslationModelMethod: String, Codable, CaseIterable, Hashable, Sendable {
-    /// 舊專案解碼相容值；目前 App 會自動遷移為 `imageToText`。
+    /// 純文字模型；只使用已抽取的原文進行翻譯。
     case textToText
     /// 多模態 VLM；利用人物、表情與畫面語境進行翻譯。
     case imageToText
@@ -710,9 +710,7 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         self.targetLanguageCode = targetLanguageCode
         self.readingDirection = readingDirection
         self.textLocalizationMethod = textLocalizationMethod
-        self.translationModelMethod = translationModelMethod == .textToText
-            ? .imageToText
-            : translationModelMethod
+        self.translationModelMethod = translationModelMethod
         self.defaultStyle = defaultStyle
         self.maskExpansion = maskExpansion
         self.eraseColorHex = Self.normalizedEraseColor(
@@ -774,12 +772,9 @@ public struct ProcessingOptions: Codable, Hashable, Sendable {
         textLocalizationMethod = try values.decodeIfPresent(
             TextLocalizationMethod.self, forKey: .textLocalizationMethod
         ) ?? defaults.textLocalizationMethod
-        let decodedTranslationModelMethod = try values.decodeIfPresent(
+        translationModelMethod = try values.decodeIfPresent(
             TranslationModelMethod.self, forKey: .translationModelMethod
         ) ?? defaults.translationModelMethod
-        translationModelMethod = decodedTranslationModelMethod == .textToText
-            ? .imageToText
-            : decodedTranslationModelMethod
         defaultStyle = try values.decodeIfPresent(
             DialogueStyle.self, forKey: .defaultStyle
         ) ?? defaults.defaultStyle

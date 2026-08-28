@@ -6,17 +6,20 @@ public enum GGUFStorageType: String, Codable, Hashable, Sendable {
     case int16 = "INT16"
     case int32 = "INT32"
     case fp16 = "FP16"
+    case bf16 = "BF16"
     case fp32 = "FP32"
 }
 
 public enum GGUFMaterializationKind: String, Codable, Hashable, Sendable {
     case directFloat32
     case directFloat16
+    case directBFloat16
     case directInt8
     case directInt16
     case directInt32
     case quantized4
     case quantized8
+    case quantizedMXFP4
     case requantized4
     case requantized8
 }
@@ -106,6 +109,12 @@ public enum GGUFStoragePolicy {
             preservesSourceQuantization: false,
             requiresConversion: false
         ),
+        "BF16": GGUFTypeSupport(
+            storageType: .bf16,
+            materialization: .directBFloat16,
+            preservesSourceQuantization: false,
+            requiresConversion: false
+        ),
         "I8": GGUFTypeSupport(
             storageType: .int8,
             materialization: .directInt8,
@@ -141,6 +150,12 @@ public enum GGUFStoragePolicy {
             materialization: .quantized8,
             preservesSourceQuantization: true,
             requiresConversion: false
+        ),
+        "MXFP4": GGUFTypeSupport(
+            storageType: .int4,
+            materialization: .quantizedMXFP4,
+            preservesSourceQuantization: true,
+            requiresConversion: true
         ),
         "Q1_0": GGUFTypeSupport(
             storageType: .int4,

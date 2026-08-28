@@ -28,7 +28,7 @@ Project
 
 既有專案可繼續追加上述來源；頁面名稱與順序屬於專案 metadata，不改寫來源檔。從專案移除頁面時只保存排除的相對路徑，不刪除託管或外部來源，因此重掃後也不會把已移除頁面自動加回。
 
-翻譯階段先以 `targetLanguageCode` 解析詞條，再依本頁 `sourceText` 篩選實際出現的專有名詞，最後只把命中的 `ResolvedGlossaryTerm` 注入 GUI 多模態模型或 MCP 多模態 Agent 的 Prompt。這可避免大型專案將無關詞條全部送進模型，同時讓 GUI、批次流程與 MCP 使用同一套語言選擇規則。GUI 不再提供文生文模型選項；舊專案讀到 `textToText` 時會遷移為 `imageToText`。
+翻譯階段先以 `targetLanguageCode` 解析詞條，再依本頁 `sourceText` 篩選實際出現的專有名詞，最後只把命中的 `ResolvedGlossaryTerm` 注入 GUI 純文字／多模態模型或 MCP 多模態 Agent 的 Prompt。這可避免大型專案將無關詞條全部送進模型，同時讓 GUI、批次流程與 MCP 使用同一套語言選擇規則。GUI 可在 `textToText` 與 `imageToText` 之間選擇翻譯模型；前者不讀取圖片，後者保留頁面語境。
 
 ## 翻譯與上色資料流
 
@@ -48,7 +48,7 @@ Project
 3. OCRRegionTextRecognitionService／ImageToTextGenerating／外部多模態 MCP Agent + ImageSuperResolving（選用）+ HTMLDialogueTypesetter
    ├─ 內建 PP-OCRv6 直接辨識步驟二已建立的文字區域，分開保存每模型 `ocrResults`；`sourceText` 空白時採用預設 OCR 原文，已確認原文、座標與遮罩不覆寫
    ├─ AppStore 支援整頁重新抽字、重新翻譯與單區重新抽取／翻譯；重新抽字不重建步驟二產物
-   ├─ GUI 固定使用 `imageToText` 多模態 Adapter 產生整頁草稿、可選校稿與 QA；MCP 以單頁工作包一次提供原圖、品質參數與遮罩 JSON，能讀圖的 Agent 一次回傳全部區域
+   ├─ GUI 依選取的 `textToText` 或 `imageToText` Adapter 產生整頁草稿、可選校稿與 QA；MCP 以單頁工作包一次提供原圖、品質參數與遮罩 JSON，能讀圖的 Agent 一次回傳全部區域
    ├─ MLX Real-ESRGAN 2×／Core ML Anime 4× 寫入獨立 SR 背景，並保護步驟二已去字的遮罩像素
    └─ 依實際背景尺寸應用 HTML/CSS 固定或自動字級、橫排／直排 → `translated.png` 步驟三預覽／分層 PSD
 
@@ -102,9 +102,9 @@ Project
 
 ### MangaKitchenRuntime
 
-- `ModelRuntimeHub`：每個 capability 同時只保留一個 protocol-based Runtime，分別管理 `textToText`、`imageToText`、`imageToImage`、`imageColorization` 與 `superResolution`。載入前比對模型 ID、capability 與解析 symlink 後的 canonical path；同一 capability 的並行載入會序列化，第一筆完成後若身分相同即共用 runtime。`textToText` 只保留底層相容能力，GUI 與公開翻譯工作流固定使用 `imageToText`。
+- `ModelRuntimeHub`：每個 capability 同時只保留一個 protocol-based Runtime，分別管理 `textToText`、`imageToText`、`imageToImage`、`imageColorization` 與 `superResolution`。載入前比對模型 ID、capability 與解析 symlink 後的 canonical path；同一 capability 的並行載入會序列化，第一筆完成後若身分相同即共用 runtime。`textToText` 用於 OCR 後的純文字翻譯，`imageToText` 用於保留頁面語境的多模態翻譯。DFlash 開關與 block size 會同時傳給文字與多模態翻譯 runtime，Draft 則由 runtime 從主模型同一個模型根目錄自動尋找。
 - `CoreMLModelRuntime`：讀取 manifest、編譯模型並透過 `MLModelConfiguration` 指定 CPU + Metal GPU。
-- `MLXVLMRuntime`：載入本機 Hugging Face 多模態模型並跨頁重用 container。結構化回覆與 Think Mode 在短 reasoning 第一段沒有完整 final JSON 時，沿用同一 container，以 `enable_thinking = false`、`temperature = 0` 執行第二段收尾。`MLXTextRuntime` 仍是底層相容 runtime，但不出現在 App 模型頁或公開翻譯流程。
+- `MLXVLMRuntime`：載入本機 Hugging Face 多模態模型並跨頁重用 container；`MLXTextRuntime`：載入本機純文字翻譯模型並沿用相同的結構化回覆與 Think Mode 收尾契約。若設定相容的 DFlash draft，兩者都透過 vendorized `mlx-swift-lm` 在同一 Metal runtime 執行 DFlash 1／2 block speculative decoding；Qwen3-VL／Qwen3.5-VL 會以視覺 embedding 與 M-RoPE 完成首輪 prefill，其他 VLM 不相容時回到標準生成。Harmony chat template 的初始生成保留模型推理階段，只在需要第二段 JSON 收尾時切換至 final channel。
 - `VLMStructuredResponseDecoder`：只接受 reasoning 結束後的完整 JSON，不會把 `<think>` 內的片段誤認為答案；reasoning 串流只送往記憶體內 UI store，不寫入 Application LOG 或專案資料。
 - `CoreMLSuperResolutionRuntime`：讀取模型原生輸入／輸出尺寸決定倍率；目前 Anime 512 模型為獨立 4× 權重，不再固定縮回 2×。
 - `MLXRealESRGANSuperResolutionRuntime`：載入 `mlx-community/Real-ESRGAN-x2plus` 的獨立 FP16 RRDBNet 權重，執行原生 2× 超解析；不載入、不重用也不降採樣 4× Anime 模型。
@@ -121,7 +121,7 @@ Project
 - `SoundEffectRegionDetecting`：預留給未來狀聲字流程的獨立契約，只能掃描既有對話區域之外的畫面；目前 `ComicTranslationPipeline` 不持有、不呼叫，也不把結果混入對話遮罩。
 - 外部 MCP Agent：翻譯的 `prepare_agent_task` 只在 App 步驟二區域、遮罩與去字背景均完成時，一次傳送指定頁原圖與完整遮罩 JSON；Agent 依既有 `region_id` 抽取原文、翻譯及排版，再由 `submit_agent_result` 建立步驟三預覽。上色的 `prepare_colorization_task` 則一次傳送實際上色輸入與反對話框遮罩，`submit_colorization_result` 驗證尺寸、正規化 PNG 並重新套用保護遮罩。兩條流程都只有在使用者要求輸出時才呼叫各自的 render 工具。
 - `MangaTextMaskRefiner`：先分析 Core ML BBOX 或 Agent 粗框；若已知 `bubbleMaskPolygons`，會先以氣泡形狀篩選元件。搜尋範圍不會直接成為遮罩，最後以 Otsu 閾值及八鄰域連通元件取得字形像素，並在像素層執行抗鋸齒遲滯與固定像素膨脹，再合併成二值遮罩矩形，避免向量描邊造成灰階毛邊；`bounds` 同步縮到未膨脹的字形外框。暗色背景上的亮字由系統覆蓋檢查回報，必要時由使用者在 App 內以畫筆修正。
-- `VLMRegionTranslationService`：GUI 固定接多模態 `imageToText` runtime，將整頁已確認的來源文字與圖片語境依閱讀順序送入模型；若回覆遺漏 UUID，只執行一次有界補翻並保留已成功結果，避免 timeout／fallback 重複翻譯。`TextOnlyImageToTextAdapter` 僅保留底層相容用途，不是可選 GUI 路徑。二次整頁校稿為可選且預設關閉；啟用時先透過 `DraftRegionTranslating` 提交初稿，由 App 寫入 `.str`、專案快照與排版預覽，再以一次整頁請求校正既有譯文。校稿不得重新抽取 `sourceText` 或逐區重翻，取消時也不回滾已提交初稿。
+- `VLMRegionTranslationService`：依專案翻譯模型選項，將整頁已確認的來源文字與可選的圖片語境依閱讀順序送入 `textToText` 或 `imageToText` runtime；兩條路徑都可使用 DFlash，VLM 由 runtime 判斷 Qwen 相容性並在不相容時回退。若回覆遺漏 UUID，只執行一次有界補翻並保留已成功結果，避免 timeout／fallback 重複翻譯。二次整頁校稿為可選且預設關閉；啟用時先透過 `DraftRegionTranslating` 提交初稿，由 App 寫入 `.str`、專案快照與排版預覽，再以一次整頁請求校正既有譯文。校稿不得重新抽取 `sourceText` 或逐區重翻，取消時也不回滾已提交初稿。
 - `TranslationQualityOptions`：專案級控制整頁語境、可選二次校稿、QA、直譯稿保存、忠實／平衡／精簡長度策略與 4,000 字元風格指南。結果保存 `literalTranslatedText`、`speakerID`、`tone`、`translationConfidence` 與 `translationQAFlags`，人工改寫顯示譯文時會清除已過期的信心與 QA。
 - `CPUBubbleCleaner`／`MetalBubbleCleaner`：步驟二的傳統去字後端。`eraseColorHex == AUTO` 時由修補器估算底紙色；指定固定底紙色時由 CPU 精確填色，並清除遮罩外兩像素內的近底色 JPEG／掃描 halo。同一文字區域的斷開筆畫共用單一底色，避免紙紋取樣變成字形斑點。
 - `HTMLDialogueTypesetter`：將步驟三保存的 `translationBounds`、`translationAnchor`、字型、固定／自動字級、粗細及橫排／直排設定交給 WebKit；自動方向優先採用字形排列偵測結果，氣泡排版優先使用完全位於 `bubbleMaskPolygons` 內的 `bubbleLayoutBounds`。使用與 WebUI 相同的 HTML/CSS 與自動縮字演算法渲染背景及文字層，再輸出原圖像素尺寸的 PNG。GUI、批次與 MCP 共用此排版器，不再存在另一套 Core Text 輸出規則。

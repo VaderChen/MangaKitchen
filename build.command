@@ -121,7 +121,7 @@ mlx_metallib_path=""
 prepare_mlx_metallib() {
   local mlx_generated_root="$PROJECT_ROOT/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated"
   local shader_root="$mlx_generated_root/metal"
-  local cache_directory="$PROJECT_ROOT/.build/mangakitchen-metal/$configuration"
+  local cache_directory="$PROJECT_ROOT/Artifacts/MLXMetal/$configuration"
   local output_path="$cache_directory/mlx.metallib"
   local rebuild=false
   local shader_source

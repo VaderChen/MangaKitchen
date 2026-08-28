@@ -198,6 +198,103 @@ final class RegionDetectionSafetyTests: XCTestCase {
         XCTAssertEqual(decoded.first?.first?.index, 1)
     }
 
+    func testStructuredResponseDecoderUsesHarmonyFinalChannelOnly() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: """
+            <|start|>assistant<|channel|>analysis<|message|>[{"index":99}]<|end|>
+            <|start|>assistant<|channel|>final<|message|>[{"index":1}]<|return|>
+            """
+        )
+
+        XCTAssertFalse(decoded.isEmpty)
+        XCTAssertTrue(decoded.allSatisfy { $0.count == 1 && $0[0].index == 1 })
+    }
+
+    func testStructuredResponseDecoderRejectsHarmonyAnalysisWithoutFinalChannel() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: """
+            <|start|>assistant<|channel|>analysis<|message|>[{"index":99}]<|end|>
+            """
+        )
+
+        XCTAssertTrue(decoded.isEmpty)
+    }
+
+    func testStructuredResponseDecoderUsesGemmaVisibleTurnAfterThought() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: """
+            <|channel>thought
+            暫存資料 [{"index":99}] 不應成為可見結果。
+            <channel|>[{"index":1}]<turn|>
+            """
+        )
+
+        XCTAssertFalse(decoded.isEmpty)
+        XCTAssertTrue(decoded.allSatisfy { $0.count == 1 && $0[0].index == 1 })
+    }
+
+    func testStructuredResponseDecoderRejectsGemmaThoughtWithoutVisibleTurn() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: """
+            <|channel>thought
+            暫存資料 [{"index":99}] 不應成為可見結果。
+            <turn|>
+            """
+        )
+
+        XCTAssertTrue(decoded.isEmpty)
+    }
+
+    func testStructuredResponseDecoderUsesGemmaModelTurnWithoutThought() {
+        struct Item: Decodable {
+            var index: Int
+        }
+
+        let decoded = VLMStructuredResponseDecoder.decodeArrays(
+            Item.self,
+            from: "<|turn>model\n[{\"index\":1}]<turn|>"
+        )
+
+        XCTAssertEqual(decoded.first?.first?.index, 1)
+    }
+
+    func testGenerationProtocolDetectsModelMetadata() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MangaKitchen-GenerationProtocol-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let configurationURL = directory.appendingPathComponent("config.json")
+        try Data(#"{"model_type":"gpt_oss"}"#.utf8).write(to: configurationURL)
+        XCTAssertEqual(MLXGenerationProtocol.detect(in: directory), .harmony)
+
+        try Data(#"{"model_type":"gemma4_unified"}"#.utf8).write(to: configurationURL)
+        XCTAssertEqual(MLXGenerationProtocol.detect(in: directory), .gemma4)
+
+        try Data(#"{"model_type":"qwen3"}"#.utf8).write(to: configurationURL)
+        XCTAssertEqual(MLXGenerationProtocol.detect(in: directory), .standard)
+    }
+
     func testStructuredResponseDecoderRejectsUnfinishedThinkingResponse() {
         struct Item: Decodable {
             var index: Int

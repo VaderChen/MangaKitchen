@@ -13,6 +13,21 @@ private final class DiagnosticLMInputBox: @unchecked Sendable {
     }
 }
 
+private final class FallbackLMInputBox: @unchecked Sendable {
+    let dflashInput: LMInput
+    let standardInput: LMInput
+
+    init(_ input: LMInput) {
+        dflashInput = input
+        standardInput = LMInput(
+            text: .init(tokens: input.text.tokens, mask: input.text.mask),
+            image: input.image,
+            video: input.video,
+            audio: input.audio
+        )
+    }
+}
+
 /// 本機 Hugging Face MLX 純文字模型 runtime。目前先提供模型載入與文字生成
 /// 能力，翻譯管線將在另一步透過 `TextGenerating` 接入。
 actor MLXTextRuntime: TextGenerating {
@@ -24,9 +39,13 @@ actor MLXTextRuntime: TextGenerating {
     private let ggufQuantizationGroupSize: Int
     private let ggufQuantizationProfile: GGUFQuantizationProfile
     private let thinkingEnabled: Bool
+    private let generationProtocol: MLXGenerationProtocol
+    private let dflashEnabled: Bool
+    private let dflashBlockSize: Int
     private let log: RuntimeLogHandler
     private let reasoningStream: RuntimeReasoningStreamHandler
     private var container: ModelContainer?
+    private var dflashDrafter: (any DFlashDrafterModel)?
 
     init(
         directoryURL: URL,
@@ -34,6 +53,8 @@ actor MLXTextRuntime: TextGenerating {
         ggufQuantizationGroupSize: Int = 64,
         ggufQuantizationProfile: GGUFQuantizationProfile = .quality,
         thinkingEnabled: Bool = false,
+        dflashEnabled: Bool = false,
+        dflashBlockSize: Int = 5,
         log: @escaping RuntimeLogHandler = { _, _, _ in },
         reasoningStream: @escaping RuntimeReasoningStreamHandler = { _ in }
     ) throws {
@@ -63,6 +84,9 @@ actor MLXTextRuntime: TextGenerating {
         self.ggufQuantizationGroupSize = ggufQuantizationGroupSize
         self.ggufQuantizationProfile = ggufQuantizationProfile
         self.thinkingEnabled = thinkingEnabled
+        self.generationProtocol = MLXGenerationProtocol.detect(in: directoryURL)
+        self.dflashEnabled = dflashEnabled
+        self.dflashBlockSize = min(max(dflashBlockSize, 2), 256)
         self.log = log
         self.reasoningStream = reasoningStream
         info = LoadedModelInfo(
@@ -110,15 +134,21 @@ actor MLXTextRuntime: TextGenerating {
         // Qwen3 系列的 chat template 在未指定時預設開啟 thinking。結構化翻譯不需要
         // 思考內容，且模型可能把整個 token 額度耗在 <think> 而沒有輸出 JSON；
         // 使用者啟用時也只要求輕度思考。
+        let additionalContext: [String: any Sendable] = [
+            "enable_thinking": thinkingEnabled,
+            "reasoning_effort": "low"
+        ]
         let input = UserInput(
             chat: [.user(trimmedPrompt)],
-            additionalContext: [
-                "enable_thinking": thinkingEnabled,
-                "reasoning_effort": "low"
-            ]
+            additionalContext: additionalContext
         )
         let prepared = try await container.prepare(input: input)
         progress(0.55)
+        if ProcessInfo.processInfo.environment["MANGAKITCHEN_DUMP_PROMPT"] == "1" {
+            let promptTokens = prepared.text.tokens.asArray(Int.self)
+            let renderedPrompt = await container.decode(tokenIds: promptTokens)
+            log(.info, "Text Model Prompt", "rendered=\(renderedPrompt)")
+        }
 
         let configuredTokenLimit = min(max(generation.maxTokens, 128), 8_192)
         let requestedMaxTokens = maximumOutputTokens.map {
@@ -145,56 +175,80 @@ actor MLXTextRuntime: TextGenerating {
             progress(1)
             return diagnosticOutput
         }
-        let stream = try await container.generate(input: prepared, parameters: parameters)
-        let generationStart = Date()
-        let expectedChunks = min(maxTokens, 512)
         var output = ""
-        var chunks = 0
-        var didLogFirstToken = false
-        var lastRepetitionCheck = 0
-        var stoppedOnRepetition = false
-        for await event in stream {
-            try Task.checkCancellation()
-            if let info = event.info {
-                log(
-                    .info,
-                    "Generation Metrics",
-                    "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
-                        + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
-                        + "tokensPerSecond=\(info.tokensPerSecond)"
-                )
-            }
-            guard case let .chunk(text) = event else { continue }
-            if !didLogFirstToken, !text.isEmpty {
-                didLogFirstToken = true
-                log(
-                    .info,
-                    "Generation Metrics",
-                    "phase=initial firstTokenLatency=\(Date().timeIntervalSince(generationStart))"
-                )
-            }
-            output += text
+        if generationProtocol.requiresTokenAwareGeneration {
+            output = try await MLXProtocolTokenGenerator.generate(
+                protocol: generationProtocol,
+                container: container,
+                input: prepared,
+                parameters: parameters,
+                progressStart: 0.55,
+                progressEnd: 0.99,
+                phase: "initial",
+                progress: progress,
+                log: log
+            )
             if let reasoningID {
                 reasoningStream(.updated(
                     id: reasoningID,
                     text: VLMStructuredResponseDecoder.streamedReasoningText(from: output)
                 ))
             }
-            chunks += 1
-            progress(min(0.99, 0.55 + Double(chunks) / Double(expectedChunks) * 0.44))
-            if chunks - lastRepetitionCheck >= 32, output.count > 400 {
-                lastRepetitionCheck = chunks
-                if Self.isRepeatingTail(output) {
-                    stoppedOnRepetition = true
-                    break
+        } else {
+            let stream = try await generateStream(
+                container: container,
+                input: prepared,
+                parameters: parameters
+            )
+            let generationStart = Date()
+            let expectedChunks = min(maxTokens, 512)
+            var chunks = 0
+            var didLogFirstToken = false
+            var lastRepetitionCheck = 0
+            var stoppedOnRepetition = false
+            for await event in stream {
+                try Task.checkCancellation()
+                if let info = event.info {
+                    log(
+                        .info,
+                        "Generation Metrics",
+                        "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                            + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                            + "tokensPerSecond=\(info.tokensPerSecond)"
+                    )
                 }
+                guard case let .chunk(text) = event else { continue }
+                if !didLogFirstToken, !text.isEmpty {
+                    didLogFirstToken = true
+                    log(
+                        .info,
+                        "Generation Metrics",
+                        "phase=initial firstTokenLatency=\(Date().timeIntervalSince(generationStart))"
+                    )
+                }
+                output += text
+                if let reasoningID {
+                    reasoningStream(.updated(
+                        id: reasoningID,
+                        text: VLMStructuredResponseDecoder.streamedReasoningText(from: output)
+                    ))
+                }
+                chunks += 1
+                progress(min(0.99, 0.55 + Double(chunks) / Double(expectedChunks) * 0.44))
+                if chunks - lastRepetitionCheck >= 32, output.count > 400 {
+                    lastRepetitionCheck = chunks
+                    if Self.isRepeatingTail(output) {
+                        stoppedOnRepetition = true
+                        break
+                    }
+                }
+            }
+            if stoppedOnRepetition {
+                output = Self.repairedTruncatedArray(output)
+                log(.warning, "Text Model", "Stopped a repeating output loop and repaired the JSON tail.")
             }
         }
         output = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        if stoppedOnRepetition {
-            output = Self.repairedTruncatedArray(output)
-            log(.warning, "Text Model", "Stopped a repeating output loop and repaired the JSON tail.")
-        }
         if let reasoningID {
             reasoningStream(.finished(id: reasoningID))
             reasoningDidFinish = true
@@ -213,7 +267,10 @@ actor MLXTextRuntime: TextGenerating {
                         reasoningResponse: output
                     ))
                 ],
-                additionalContext: ["enable_thinking": false]
+                additionalContext: [
+                    "enable_thinking": false,
+                    "mangakitchen_force_final_channel": generationProtocol == .harmony
+                ]
             )
             let finalPrepared = try await container.prepare(input: finalInput)
             let finalParameters = GenerateParameters(
@@ -223,37 +280,54 @@ actor MLXTextRuntime: TextGenerating {
                 repetitionPenalty: max(generation.repetitionPenalty, 1),
                 repetitionContextSize: 128
             )
-            let finalStream = try await container.generate(
-                input: finalPrepared,
-                parameters: finalParameters
-            )
-            let finalGenerationStart = Date()
-            var finalOutput = ""
-            var didLogFinalFirstToken = false
-            for await event in finalStream {
-                try Task.checkCancellation()
-                if let info = event.info {
-                    log(
-                        .info,
-                        "Generation Metrics",
-                        "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
-                            + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
-                            + "tokensPerSecond=\(info.tokensPerSecond)"
-                    )
+            if generationProtocol.requiresTokenAwareGeneration {
+                output = try await MLXProtocolTokenGenerator.generate(
+                    protocol: generationProtocol,
+                    container: container,
+                    input: finalPrepared,
+                    parameters: finalParameters,
+                    progressStart: 0.99,
+                    progressEnd: 0.99,
+                    phase: "finalization",
+                    startsInFinalChannel: generationProtocol == .harmony,
+                    progress: progress,
+                    log: log
+                )
+            } else {
+                let finalStream = try await generateStream(
+                    container: container,
+                    input: finalPrepared,
+                    parameters: finalParameters
+                )
+                let finalGenerationStart = Date()
+                var finalOutput = ""
+                var didLogFinalFirstToken = false
+                for await event in finalStream {
+                    try Task.checkCancellation()
+                    if let info = event.info {
+                        log(
+                            .info,
+                            "Generation Metrics",
+                            "promptTokens=\(info.promptTokenCount) generationTokens=\(info.generationTokenCount) "
+                                + "promptTokensPerSecond=\(info.promptTokensPerSecond) "
+                                + "tokensPerSecond=\(info.tokensPerSecond)"
+                        )
+                    }
+                    guard case let .chunk(text) = event else { continue }
+                    if !didLogFinalFirstToken, !text.isEmpty {
+                        didLogFinalFirstToken = true
+                        log(
+                            .info,
+                            "Generation Metrics",
+                            "phase=finalization firstTokenLatency=\(Date().timeIntervalSince(finalGenerationStart))"
+                        )
+                    }
+                    finalOutput += text
+                    progress(0.99)
                 }
-                guard case let .chunk(text) = event else { continue }
-                if !didLogFinalFirstToken, !text.isEmpty {
-                    didLogFinalFirstToken = true
-                    log(
-                        .info,
-                        "Generation Metrics",
-                        "phase=finalization firstTokenLatency=\(Date().timeIntervalSince(finalGenerationStart))"
-                    )
-                }
-                finalOutput += text
-                progress(0.99)
+                output = finalOutput
             }
-            output = finalOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            output = output.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard !output.isEmpty else {
             log(.error, "Text Model", "The model returned an empty response.")
@@ -357,9 +431,52 @@ actor MLXTextRuntime: TextGenerating {
                 using: #huggingFaceTokenizerLoader()
             )
         }
+        dflashDrafter = await DFlashDraftRuntimeLoader.loadIfEnabled(
+            enabled: dflashEnabled,
+            targetDirectory: modelDirectory,
+            targetDisplayName: info.displayName,
+            container: loaded,
+            log: log
+        )
         progress(0.45)
         container = loaded
         return loaded
+    }
+
+    private func generateStream(
+        container: ModelContainer,
+        input: LMInput,
+        parameters: GenerateParameters
+    ) async throws -> AsyncStream<Generation> {
+        let inputs = FallbackLMInputBox(input)
+        guard let dflashDrafter else {
+            return try await container.generate(input: inputs.standardInput, parameters: parameters)
+        }
+        guard parameters.maxKVSize == nil,
+              parameters.kvBits == nil,
+              parameters.kvScheme == nil else {
+            log(
+                .warning,
+                "DFlash",
+                "Target KV Cache configuration is incompatible; using standard generation."
+            )
+            return try await container.generate(input: inputs.standardInput, parameters: parameters)
+        }
+        do {
+            return try await container.generate(
+                input: inputs.dflashInput,
+                parameters: parameters,
+                dflashDrafter: dflashDrafter,
+                blockSize: dflashBlockSize
+            )
+        } catch let error as DFlashError {
+            log(
+                .warning,
+                "DFlash",
+                "DFlash generation is unavailable; using standard generation: \(error.localizedDescription)"
+            )
+            return try await container.generate(input: inputs.standardInput, parameters: parameters)
+        }
     }
 }
 

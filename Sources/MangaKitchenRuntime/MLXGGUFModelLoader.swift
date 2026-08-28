@@ -507,7 +507,7 @@ enum MLXGGUFLoader {
                 )
                 try insert(
                     convertQwen35StateSpaceParameters
-                        && Self.isFloat32AccumulatorTensorName(tensor.name)
+                        && Self.isStateSpaceParameterTensorName(tensor.name)
                         // GGUF stores Qwen3.5's A parameter as -exp(A_log),
                         // while mlx-swift's GatedDeltaNet expects A_log.
                         ? (-value).log()
@@ -527,6 +527,21 @@ enum MLXGGUFLoader {
                     name: tensor.name,
                     into: &weights
                 )
+            case .directBFloat16:
+                let value = MLXArray(
+                    try dataSlice(data, tensor: tensor, dataOffset: tensorDataOffset,
+                                  byteCount: try checkedByteCount(elementCount, elementSize: 2)),
+                    mlxShape,
+                    dtype: .bfloat16
+                )
+                try insert(
+                    convertQwen35StateSpaceParameters
+                        && Self.isStateSpaceParameterTensorName(tensor.name)
+                        ? (-value).log()
+                        : value,
+                    name: tensor.name,
+                    into: &weights
+                )
             case .quantized4, .quantized8:
                 let quantized = try quantizedArrays(
                     data,
@@ -539,6 +554,19 @@ enum MLXGGUFLoader {
                 for (name, array) in quantized {
                     try insert(array, name: name, into: &weights)
                 }
+            case .quantizedMXFP4:
+                let quantized = try mxfp4Arrays(
+                    data,
+                    tensor: tensor,
+                    shape: mlxShape,
+                    elementCount: elementCount,
+                    dataOffset: tensorDataOffset
+                )
+                let namePrefix = tensor.name.hasSuffix(".weight")
+                    ? String(tensor.name.dropLast(".weight".count))
+                    : tensor.name
+                try insert(quantized.wq, name: tensor.name, into: &weights)
+                try insert(quantized.scales, name: namePrefix + ".scales", into: &weights)
             case .requantized4, .requantized8:
                 let bits = support.materialization == .requantized4 ? 4 : 8
                 let quantized = try directlyRequantizedArrays(
@@ -608,7 +636,7 @@ enum MLXGGUFLoader {
 
     /// Qwen3.5 的 `blk.N.ssm_a` 對應 MLX 的 `linear_attn.A_log`，其參考
     /// checkpoint 保留 F32；其餘 GGUF F32 權重統一降為 BF16 compute dtype。
-    private static func isFloat32AccumulatorTensorName(_ name: String) -> Bool {
+    private static func isStateSpaceParameterTensorName(_ name: String) -> Bool {
         let components = name.split(separator: ".")
         return components.count == 3
             && components[0] == "blk"
@@ -743,9 +771,11 @@ enum MLXGGUFLoader {
         case 12: return try checkedByteCount(try divisible(elementCount, by: 256), elementSize: 144)
         case 13: return try checkedByteCount(try divisible(elementCount, by: 256), elementSize: 176)
         case 14: return try checkedByteCount(try divisible(elementCount, by: 256), elementSize: 210)
+        case 39: return try checkedByteCount(try divisible(elementCount, by: 32), elementSize: 17)
         case 24: return elementCount
         case 25: return try checkedByteCount(elementCount, elementSize: 2)
         case 26: return try checkedByteCount(elementCount, elementSize: 4)
+        case 30: return try checkedByteCount(elementCount, elementSize: 2)
         case 41: return try checkedByteCount(try divisible(elementCount, by: 128), elementSize: 18)
         case 42: return try checkedByteCount(try divisible(elementCount, by: 64), elementSize: 18)
         default: throw MLXGGUFLoaderError.unsupportedTensorType(type, "")
@@ -863,6 +893,35 @@ enum MLXGGUFLoader {
             namePrefix + ".scales": packed.scales,
             namePrefix + ".biases": packed.biases
         ]
+    }
+
+    private static func mxfp4Arrays(
+        _ data: Data,
+        tensor: MLXGGUFTensorInfo,
+        shape: [Int],
+        elementCount: Int,
+        dataOffset: Int
+    ) throws -> (wq: MLXArray, scales: MLXArray) {
+        guard tensor.type == 39,
+              let lastDimension = shape.last,
+              lastDimension > 0,
+              lastDimension % 32 == 0,
+              elementCount % 32 == 0 else {
+            throw MLXGGUFLoaderError.invalidTensor(tensor.name)
+        }
+        let blockCount = elementCount / 32
+        let byteCount = try checkedByteCount(blockCount, elementSize: 17)
+        let raw = try dataSlice(data, tensor: tensor, dataOffset: dataOffset, byteCount: byteCount)
+        var weightShape = shape
+        weightShape[weightShape.count - 1] /= 8
+        var scaleShape = shape
+        scaleShape[scaleShape.count - 1] /= 32
+        return try MLXGGUFMetalQuantizer.packMXFP4(
+            raw: raw,
+            sourceShape: shape,
+            targetWeightShape: weightShape,
+            targetScaleShape: scaleShape
+        )
     }
 
     private static func directlyRequantizedArrays(
@@ -1807,6 +1866,9 @@ enum MLXGGUFWeightNameNormalizer {
            layerIndex >= maximumLayerIndex {
             return nil
         }
+        if name.hasSuffix(".attn_sinks.weight") {
+            return normalizeBase(String(name.dropLast(".weight".count)))
+        }
         let suffixes = [".scales", ".biases", ".weight", ".bias"]
         if let suffix = suffixes.first(where: { name.hasSuffix($0) }) {
             let base = String(name.dropLast(suffix.count))
@@ -1843,6 +1905,7 @@ enum MLXGGUFWeightNameNormalizer {
         let mappedTail: String
         switch tail {
         case "attn_norm": mappedTail = "self_attn.input_layernorm"
+        case "attn_sinks": mappedTail = "self_attn.sinks"
         case "attn_gate": mappedTail = "linear_attn.in_proj_z"
         case "attn_qkv": mappedTail = "linear_attn.in_proj_qkv"
         case "attn_q": mappedTail = "self_attn.q_proj"
@@ -1855,6 +1918,10 @@ enum MLXGGUFWeightNameNormalizer {
         case "ffn_gate": mappedTail = "mlp.gate_proj"
         case "ffn_down": mappedTail = "mlp.down_proj"
         case "ffn_up": mappedTail = "mlp.up_proj"
+        case "ffn_gate_exps": mappedTail = "mlp.experts.gate_proj"
+        case "ffn_down_exps": mappedTail = "mlp.experts.down_proj"
+        case "ffn_up_exps": mappedTail = "mlp.experts.up_proj"
+        case "ffn_gate_inp": mappedTail = "mlp.router"
         case "ssm_a": mappedTail = "linear_attn.A_log"
         case "ssm_alpha": mappedTail = "linear_attn.in_proj_a"
         case "ssm_beta": mappedTail = "linear_attn.in_proj_b"
@@ -1957,11 +2024,17 @@ private struct MLXGGUFUserInputProcessor: UserInputProcessor {
     func prepare(input: UserInput) async throws -> LMInput {
         let messages = messageGenerator.generate(from: input)
         do {
-            let promptTokens = try tokenizer.applyChatTemplate(
+            var promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages,
                 tools: input.tools,
                 additionalContext: input.additionalContext
             )
+            if input.additionalContext?["mangakitchen_force_final_channel"] as? Bool == true {
+                promptTokens.append(contentsOf: tokenizer.encode(
+                    text: "<|channel|>final<|message|>",
+                    addSpecialTokens: false
+                ))
+            }
             return LMInput(tokens: MLXArray(promptTokens))
         } catch MLXLMCommon.TokenizerError.missingChatTemplate {
             let prompt = messages
@@ -2082,6 +2155,7 @@ enum MLXGGUFModelLoader {
                 layout: linearAttentionLayout,
                 groupSize: quantizationGroupSize
             )
+            weights = undoQwen35ConverterNormOffset(weights)
         }
         weights = try MLXGGUFWeightNameNormalizer.normalize(
             weights,
@@ -2255,6 +2329,27 @@ enum MLXGGUFModelLoader {
         )
     }
 
+    private static func undoQwen35ConverterNormOffset(
+        _ weights: [String: MLXArray]
+    ) -> [String: MLXArray] {
+        var corrected = weights
+        for (name, value) in weights where isQwen35ConverterShiftedNorm(name) {
+            switch value.dtype {
+            case .float16, .float32, .bfloat16:
+                corrected[name] = value - MLXArray(1, dtype: value.dtype)
+            default:
+                break
+            }
+        }
+        return corrected
+    }
+
+    static func isQwen35ConverterShiftedNorm(_ name: String) -> Bool {
+        name.hasSuffix("norm.weight")
+            && !name.hasSuffix("linear_attn.norm.weight")
+            && !name.hasSuffix(".ssm_norm.weight")
+    }
+
     private static func reorderQwen35LinearAttentionWeights(
         _ weights: [String: MLXArray],
         layout: LinearAttentionLayout,
@@ -2373,7 +2468,9 @@ enum MLXGGUFModelLoader {
         guard value.ndim >= 2, groupSize > 0 else { return value }
         let dimensionLength = value.dim(-1)
         let packingFactor: Int
-        if dimensionLength == layout.valueRows / 8 {
+        if dimensionLength == layout.valueRows {
+            packingFactor = 1
+        } else if dimensionLength == layout.valueRows / 8 {
             packingFactor = 8
         } else if dimensionLength == layout.valueRows / 4 {
             packingFactor = 4
@@ -2427,6 +2524,11 @@ enum MLXGGUFModelLoader {
             guard let weight = weights["\(path).weight"],
                   let scales = weights["\(path).scales"],
                   scales.dim(-1) > 0 else { return nil }
+            if weights["\(path).biases"] == nil,
+               scales.dtype == .uint8,
+               weight.dim(-1) * 8 == scales.dim(-1) * 32 {
+                return (32, 4, .mxfp4)
+            }
             let packedWidthPerGroup = groupSize / 32
             guard packedWidthPerGroup > 0,
                   weight.dim(-1) % scales.dim(-1) == 0 else { return nil }

@@ -156,13 +156,13 @@ manifest feature 이름은 실제 Core ML 모델과 일치해야 합니다. 현�
 
 Core ML manifest는 한 번의 prediction으로 패키징된 모델용 일반 Adapter입니다. tokenizer와 순차 decode가 필요한 Qwen-VL은 전용 MLX Adapter를 사용하고 sampler loop가 있는 diffusion model도 전용 `ImageToImageGenerating` Adapter가 필요합니다. 코어 pipeline은 변경하지 않습니다.
 
-App은 `mlx-swift-lm`이 지원하는 로컬 멀티모달 번역 모델을 `MLXVLMRuntime`으로 노출합니다. `MLXTextRuntime`은 기존 계약 호환용으로만 유지되며 UI에서 선택할 수 없습니다. 권장 모델은 약 3GB인 `lmstudio-community/Qwen3.5-4B-MLX-4bit`입니다.
+App은 텍스트 전용 번역을 `MLXTextRuntime`으로, `mlx-swift-lm`이 지원하는 로컬 멀티모달 번역을 `MLXVLMRuntime`으로 실행합니다. 텍스트 번역에는 `mlx-community/Qwen3-4B-4bit`를 권장하며 더 큰 `Qwen3-8B-4bit`도 선택할 수 있습니다. GPT-OSS도 선택 가능하지만 다국어 번역 품질이 일정하지 않아 기본 번역 모델로 사용하지 않습니다.
 
 1. Hugging Face 모델 전체를 로컬 폴더에 다운로드합니다.
 2. App에서 해당 폴더를 선택합니다. 첫 로드 후 container를 메모리에 유지하여 페이지 간 재사용합니다.
 3. 표시 이름이나 생성 설정을 명시적으로 덮어쓸 때만 `Examples/Models/MLXVLMModel/mangakitchen-model.json`을 추가합니다.
 
-단일 safetensors 파일만으로는 충분하지 않습니다. `config.json`, tokenizer, processor 및 chat template를 함께 보존해야 합니다.
+단일 safetensors 파일만으로는 충분하지 않습니다. `config.json`, tokenizer 및 chat template를 함께 보존해야 합니다. 다른 멀티모달 모델은 processor 설정도 보존해야 합니다. `vision_config`가 있는 Qwen3.5 체크포인트에서 `processor_config.json`과 `preprocessor_config.json`이 없으면 factory가 `config.json`에서 호환 가능한 Qwen3VLProcessor 설정을 추론합니다.
 
 ## Qwen Image Edit Worker
 

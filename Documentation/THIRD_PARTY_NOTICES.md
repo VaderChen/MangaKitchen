@@ -1,5 +1,25 @@
 # 第三方模型與授權聲明
 
+## mlx-swift-lm（含 DFlash 擴充）
+
+MangaKitchen 以本機 vendor 形式固定使用 `mlx-swift-lm`，位置為
+[`Vendor/mlx-swift-lm`](../Vendor/mlx-swift-lm)。這份 fork 只保留 SwiftPM
+正式 runtime 所需的 Libraries，並加入原生 Swift／MLX DFlash 1／2 speculative
+decoding、Qwen3／Qwen3.5 target 中間層輸出與相容性驗證。
+
+- 上游專案：[`ml-explore/mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm)
+- DFlash 參考實作：[`z-lab/dflash`](https://github.com/z-lab/dflash)
+- MangaKitchen 使用的 fork 版本：`mlx-swift-lm`（以 `Package.swift` 與 `Package.resolved` 為準）
+- 上游套件授權：MIT，完整文字見 [`Vendor/mlx-swift-lm/LICENSE`](../Vendor/mlx-swift-lm/LICENSE)
+- 執行範圍：DFlash 可套用純文字 `textToText` runtime；Qwen3-VL／Qwen3.5-VL 的 `imageToText` 會先完成視覺 prefill 後啟用，其他 VLM 不相容時回退標準生成
+- 相容性：Draft 載入或 target 驗證失敗時，App 保留標準 MLX 生成，不會阻斷模型載入
+
+DFlash draft 權重不隨 App 預先發佈，也不屬於主模型權重。使用者可在「設定 → 模型 →
+翻譯」或「多模態」開啟 DFlash；App 不保存 Draft 路徑，而是在目標模型第一次載入時，
+從主模型同一個模型根目錄自動尋找並驗證 Qwen3／Qwen3.5 target、相容的
+Qwen3-VL／Qwen3.5-VL target、draft 版本與 block size。這些模型權重仍受其 Hugging Face
+repository 各自授權條款約束。
+
 ## DDColor Tiny Core ML（下載式）
 
 MangaKitchen 的模型下載頁可取得

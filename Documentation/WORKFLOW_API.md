@@ -17,7 +17,7 @@
 
 一鍵模式不是第五套流程。`runFullPage` 只依序呼叫步驟二、三、四；步驟一提供已掃描的頁面列表。
 
-步驟二固定使用內建氣泡分割與原圖像素精修，不需要 PP-OCR 文字偵測或 `imageToText` 模型，也不會因 OCR／VLM 偏好而改變遮罩。步驟三的原文抽取才依專案選項分流：PP-OCR 以 Medium Det 切欄後逐行辨識，VLM 則沿用整區轉錄；翻譯、可選二次校稿與語意 QA 固定使用多模態 `imageToText` 模型。舊專案的 `textToText` 設定在讀取時遷移為 `imageToText`，App 不再暴露文生文模型選項。
+步驟二固定使用內建氣泡分割與原圖像素精修，不需要 PP-OCR 文字偵測或 `imageToText` 模型，也不會因 OCR／VLM 偏好而改變遮罩。步驟三的原文抽取才依專案選項分流：PP-OCR 以 Medium Det 切欄後逐行辨識，VLM 則沿用整區轉錄；翻譯、可選二次校稿與語意 QA 依專案選項使用純文字 `textToText` 或多模態 `imageToText`。純文字路徑只接收已抽出的原文，多模態路徑才讀取頁面語境；翻譯模型可在設定中個別選擇。DFlash 會套用於相容的 Qwen3／Qwen3.5 純文字 target，以及 Qwen3-VL／Qwen3.5-VL 完成視覺 prefill 後的多模態 target；其他 VLM 安全回退標準生成。
 
 上色是另一套四步驟流程：選頁、反對話框遮罩、DDColor 預覽、儲存輸出。上色優先使用已存在的翻譯輸出，否則回退來源圖片；`ColorizationPageState`、預覽與輸出不覆寫翻譯的 `stage`、`progress`、`translationPreviewURL` 或 `outputURL`。目前 DDColor 只使用模型預設推論，`colorizationColorRange` 與 `colorizationMode` 僅保留專案欄位，對應介面卡片目前停用，契約不宣稱它們會影響推論。
 
@@ -81,7 +81,7 @@
 - `mcpExtractedSourceText` 只保存 MCP Agent 回傳的原文抽取結果；本機 VLM 的直譯稿不會填入此欄位，WebUI 只有在 MCP 實際回傳內容時才顯示「MCP 抽取原文」。
 - `ocrResults` 以 OCR 模型 ID 分開保存各模型的候選 `text`、信心、文字行與正規化座標；當 `sourceText` 空白時，預設 OCR 候選會被採用為翻譯原文，但不覆寫已確認原文、`bounds`、`maskPolygons` 或人工筆劃。複合 OCR 與多模型校稿融合尚未啟用。
 - `ocrTextRefined` 是為了既有 `.str` 相容而保留的欄位；`true` 代表來源文字已由 VLM、MCP Agent 或人工確認。單模型 OCR 候選被採用時不會冒用此標記。
-- **GUI 路徑**：步驟二一律先由 `MangaBubbleSegmentationCoreMLRuntime` 產生對話框 BBOX 與氣泡形狀，再固定以原圖像素收斂為遮罩；不會呼叫 Medium Det 或 VLM。步驟三才依「原文抽取方式」選擇 `OCRRegionTextRecognitionService` 逐欄 OCR 或 `VLMRegionTranscriptionService` 整區轉錄；辨識合併只採用原文與 OCR 候選，不覆寫座標與遮罩。翻譯、可選二次校稿與語意 QA 固定使用 `imageToText` runtime。
+- **GUI 路徑**：步驟二一律先由 `MangaBubbleSegmentationCoreMLRuntime` 產生對話框 BBOX 與氣泡形狀，再固定以原圖像素收斂為遮罩；不會呼叫 Medium Det 或 VLM。步驟三才依「原文抽取方式」選擇 `OCRRegionTextRecognitionService` 逐欄 OCR 或 `VLMRegionTranscriptionService` 整區轉錄；辨識合併只採用原文與 OCR 候選，不覆寫座標與遮罩。翻譯、可選二次校稿與語意 QA 依「翻譯模型」選用 `textToText` 或 `imageToText` runtime。
 - **MCP 路徑**：App 先完成區域、像素遮罩與去字背景，再由 `prepare_agent_task` 將原圖及完整遮罩 JSON 一次交給可讀圖的多模態 Agent；Agent 只依既有 `region_id` 抽取原文、翻譯與決定排版，最後以 `submit_agent_result` 一次回寫並建立步驟三預覽。只有使用者要求輸出時才以 `page.render` 儲存步驟四結果。MCP 不接受 Agent 修改區域或遮罩，也不呼叫 App 內建 VLM 翻譯。詳見〈標準 MCP〉。
 - `maskRefinementApplied == true` 表示遮罩已由封閉區域或 Agent 粗框收斂成亮度／連通元件字形像素遮罩；抗鋸齒遲滯與固定像素膨脹都在像素層完成，不再對逐條矩形做向量描邊，因此輸出的 `dialogue-mask.png` 維持二值邊界。
 - `maskCoverageRatio` 是系統像素精修保留的前景筆畫比例；`null` 代表尚未執行自動檢查。
@@ -415,6 +415,8 @@ MCP 初始化與工具清單只描述能力，不代表應立即操作資料。�
 ### MLX 權重格式
 
 `mangakitchen.model.load` 可載入使用 `.gguf` 權重的本機 MLX 純文字或多模態模型。唯一的 Swift `GGUFStoragePolicy` 會把 `Q4_0`／`Q4_1` 目標為 `INT4`、`Q8_0` 目標為 `INT8`；Unsloth Dynamic `Q4_0` 內混用的 `Q4_1` 也可直接載入。`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 依來源 block 直接產生 MLX `INT4` 的 `wq/scales/biases`；quality profile 的 `Q5_K`／`Q6_K` 產生 `INT8`，speed profile 才改產生 `INT4`，不再先配置整顆 `Float16` 反量化 tensor。正式 App 的 `group64` 會對所有需量化的來源型別直接從 GGUF raw block 產生目標群組，不經 `group32` 中間結果；`Q8_K` 與其他未列入能力表的型別則明確回報不支援，不會在下載或載入十幾 GB 後才失敗。compute dtype 以 BF16 為主，只有 Qwen3.5 `blk.N.ssm_a` 保留 F32；mmproj 會沿用相同 group size。llama.cpp bridge 只在 `Tools/GGUFBackendPOC` 供 parser 對照，正式 App 不依賴外部執行檔。loader 會先讀 GGUF 內嵌的 model metadata、vocabulary、merges 與 special tokens；外部 `config.json`、`tokenizer.json`、`tokenizer_config.json` 只作 fallback。若 manifest 未指定 `weightsFile`，目錄只能有一個主 GGUF 權重檔。
+
+若在「設定 → 模型 → 翻譯」或「多模態」開啟 DFlash，文字與多模態 runtime 都會在主模型完成載入後，從主模型同一個模型根目錄自動尋找並驗證 Draft 與 target 的 Qwen3／Qwen3.5 架構、層數、hidden size 與 vocabulary；驗證失敗只停用 DFlash，不會阻斷主模型。Qwen3-VL／Qwen3.5-VL 會以視覺 embedding 與 M-RoPE 完成首輪 prefill，再使用相同 DFlash verify loop；DFlash 使用 target 原本的 Metal／MLX context 與 tokenizer。其他 VLM、音訊輸入、rotating／量化 target KV cache 會維持標準生成。
 
 可辨識的 `FP8`（包含 `F8_E4M3`／`F8_E5M2` 變體）統一採 `INT8` 重新量化；一般 GGUF `F16`／`F32` compute 權重轉成 BF16，只有 Qwen3.5 `blk.N.ssm_a` 保留 F32。由於 llama.cpp 標準 GGUF 目前沒有獨立的 FP8 tensor type，Swift loader 仍會拒絕未知的 GGUF type，不會誤宣稱已能載入 FP8；`GGUFStoragePolicy.targetStorageType(for:)` 已固定 `quality` profile 的目標策略，`targetStorageType(for:profile:)` 可查詢速度 profile，待 parser 提供明確 encoding 後再接入實際解碼。
 

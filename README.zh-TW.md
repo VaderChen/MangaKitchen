@@ -92,9 +92,9 @@ MangaKitchen 的翻譯可由本機 GUI 或 MCP 多模態 Agent 校稿。兩者�
 
 ### 用法 A：下載模型，在本機離線運作
 
-在「設定 → 模型」下載多模態翻譯模型，並在需要本機上色時下載 DDColor Tiny。區域辨識、原文抽取、翻譯、背景修補、合成與本機上色都在 Mac 執行；模型完成下載後，工作流不需要把漫畫內容送到外部 AI 服務。
+在「設定 → 模型」下載純文字或多模態翻譯模型，並在需要本機上色時下載 DDColor Tiny。區域辨識、原文抽取、翻譯、背景修補、合成與本機上色都在 Mac 執行；模型完成下載後，工作流不需要把漫畫內容送到外部 AI 服務。
 
-- 翻譯固定使用 `imageToText`；PP-OCR「重新抽字」本身不需要 VLM，但翻譯、二次校稿與語意 QA 需要多模態模型。App 不使用 Apple Vision OCR，擬聲字仍不進入目前的翻譯主流程。
+- 翻譯模型可在純文字 `textToText` 與多模態 `imageToText` 之間選擇；前者接收 OCR／已確認的原文，後者會同時使用頁面語境。PP-OCR「重新抽字」本身不需要 VLM，擬聲字仍不進入目前的翻譯主流程。
 - 「重新抽字」會更新原文並清除依賴它的譯文；「重新翻譯」沿用現有原文；單區按鈕只更新選取區域，完成後重新產生整頁預覽。
 - `imageToImage` 模型負責步驟二的背景修補，屬於選用；未設定時依「設定 → 進階」使用 Metal GPU 鄰域修補或 CPU 對話框主色修補，GPU 失敗時會自動退回 CPU。
 - `superResolution` 模型屬於選用；可在步驟二產生乾淨背景後手動執行，也可啟用完整流程自動放大。SR 改變實際像素尺寸，不改變畫布檢視倍率的標準計算。
@@ -174,14 +174,20 @@ manifest 的 feature 名稱必須與實際 Core ML 模型一致。現有 Core ML
 
 Core ML manifest 是對「已封裝成單次 prediction 的模型」提供的通用 Adapter。Qwen-VL 這類需要 tokenizer 與逐 token 解碼的模型會改走專用 MLX Adapter；需要 sampler loop 的擴散模型也必須使用專用 `ImageToImageGenerating` Adapter，不能只更改 Core ML feature 名稱。核心 pipeline 不需要跟著修改。
 
-App 只透過 `MLXVLMRuntime` 暴露 `model_type` 受 `mlx-swift-lm` 支援的本機多模態翻譯模型；`MLXTextRuntime` 僅保留舊契約相容，不在 UI 提供。完整的 Hugging Face MLX 目錄若包含 `config.json`、Tokenizer 與 Safetensors 權重，App 會依影像／視覺欄位判定能力，不強制要求 `mangakitchen-model.json`。若需要自訂顯示名稱或生成參數，仍可放置 manifest 覆寫自動設定。
+App 以 `MLXTextRuntime` 提供純文字翻譯，並以 `MLXVLMRuntime` 提供 `model_type` 受 `mlx-swift-lm` 支援的本機多模態翻譯模型。管理下載清單目前推薦純文字翻譯使用 `mlx-community/Qwen3-4B-4bit`，另提供較大的 `Qwen3-8B-4bit`；GPT-OSS 仍保留為可選模型，但因多語言翻譯品質不穩定，不再作為預設翻譯模型。完整的 Hugging Face MLX 目錄若包含 `config.json`、Tokenizer 與 Safetensors 權重，App 會依影像／視覺欄位判定能力，不強制要求 `mangakitchen-model.json`。若需要自訂顯示名稱或生成參數，仍可放置 manifest 覆寫自動設定。
 
 多模態建議先使用約 3GB 的 `lmstudio-community/Qwen3.5-4B-MLX-4bit`：
 
 1. 將 Hugging Face 模型完整下載到本機資料夾。
 2. 在 App 選擇該資料夾；路徑會立即登記，模型則在第一次使用時載入並跨頁重用，直到記憶體壓力需要釋放。
 
-`mlx-swift-lm` 的 factory 依模型目錄內的 `config.json` 選擇架構，因此不能只下載單一 safetensors 檔案；tokenizer、processor、chat template 與 config 都必須保留。
+`mlx-swift-lm` 的 factory 依模型目錄內的 `config.json` 選擇架構，因此不能只下載單一 safetensors 檔案；tokenizer、chat template 與 config 必須保留。一般多模態模型仍應保留 processor 設定；若 Qwen3.5 模型含 `vision_config` 但缺少 `processor_config.json`／`preprocessor_config.json`，factory 會從 `config.json` 推導 Qwen3VLProcessor 設定。
+
+純文字翻譯請在「設定 → 模型 → 翻譯」選擇 Qwen3 4B 或 8B。這條流程只會把 OCR 抽出的原文交給模型，不會讀取頁面圖片；需要整頁語境時再改用多模態翻譯模型。
+
+### DFlash 推測解碼
+
+「設定 → 模型 → 翻譯」或「多模態」可開啟相容 Qwen3／Qwen3.5 的 DFlash。App 會從所選主模型同一個模型根目錄自動尋找 Draft，讓文字與多模態模型在相同的 Metal runtime 上執行原生 Swift／MLX DFlash 1／2 推測解碼；不需要額外選取或保存 Draft 路徑。Qwen3-VL 與 Qwen3.5-VL 會先完成視覺 prefill，再進入相同的 speculative decoding；其他 VLM 架構會安全回退標準生成。這不會取代既有 Safetensors／MLX checkpoint 或 GGUF 載入。Draft 遺失、不相容、格式錯誤、生成設定不支援或初始化失敗時，App 會記錄原因並安全回退標準生成。Draft 權重不隨 App 內建發佈。
 
 ## Qwen Image Edit Worker
 
@@ -234,7 +240,7 @@ MangaKitchenApp/MCP
 
 詳細決策與資料流請見 [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md)。
 版本化的翻譯／上色 Swift、JavaScript 與 MCP 契約請見 [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md)。
-已封裝版本的英文更新紀錄請見 [MangaKitchen 1.26.0825 build 1850 Release Notes](Documentation/RELEASE_NOTES_1.26.0825-build-1850.md)；封裝後的新變更請見 [Development Release Notes](Documentation/RELEASE_NOTES_UNRELEASED.md)。
+已封裝版本的英文更新紀錄請見 [MangaKitchen 1.26.0829 build 0052 Release Notes](Documentation/RELEASE_NOTES_1.26.0829-build-0052.md)；封裝後的新變更請見 [Development Release Notes](Documentation/RELEASE_NOTES_UNRELEASED.md)。
 
 ## 已知邊界
 

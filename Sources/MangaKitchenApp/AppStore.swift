@@ -93,7 +93,10 @@ final class AppStore: ObservableObject {
         defaultOutputDirectoryPath: String? = nil,
         imageCompositingBackend: ImageCompositingBackend = .cpu,
         imageToTextModelPath: String? = nil,
+        translationModelPath: String? = nil,
         modelThinkingEnabled: Bool = false,
+        dflashEnabled: Bool = false,
+        dflashBlockSize: Int = 5,
         imageToImageModelPath: String? = nil,
         imageColorizationModelPath: String? = nil,
         automaticSuperResolutionEnabled: Bool = false,
@@ -117,6 +120,8 @@ final class AppStore: ObservableObject {
                 applicationRoot: root,
                 imageCompositingBackend: imageCompositingBackend,
                 modelThinkingEnabled: modelThinkingEnabled,
+                dflashEnabled: dflashEnabled,
+                dflashBlockSize: dflashBlockSize,
                 log: runtimeLog,
                 reasoningStream: reasoningStream
             )
@@ -157,6 +162,7 @@ final class AppStore: ObservableObject {
             await self.restoreProjectLibrary()
             await self.applyPreferredModelsNow(
                 imageToTextPath: imageToTextModelPath,
+                translationPath: translationModelPath,
                 imageToImagePath: imageToImageModelPath,
                 imageColorizationPath: imageColorizationModelPath,
                 superResolutionPath: superResolutionModelPath
@@ -1001,7 +1007,7 @@ final class AppStore: ObservableObject {
             pageIDs: orderedPageIDs,
             forceRecalculation: forceRecalculation
         ), effectiveTranslationModelMethod() == nil {
-            statusMessage = "請先在設定中下載並載入多模態模型，才能翻譯文字。"
+            statusMessage = "請先在設定中下載並選取可用的翻譯模型。"
             return nil
         }
         if requiresVLMTextExtraction(
@@ -1068,7 +1074,7 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// 多模態模型永遠負責翻譯；此處只判斷原文抽取是否也選用 VLM。
+    /// 原文抽取與翻譯是兩個獨立選項；只有抽取方式選用 VLM 時才要求多模態模型。
     private func requiresVLMTextExtraction(
         for operation: BatchOperation,
         pageIDs: [UUID],
@@ -1101,13 +1107,19 @@ final class AppStore: ObservableObject {
         modelLifecycleCoordinator.hasConfiguredModel(capability)
     }
 
-    /// 翻譯只支援多模態模型；模型不在啟動時常駐，真正翻譯前才延遲載入。
+    /// 依專案設定選用純文字或多模態翻譯模型；真正翻譯前才延遲載入。
     private func effectiveTranslationModelMethod() -> TranslationModelMethod? {
-        modelLifecycleCoordinator.effectiveTranslationModelMethod()
+        modelLifecycleCoordinator.effectiveTranslationModelMethod(
+            preferred: options.translationModelMethod
+        )
     }
 
-    private func ensureTranslationModelLoaded() async throws {
-        try await ensureModelLoaded(.imageToText, purpose: "translation")
+    private func ensureTranslationModelLoaded(_ method: TranslationModelMethod) async throws {
+        let capability: ModelCapability = switch method {
+        case .textToText: .textToText
+        case .imageToText: .imageToText
+        }
+        try await ensureModelLoaded(capability, purpose: "translation")
     }
 
     private func ensureTextLocalizationModelLoaded() async throws {
@@ -1618,7 +1630,7 @@ final class AppStore: ObservableObject {
             return false
         }
         guard let translationModelMethod = effectiveTranslationModelMethod() else {
-            statusMessage = "請先載入多模態模型，才能重新抽取並翻譯文字。"
+            statusMessage = "請先下載並選取可用的翻譯模型，才能重新抽取並翻譯文字。"
             return false
         }
         if options.textLocalizationMethod == .vlm,
@@ -1693,7 +1705,7 @@ final class AppStore: ObservableObject {
                     return
                 }
 
-                try await self.ensureTranslationModelLoaded()
+                try await self.ensureTranslationModelLoaded(translationModelMethod)
                 try Task.checkCancellation()
                 self.processingActivities[pageID] = .translatingRegions
                 self.processingRegionProgress[pageID] = ProcessingRegionProgress(current: 0, total: 1)
@@ -1907,6 +1919,7 @@ final class AppStore: ObservableObject {
 
     func applyPreferredModels(
         imageToTextPath: String?,
+        translationPath: String?,
         imageToImagePath: String?,
         imageColorizationPath: String? = nil,
         superResolutionPath: String? = nil
@@ -1914,6 +1927,7 @@ final class AppStore: ObservableObject {
         Task {
             await applyPreferredModelsNow(
                 imageToTextPath: imageToTextPath,
+                translationPath: translationPath,
                 imageToImagePath: imageToImagePath,
                 imageColorizationPath: imageColorizationPath,
                 superResolutionPath: superResolutionPath
@@ -1940,6 +1954,26 @@ final class AppStore: ObservableObject {
             self.statusMessage = enabled
                 ? "Think Mode 已開啟；文字模型將在下次使用時重新載入。"
                 : "Think Mode 已關閉；文字模型將在下次使用時重新載入。"
+        }
+    }
+
+    func setDFlashConfiguration(enabled: Bool, blockSize: Int) {
+        guard let models else { return }
+        let normalizedBlockSize = min(max(blockSize, 2), 256)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await models.setDFlashConfiguration(
+                enabled: enabled,
+                blockSize: normalizedBlockSize
+            )
+            self.loadedModels = await models.loadedModels()
+            self.applicationLog.append(
+                .info,
+                category: "Model",
+                message: enabled
+                    ? "DFlash enabled; paired Draft models will be discovered beside the selected model."
+                    : "DFlash disabled; text and multimodal generation will use the standard path."
+            )
         }
     }
 
@@ -2298,13 +2332,16 @@ final class AppStore: ObservableObject {
             regions = page.regions
         } else {
             guard let translationModelMethod = effectiveTranslationModelMethod() else {
-                throw ModelRuntimeError.capabilityNotLoaded(.imageToText)
+                let capability: ModelCapability = options.translationModelMethod == .textToText
+                    ? .textToText
+                    : .imageToText
+                throw ModelRuntimeError.capabilityNotLoaded(capability)
             }
             if recognizeText {
                 try await ensureTextLocalizationModelLoaded()
                 try Task.checkCancellation()
             }
-            try await ensureTranslationModelLoaded()
+            try await ensureTranslationModelLoaded(translationModelMethod)
             try Task.checkCancellation()
             var processingOptions = options
             processingOptions.translationModelMethod = translationModelMethod
@@ -3312,9 +3349,6 @@ final class AppStore: ObservableObject {
         value.selectedPageIDs.formIntersection(validIDs)
         value.selectedPageID = value.selectedPageID.flatMap { validIDs.contains($0) ? $0 : nil }
             ?? value.pages.first?.id
-        value.modelDirectories.removeAll { directoryURL in
-            (try? ModelManifest.load(from: directoryURL).capability) == .textToText
-        }
         return value
     }
 
@@ -3326,7 +3360,6 @@ final class AppStore: ObservableObject {
         activeProjectCreatedAt = snapshot.createdAt
         var restoredOptions = snapshot.options
         restoredOptions.useImageToImageRestoration = false
-        restoredOptions.translationModelMethod = .imageToText
         // 舊專案會把當時的 `.center` 預設明確編碼；目前沒有可調整專案級
         // 對齊預設的 UI，因此只遷移未來新建／重新偵測區域的預設值。
         // 各既有 region 的明確對齊選擇保留不動。
@@ -3468,8 +3501,7 @@ final class AppStore: ObservableObject {
         // 專案復原只登記上次使用的模型路徑，不在啟動階段建立 runtime。
         // 需要模型的工作會在對應步驟透過 ensureModelLoaded() 延遲載入。
         for directoryURL in directories where fileManager.fileExists(atPath: directoryURL.path) {
-            guard let manifest = try? ModelManifest.load(from: directoryURL),
-                  manifest.capability != .textToText else { continue }
+            guard let manifest = try? ModelManifest.load(from: directoryURL) else { continue }
             _ = await configureLazyPreferredModel(
                 capability: manifest.capability,
                 path: directoryURL.path
@@ -3479,6 +3511,7 @@ final class AppStore: ObservableObject {
 
     private func applyPreferredModelsNow(
         imageToTextPath: String?,
+        translationPath: String?,
         imageToImagePath: String?,
         imageColorizationPath: String?,
         superResolutionPath: String?
@@ -3486,6 +3519,10 @@ final class AppStore: ObservableObject {
         _ = await configureLazyPreferredModel(
             capability: .imageToText,
             path: imageToTextPath
+        )
+        _ = await configureLazyPreferredModel(
+            capability: .textToText,
+            path: translationPath
         )
         _ = await configureLazyPreferredModel(
             capability: .imageToImage,
@@ -3627,7 +3664,6 @@ private enum AppWorkflowError: LocalizedError {
     case outputWouldOverwriteSource
     case translationPreviewRequired
     case colorizationPreviewRequired
-    case textToTextUnsupported
     case runtimeUnavailable
 
     var errorDescription: String? {
@@ -3640,7 +3676,6 @@ private enum AppWorkflowError: LocalizedError {
         case .outputWouldOverwriteSource: "輸出路徑會覆寫來源圖片，已中止輸出。"
         case .translationPreviewRequired: "步驟三的原文、譯文或自動排版預覽尚未完成，請先補齊後再輸出。"
         case .colorizationPreviewRequired: "上色預覽尚未完成，請先執行步驟三。"
-        case .textToTextUnsupported: "目前只支援多模態模型，無法載入文生文模型。"
         case .runtimeUnavailable: "漫畫處理 Runtime 尚未就緒。"
         }
     }

@@ -14,13 +14,10 @@ let package = Package(
         .library(name: "MangaKitchenRuntime", targets: ["MangaKitchenRuntime"])
     ],
     dependencies: [
-        .package(
-            url: "https://github.com/ml-explore/mlx-swift-lm.git",
-            exact: "3.31.4"
-        ),
+        .package(path: "Vendor/mlx-swift-lm"),
         .package(
             url: "https://github.com/ml-explore/mlx-swift.git",
-            exact: "0.31.4"
+            exact: "0.31.6"
         ),
         .package(
             url: "https://github.com/huggingface/swift-transformers",

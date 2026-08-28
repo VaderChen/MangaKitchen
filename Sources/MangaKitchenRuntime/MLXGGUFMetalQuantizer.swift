@@ -2,6 +2,31 @@ import Foundation
 import MLX
 
 enum MLXGGUFMetalQuantizer {
+    private static let mxfp4Kernel = MLXFast.metalKernel(
+        name: "mangakitchen_gguf_pack_mxfp4",
+        inputNames: ["raw"],
+        outputNames: ["wq", "scales"],
+        source: """
+            uint block = thread_position_in_grid.x;
+            uint raw_offset = block * 17;
+            scales[block] = raw[raw_offset];
+
+            for (uint word = 0; word < 4; ++word) {
+                uint result = 0;
+                for (uint index = 0; index < 8; ++index) {
+                    uint source_index = word * 8 + index;
+                    uint packed_index = source_index < 16
+                        ? source_index
+                        : source_index - 16;
+                    uint shift = source_index < 16 ? 0 : 4;
+                    uint value = (uint(raw[raw_offset + 1 + packed_index]) >> shift) & 15;
+                    result |= value << (index * 4);
+                }
+                wq[block * 4 + word] = result;
+            }
+        """
+    )
+
     private static let preservedQuantizedKernel = MLXFast.metalKernel(
         name: "mangakitchen_gguf_pack_quantized",
         inputNames: ["raw"],
@@ -186,7 +211,8 @@ enum MLXGGUFMetalQuantizer {
                         int quantized = signed_byte(raw[block_offset + 2 + source_index]);
                         return scale * float(quantized);
                     }
-                    uchar packed = raw[block_offset + 2 + source_index % 16];
+                    uchar packed = raw[block_offset + (source_type == 3 ? 4 : 2)
+                        + source_index % 16];
                     if (source_type == 2) {
                         uint quantized = source_index < 16 ? uint(packed & 15) : uint(packed >> 4);
                         return scale * float(int(quantized) - 8);
@@ -244,9 +270,9 @@ enum MLXGGUFMetalQuantizer {
                         * float(int(quantized) - int(high));
                 }
                 if (source_type == 12 || source_type == 13) {
-                    uint segment = half_index / 64;
-                    bool upper = (half_index % 64) >= 32;
-                    uint position = half_index % 32;
+                    uint segment = source_index / 64;
+                    bool upper = (source_index % 64) >= 32;
+                    uint position = source_index % 32;
                     uint scale_index = segment * 2 + (upper ? 1 : 0);
                     uint quantized;
                     if (source_type == 12) {
@@ -408,5 +434,32 @@ enum MLXGGUFMetalQuantizer {
         )
         try checkedEval(output)
         return (output[0], output[1], output[2])
+    }
+
+    static func packMXFP4(
+        raw: Data,
+        sourceShape: [Int],
+        targetWeightShape: [Int],
+        targetScaleShape: [Int]
+    ) throws -> (wq: MLXArray, scales: MLXArray) {
+        let elementCount = sourceShape.reduce(1, *)
+        guard elementCount > 0, elementCount % 32 == 0 else {
+            throw MLXGGUFLoaderError.invalidTensor("MXFP4 量化群組設定")
+        }
+        let blockCount = elementCount / 32
+        guard raw.count == blockCount * 17 else {
+            throw MLXGGUFLoaderError.invalidTensor("MXFP4 權重資料大小")
+        }
+
+        let rawArray = MLXArray(raw, [raw.count], dtype: .uint8)
+        let output = mxfp4Kernel(
+            [rawArray],
+            grid: (blockCount, 1, 1),
+            threadGroup: (min(blockCount, 64), 1, 1),
+            outputShapes: [targetWeightShape, targetScaleShape],
+            outputDTypes: [.uint32, .uint8]
+        )
+        try checkedEval(output)
+        return (output[0], output[1])
     }
 }

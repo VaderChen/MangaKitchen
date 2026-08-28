@@ -54,8 +54,14 @@ final class AppModelLifecycleCoordinator {
             || preferredPaths[capability] != nil
     }
 
-    func effectiveTranslationModelMethod() -> TranslationModelMethod? {
-        hasConfiguredModel(.imageToText) ? .imageToText : nil
+    func effectiveTranslationModelMethod(
+        preferred method: TranslationModelMethod
+    ) -> TranslationModelMethod? {
+        let capability: ModelCapability = switch method {
+        case .textToText: .textToText
+        case .imageToText: .imageToText
+        }
+        return hasConfiguredModel(capability) ? method : nil
     }
 
     func setThinkingEnabled(_ enabled: Bool) async {
@@ -71,10 +77,11 @@ final class AppModelLifecycleCoordinator {
         guard let models else { return false }
         let normalizedPath = path.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         if preferredPaths[capability] == normalizedPath { return true }
-        await models.unloadModel(capability: capability)
-        await refreshLoadedModels()
+        let previousPath = preferredPaths[capability]
         guard let normalizedPath else {
             preferredPaths.removeValue(forKey: capability)
+            await models.unloadModel(capability: capability)
+            await refreshLoadedModels()
             log(.info, "Cleared lazy \(capability.rawValue) model configuration.")
             return true
         }
@@ -85,10 +92,12 @@ final class AppModelLifecycleCoordinator {
                 throw PreferredModelError.capabilityMismatch(expected: capability)
             }
             preferredPaths[capability] = normalizedPath
+            await models.unloadModel(capability: capability)
+            await refreshLoadedModels()
             log(.info, "Configured \(manifest.displayName) for lazy loading.")
             return true
         } catch {
-            preferredPaths.removeValue(forKey: capability)
+            preferredPaths[capability] = previousPath
             statusDidChange(error.localizedDescription)
             log(.error, error.localizedDescription)
             return false
@@ -132,9 +141,6 @@ final class AppModelLifecycleCoordinator {
         let safeCurrentIndex = min(max(1, currentIndex), safeTotalCount)
         let canonicalDirectoryURL = directoryURL.standardizedFileURL.resolvingSymlinksInPath()
         let manifest = try ModelManifest.load(from: canonicalDirectoryURL)
-        guard manifest.capability != .textToText else {
-            throw ModelLifecycleError.textToTextUnsupported
-        }
         let displayName = manifest.displayName
         if let loaded = await models.loadedModels().first(where: {
             $0.matchesModel(
@@ -292,12 +298,10 @@ private enum PreferredModelError: LocalizedError {
 
 private enum ModelLifecycleError: LocalizedError {
     case runtimeUnavailable
-    case textToTextUnsupported
 
     var errorDescription: String? {
         switch self {
         case .runtimeUnavailable: "漫畫處理 Runtime 尚未就緒。"
-        case .textToTextUnsupported: "目前只支援多模態模型，無法載入文生文模型。"
         }
     }
 }

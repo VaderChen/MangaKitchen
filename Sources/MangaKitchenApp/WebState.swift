@@ -256,6 +256,10 @@ struct WebGlobalSettings: Encodable {
         var recommended: Bool
         var installed: Bool
         var format: String
+        var repositoryID: String? = nil
+        var auxiliaryRepositoryID: String? = nil
+        var weightsFileName: String? = nil
+        var mmprojFileName: String? = nil
     }
 
     var interfaceLanguage: String
@@ -272,6 +276,18 @@ struct WebGlobalSettings: Encodable {
     var imageToTextModelVariant: String
     var imageToTextModelOptions: [ModelOption]
     var imageToTextModelInstalled: Bool
+    var translationModelPath: String?
+    var translationModelDownloadDirectoryPath: String?
+    var translationModelVariant: String
+    var translationModelOptions: [ModelOption]
+    var translationModelInstalled: Bool
+    var dflashEnabled: Bool
+    var dflashBlockSize: Int
+    var agentModelPath: String?
+    var agentModelDownloadDirectoryPath: String?
+    var agentModelVariant: String
+    var agentModelOptions: [ModelOption]
+    var agentModelInstalled: Bool
     var modelThinkingEnabled: Bool
     var modelDownloadState: ModelDownloadState?
     var imageToImageModelPath: String?
@@ -335,6 +351,60 @@ struct WebGlobalSettings: Encodable {
         }
         imageToTextModelInstalled = imageToTextModelOptions.first {
             $0.id == selectedImageToTextModelVariant
+        }?.installed ?? false
+        translationModelPath = preferences.translationModelPath
+        translationModelDownloadDirectoryPath = preferences.translationModelDownloadDirectoryPath
+        let selectedTranslationModelVariant = preferences.resolvedTranslationModelVariant
+        translationModelVariant = selectedTranslationModelVariant
+        let translationModelStorageDirectoryURL = preferences.translationModelDownloadDirectoryPath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        }
+        translationModelOptions = DownloadableModelCatalog.translationModels.map { model in
+            ModelOption(
+                id: model.id,
+                displayName: model.displayName,
+                recommended: model.recommended,
+                installed: translationModelStorageDirectoryURL.flatMap {
+                    DownloadableModelCatalog.installedModelDirectory(
+                        storageDirectoryURL: $0,
+                        model: model
+                    )
+                } != nil,
+                format: model.format.rawValue,
+                repositoryID: model.repositoryID,
+                auxiliaryRepositoryID: model.auxiliaryRepositoryID,
+                weightsFileName: model.weightsFileName,
+                mmprojFileName: model.mmprojFileName
+            )
+        }
+        translationModelInstalled = translationModelOptions.first {
+            $0.id == selectedTranslationModelVariant
+        }?.installed ?? false
+        dflashEnabled = preferences.dflashEnabled
+        dflashBlockSize = preferences.dflashBlockSize
+        agentModelPath = preferences.agentModelPath
+        agentModelDownloadDirectoryPath = preferences.agentModelDownloadDirectoryPath
+        let selectedAgentModelVariant = preferences.resolvedAgentModelVariant
+        agentModelVariant = selectedAgentModelVariant
+        let agentModelStorageDirectoryURL = preferences.agentModelDownloadDirectoryPath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        }
+        agentModelOptions = DownloadableModelCatalog.agentModels.map { model in
+            ModelOption(
+                id: model.id,
+                displayName: model.displayName,
+                recommended: model.recommended,
+                installed: agentModelStorageDirectoryURL.flatMap {
+                    DownloadableModelCatalog.installedModelDirectory(
+                        storageDirectoryURL: $0,
+                        model: model
+                    )
+                } != nil,
+                format: model.format.rawValue
+            )
+        }
+        agentModelInstalled = agentModelOptions.first {
+            $0.id == selectedAgentModelVariant
         }?.installed ?? false
         modelThinkingEnabled = preferences.modelThinkingEnabled
         modelDownloadState = store.modelDownloadState

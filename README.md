@@ -43,7 +43,7 @@ GPLv3 itself permits commercial use and paid distribution, subject to its source
 - A bundled manga109 bubble-segmentation Core ML model, preferring Apple Neural Engine execution, produces dialogue BBOX candidates and bubble shapes for black-and-white manga. Stage two always refines those confirmed bubbles into pixel-level glyph masks from the original image; changing an OCR/VLM text-localization preference cannot replace or alter this mask path. Apple Vision OCR is not used. Sound effects, page numbers, footer credits, people, and empty regions are deliberately excluded from the primary workflow.
 - Stage two requires neither PP-OCR text detection nor an `imageToText` VLM. The Medium Det and VLM localization runtimes remain isolated from mask generation so model changes cannot regress existing bubble and pixel-mask behavior.
 - Bundled native Swift/Core ML PP-OCRv6 Medium OCR is the default source-text recognizer during stage-three per-region or full-page translation, with the verified Small recognizer as fallback. Every OCR result remains separated by model ID with confidence, line boxes, and reading order; when `sourceText` is empty, the default OCR result becomes the translation source without changing bounds or masks. Existing VLM, Agent, or manually confirmed source text is never overwritten, and an OCR-only result does not claim the legacy `ocrTextRefined` confirmation flag.
-- GUI translation always uses a downloaded multimodal model so page context remains available. OCR can still extract per-region source text, while VLM transcription remains selectable; legacy text-to-text project settings migrate to `imageToText`.
+- GUI translation uses the selected text-to-text or multimodal model. OCR can extract per-region source text for the text-only path, while VLM transcription and page context remain available when the multimodal path is selected.
 - Stage-three controls can explicitly re-extract all region source text, retranslate using the existing source text, or re-extract and translate one selected region; these operations keep stage-two masks and clean backgrounds intact. Calculation dialogs show an elapsed `MM:SS` timer while work is waiting or running.
 - Accepted dialogue regions use the dialogue BBOX as their search boundary, then are refined into pixel glyph masks from original-image pixels and shrink to the unexpanded glyph extents. Automatic layout direction prefers the measured glyph arrangement. Each candidate is isolated: if OCR or translation fails for one region, that region is preserved and the remaining regions continue; only cancellation stops the whole job.
 - Page-context multimodal prompts and strict JSON response parsing for local translation models.
@@ -138,7 +138,7 @@ Data-location changes take effect after restart. Image-to-text, image-colorizati
 
 ### SwiftPM and Metal build troubleshooting
 
-MLX depends on its bundled Metal resource (`default.metallib`). If `swift test` stops with `Failed to load the default metallib`, the test has failed while initializing MLX and has not reached the MangaKitchen GGUF loader. This is not a MangaKitchen or GGUF kernel error.
+MLX depends on its bundled Metal resource (`default.metallib`). The packaging script builds the application-specific `mlx.metallib` once and persists it under `Artifacts/MLXMetal/<configuration>/`, outside SwiftPM's `.build` cache; `--clean` therefore does not rebuild it unless the MLX shader sources change. If `swift test` stops with `Failed to load the default metallib`, the test has failed while initializing MLX and has not reached the MangaKitchen GGUF loader. This is not a MangaKitchen or GGUF kernel error.
 
 Start with a clean SwiftPM dependency and build cache:
 
@@ -189,13 +189,19 @@ Colorization uses a dedicated `ImageColorizing` adapter rather than the generic 
 
 The Core ML manifest is a generic adapter for models packaged as one prediction. Models such as Qwen-VL that require tokenizers and autoregressive decoding use a dedicated MLX adapter. Diffusion models with sampler loops likewise require a dedicated `ImageToImageGenerating` adapter; changing only the Core ML feature names is insufficient. The core pipeline does not need to change.
 
-The App exposes `MLXVLMRuntime` for local multimodal translation models whose `model_type` is supported by `mlx-swift-lm`. `MLXTextRuntime` remains only for legacy contract compatibility and is not selectable in the UI. The managed catalog recommends the approximately 3 GB `lmstudio-community/Qwen3.5-4B-MLX-4bit`:
+The App exposes `MLXTextRuntime` for text-only translation and `MLXVLMRuntime` for local multimodal translation models whose `model_type` is supported by `mlx-swift-lm`. The managed catalog recommends `mlx-community/Qwen3-4B-4bit` for text-only translation and also provides the larger `Qwen3-8B-4bit`. GPT-OSS remains available as an optional model, but is marked as not recommended for multilingual translation because its quality can be inconsistent. The Multimodal catalog also provides Gemma 4 E2B, E4B, and 12B 4-bit MLX checkpoints:
 
 1. Download the complete Hugging Face model into a local directory.
 2. Select that directory in the app. The path is registered immediately; the model container loads on first use and is then reused across pages until memory pressure requires release.
 3. Add `Examples/Models/MLXVLMModel/mangakitchen-model.json` only when explicit display or generation overrides are needed.
 
-The `mlx-swift-lm` factory selects architecture from `config.json`, so a single safetensors file is not enough. Keep the tokenizer, processor, chat template, and config files together.
+For text-only translation, choose the Qwen3 4B or 8B entry in Settings → Models → Translation. These models receive OCR text without the page image; multimodal translation remains available through the separate multimodal model selection.
+
+### DFlash speculative decoding
+
+The Translation and Multimodal model settings can enable DFlash for compatible Qwen3／Qwen3.5 targets. The app automatically discovers the Draft in the same model root as the selected target, so no separate Draft path is stored. The native Swift／MLX implementation runs on the same Metal runtime as the target model; it does not replace Safetensors／MLX checkpoint or GGUF loading. Qwen3-VL and Qwen3.5-VL perform a vision-aware prefill before entering the same speculative decoding loop; other VLM architectures safely fall back to standard generation. If the draft is missing, incompatible, invalid, or encounters an unsupported generation configuration, the App logs the reason and falls back to standard generation. The Draft weights are not bundled with the App.
+
+The `mlx-swift-lm` factory selects architecture from `config.json`, so a single safetensors file is not enough. Keep the tokenizer, chat template, and config files together. Other multimodal models should also retain their processor configuration; for Qwen3.5 checkpoints with `vision_config`, the factory derives a compatible Qwen3VLProcessor configuration when `processor_config.json` and `preprocessor_config.json` are absent.
 
 ### GGUF 權重
 
@@ -285,7 +291,7 @@ MangaKitchenApp/MCP
 
 See [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md) for architectural decisions and data flow.
 See [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md) for the versioned translation/colorization Swift, JavaScript, and MCP contract.
-See [the build 1850 release notes](Documentation/RELEASE_NOTES_1.26.0825-build-1850.md) for the latest packaged changes, Developer ID signature, notarization status, and verified download checksum.
+See [the build 0052 release notes](Documentation/RELEASE_NOTES_1.26.0829-build-0052.md) for the latest packaged changes, Developer ID signature, notarization status, and verified download checksum.
 See [the current development release notes](Documentation/RELEASE_NOTES_UNRELEASED.md) for changes after the latest package.
 
 ## Known Boundaries

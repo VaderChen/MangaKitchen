@@ -23,12 +23,28 @@ struct HuggingFaceModelDownloader: Sendable {
             return targetDirectoryURL
         }
 
+        let stagingRootURL = storageDirectoryURL
+            .appendingPathComponent(".mangakitchen-downloads", isDirectory: true)
+        let downloadedDirectoryURL = try repositoryDirectoryURL(
+            model: model,
+            stagingRootURL: stagingRootURL
+        )
+        if fileManager.fileExists(atPath: downloadedDirectoryURL.path),
+           DownloadableModelCatalog.isCompleteModelDirectory(downloadedDirectoryURL, model: model) {
+            try prepareDownloadedModel(downloadedDirectoryURL, model: model)
+            let finalizedURL = try finalizeDownloadedModel(
+                downloadedDirectoryURL,
+                targetDirectoryURL: targetDirectoryURL,
+                model: model
+            )
+            progressHandler(.completed)
+            return finalizedURL
+        }
+
         try fileManager.createDirectory(
             at: storageDirectoryURL,
             withIntermediateDirectories: true
         )
-        let stagingRootURL = storageDirectoryURL
-            .appendingPathComponent(".mangakitchen-downloads", isDirectory: true)
         let hub = HubApi(downloadBase: stagingRootURL)
         let repository = Hub.Repo(id: model.repositoryID)
         let filenames = try await hub.getFilenames(from: repository)
@@ -52,10 +68,6 @@ struct HuggingFaceModelDownloader: Sendable {
         )
         await progress.report()
 
-        let downloadedDirectoryURL = try repositoryDirectoryURL(
-            model: model,
-            stagingRootURL: stagingRootURL
-        )
         if fileManager.fileExists(atPath: downloadedDirectoryURL.path) {
             try fileManager.removeItem(at: downloadedDirectoryURL)
         }
@@ -79,6 +91,24 @@ struct HuggingFaceModelDownloader: Sendable {
             throw ModelDownloadError.incompleteRepository(model.repositoryID)
         }
 
+        let finalizedURL = try finalizeDownloadedModel(
+            downloadedDirectoryURL,
+            targetDirectoryURL: targetDirectoryURL,
+            model: model
+        )
+        await progress.finish()
+        return finalizedURL
+    }
+
+    private func finalizeDownloadedModel(
+        _ downloadedDirectoryURL: URL,
+        targetDirectoryURL: URL,
+        model: DownloadableModelDescriptor
+    ) throws -> URL {
+        let fileManager = FileManager.default
+        guard DownloadableModelCatalog.isCompleteModelDirectory(downloadedDirectoryURL, model: model) else {
+            throw ModelDownloadError.incompleteRepository(model.repositoryID)
+        }
         if fileManager.fileExists(atPath: targetDirectoryURL.path) {
             try fileManager.removeItem(at: targetDirectoryURL)
         }
@@ -86,7 +116,6 @@ struct HuggingFaceModelDownloader: Sendable {
         guard DownloadableModelCatalog.isCompleteModelDirectory(targetDirectoryURL, model: model) else {
             throw ModelDownloadError.incompleteRepository(model.repositoryID)
         }
-        await progress.finish()
         return targetDirectoryURL
     }
 

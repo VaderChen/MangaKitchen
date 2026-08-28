@@ -253,14 +253,17 @@
               <option value="ppocrv6MediumDet">PP-OCRv6 Medium Det</option>
             </select>
           </label>
+          <label><span data-i18n="translationModel">翻譯模型</span>
+            <select id="translation-model"></select>
+          </label>
           </details>
           <details class="inspector-settings-card" open>
             <summary data-i18n="translationQuality">翻譯品質</summary>
           <fieldset class="translation-quality-settings">
             <label class="checkbox-label"><input id="translation-page-context" type="checkbox"> <span data-i18n="translationPageContext">使用整頁語境</span></label>
-            <label class="checkbox-label"><input id="translation-review-pass" type="checkbox"> <span data-i18n="translationReviewPass">執行二次校稿</span></label>
-            <label class="checkbox-label"><input id="translation-quality-check" type="checkbox"> <span data-i18n="translationQualityCheck">執行翻譯品質檢查</span></label>
             <label class="checkbox-label"><input id="translation-preserve-literal" type="checkbox"> <span data-i18n="translationPreserveLiteral">保留直譯稿</span></label>
+            <label class="checkbox-label"><input id="translation-quality-check" type="checkbox"> <span data-i18n="translationQualityCheck">執行翻譯品質檢查</span></label>
+            <label class="checkbox-label"><input id="translation-review-pass" type="checkbox"> <span data-i18n="translationReviewPass">執行二次校稿</span></label>
             <label><span data-i18n="translationLengthMode">顯示譯文長度</span>
               <select id="translation-length-mode">
                 <option value="faithful" data-i18n="translationLengthFaithful">忠實</option>
@@ -466,6 +469,8 @@
               <button id="model-tab-previous" type="button" class="secondary icon-button" data-i18n-title="previousModelTab" data-i18n-aria-label="previousModelTab" title="上一個模型分類" aria-label="上一個模型分類"><i class="fa-solid fa-chevron-left" aria-hidden="true"></i></button>
               <nav class="model-tabs" data-i18n-aria-label="modelTabs" aria-label="模型分類" role="tablist">
                 <button type="button" class="model-tab" data-model-tab="imageToText" role="tab" aria-selected="false" aria-controls="model-page-image-to-text" data-i18n="modelTabImageToText">多模態</button>
+                <button type="button" class="model-tab" data-model-tab="translation" role="tab" aria-selected="false" aria-controls="model-page-translation" data-i18n="modelTabTranslation">翻譯</button>
+                <button type="button" class="model-tab" data-model-tab="agent" role="tab" aria-selected="false" aria-controls="model-page-agent" data-i18n="modelTabAgent">Agent</button>
                 <button type="button" class="model-tab" data-model-tab="textLocalization" role="tab" aria-selected="false" aria-controls="model-page-text-localization" data-i18n="modelTabTextLocalization">文字定位</button>
                 <button type="button" class="model-tab active" data-model-tab="ocr" role="tab" aria-selected="true" aria-controls="model-page-ocr" data-i18n="modelTabOCR">OCR</button>
                 <button type="button" class="model-tab" data-model-tab="superResolution" role="tab" aria-selected="false" aria-controls="model-page-super-resolution" data-i18n="modelTabSuperResolution">超高解析度</button>
@@ -536,6 +541,112 @@
                   <small id="image-to-text-model-download-status"></small>
                 </div>
                 <p class="section-help" data-i18n="imageToTextModelDescription">用途：多模態模型可以同時取代文字定位、OCR 與翻譯工作，直接從圖片找出文字座標、抽取原文並翻譯；還能分析畫面內容，調整語氣並對應角色。特別推薦在希望簡化流程、保留畫面語境時使用。它不參與氣泡偵測或遮罩產生。</p>
+                <div class="settings-path-group dflash-settings-group">
+                  <div class="settings-card-heading">
+                    <strong data-i18n="dflashSettings">DFlash 推測解碼</strong>
+                    <span data-i18n="dflashAutoDiscovery">自動尋找同模型目錄</span>
+                  </div>
+                  <label class="settings-switch-row">
+                    <span>
+                      <strong data-i18n="dflashEnabled">啟用 DFlash</strong>
+                      <small data-i18n="dflashEnabledHelp">從主模型同一個模型根目錄自動尋找相容的 Draft；多模態模型也適用。</small>
+                    </span>
+                    <input id="settings-image-to-text-dflash-enabled" type="checkbox" role="switch">
+                  </label>
+                  <p class="section-help" data-i18n="dflashSettingsHelp">Draft 必須與主模型放在同一個模型根目錄下；找不到、不相容或初始化失敗時會自動回到標準生成。</p>
+                </div>
+              </div>
+              </section>
+              <section id="model-page-translation" class="model-page" data-model-page="translation" role="tabpanel" hidden>
+              <div class="settings-path-group">
+                <div class="settings-card-heading">
+                  <strong data-i18n="translationModel">翻譯模型</strong>
+                  <span data-i18n="downloadRequired">需下載</span>
+                </div>
+                <div class="settings-field">
+                  <label for="settings-translation-model" data-i18n="translationModel">翻譯模型</label>
+                  <div class="settings-directory-row">
+                    <input id="settings-translation-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+                    <button id="choose-translation-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
+                  </div>
+                </div>
+                <div class="settings-inline-row model-format-version-row">
+                  <label class="settings-field">
+                    <span data-i18n="modelFormat">模型格式</span>
+                    <select id="settings-translation-model-format">
+                      <option value="all" data-i18n="modelFormatAll">全部</option>
+                      <option value="mlxDirectory" data-i18n="modelFormatMLX">MLX</option>
+                      <option value="ggufDirectory" data-i18n="modelFormatGGUF">GGUF</option>
+                    </select>
+                  </label>
+                  <label class="settings-field">
+                    <span data-i18n="modelVersion">模型版本</span>
+                    <div class="model-info-control">
+                      <select id="settings-translation-model-variant"></select>
+                      <button id="translation-model-info" type="button" class="quiet icon-button model-info-button" data-i18n-title="modelInfo" data-i18n-aria-label="modelInfo" title="模型資訊" aria-label="模型資訊" aria-describedby="translation-model-info-tooltip" disabled>
+                        <i class="fa-solid fa-circle-info" aria-hidden="true"></i>
+                      </button>
+                      <div id="translation-model-info-tooltip" class="model-info-tooltip" role="tooltip"></div>
+                    </div>
+                  </label>
+                </div>
+                <div class="settings-actions">
+                  <button id="download-translation-model" type="button" class="primary" data-i18n="downloadModel" disabled>下載</button>
+                  <button id="clear-translation-model" type="button" class="quiet" data-i18n="clear">清除</button>
+                  <button id="delete-translation-model" type="button" class="quiet danger-text" data-i18n="delete" hidden>刪除</button>
+                </div>
+                <div id="translation-model-download-progress" class="model-download-progress" hidden>
+                  <progress id="translation-model-download-progress-bar" value="0" max="1"></progress>
+                  <small id="translation-model-download-status"></small>
+                </div>
+                <p class="section-help" data-i18n="translationModelDescription">用途：接收 OCR／多模態模型抽出的原文，執行翻譯與翻譯品質處理；不讀取漫畫圖片。</p>
+                <div class="settings-path-group dflash-settings-group">
+                  <div class="settings-card-heading">
+                    <strong data-i18n="dflashSettings">DFlash 推測解碼</strong>
+                    <span data-i18n="dflashAutoDiscovery">自動尋找同模型目錄</span>
+                  </div>
+                  <label class="settings-switch-row">
+                    <span>
+                      <strong data-i18n="dflashEnabled">啟用 DFlash</strong>
+                      <small data-i18n="dflashEnabledHelp">從主模型同一個模型根目錄自動尋找相容的 Draft；多模態模型也適用。</small>
+                    </span>
+                    <input id="settings-translation-dflash-enabled" type="checkbox" role="switch">
+                  </label>
+                  <label class="settings-field">
+                    <span data-i18n="dflashBlockSize">Block size</span>
+                    <input id="settings-dflash-block-size" type="number" min="2" max="256" step="1" value="5" inputmode="numeric">
+                  </label>
+                  <p class="section-help" data-i18n="dflashSettingsHelp">Draft 必須與主模型放在同一個模型根目錄下；找不到、不相容或初始化失敗時會自動回到標準生成。</p>
+                </div>
+              </div>
+              </section>
+              <section id="model-page-agent" class="model-page" data-model-page="agent" role="tabpanel" hidden>
+              <div class="settings-path-group">
+                <div class="settings-card-heading">
+                  <strong data-i18n="agentModel">Agent 模型</strong>
+                  <span data-i18n="downloadRequired">需下載</span>
+                </div>
+                <div class="settings-field">
+                  <label for="settings-agent-model" data-i18n="agentModel">Agent 模型</label>
+                  <div class="settings-directory-row">
+                    <input id="settings-agent-model" readonly data-i18n-placeholder="notConfigured" placeholder="尚未設定">
+                    <button id="choose-agent-model" type="button" class="secondary" data-i18n="chooseModelFolder">選取模型目錄</button>
+                  </div>
+                </div>
+                <label class="settings-field">
+                  <span data-i18n="modelVersion">模型版本</span>
+                  <select id="settings-agent-model-variant"></select>
+                </label>
+                <div class="settings-actions">
+                  <button id="download-agent-model" type="button" class="primary" data-i18n="downloadModel" disabled>下載</button>
+                  <button id="clear-agent-model" type="button" class="quiet" data-i18n="clear">清除</button>
+                  <button id="delete-agent-model" type="button" class="quiet danger-text" data-i18n="delete" hidden>刪除</button>
+                </div>
+                <div id="agent-model-download-progress" class="model-download-progress" hidden>
+                  <progress id="agent-model-download-progress-bar" value="0" max="1"></progress>
+                  <small id="agent-model-download-status"></small>
+                </div>
+                <p class="section-help" data-i18n="agentModelDescription">供外部 Agent 使用的本機文字模型下載項目。它不會加入 MangaKitchen 的多模態翻譯流程；翻譯仍只使用多模態模型。</p>
               </div>
               </section>
               <section id="model-page-super-resolution" class="model-page" data-model-page="superResolution" role="tabpanel" hidden>

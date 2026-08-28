@@ -50,6 +50,7 @@ const colorSchemeStorageKey = "mangakitchen.color-scheme";
 const inspectorTabStorageKey = "mangakitchen.inspector-tab";
 const modelTabStorageKey = "mangakitchen.model-tab";
 const imageToTextModelFormatStorageKey = "mangakitchen.image-to-text-model-format";
+const translationModelFormatStorageKey = "mangakitchen.translation-model-format";
 
 const elements = {
   workflowBar: document.querySelector(".workflow-bar"),
@@ -178,6 +179,28 @@ const elements = {
   settingsImageToTextModelDownloadProgress: document.querySelector("#image-to-text-model-download-progress"),
   settingsImageToTextModelDownloadProgressBar: document.querySelector("#image-to-text-model-download-progress-bar"),
   settingsImageToTextModelDownloadStatus: document.querySelector("#image-to-text-model-download-status"),
+  settingsTranslationModel: document.querySelector("#settings-translation-model"),
+  settingsTranslationModelFormat: document.querySelector("#settings-translation-model-format"),
+  settingsTranslationModelVariant: document.querySelector("#settings-translation-model-variant"),
+  settingsTranslationModelInfo: document.querySelector("#translation-model-info"),
+  settingsTranslationModelInfoTooltip: document.querySelector("#translation-model-info-tooltip"),
+  settingsTranslationModelDownload: document.querySelector("#download-translation-model"),
+  settingsTranslationModelClear: document.querySelector("#clear-translation-model"),
+  settingsTranslationModelDelete: document.querySelector("#delete-translation-model"),
+  settingsTranslationModelDownloadProgress: document.querySelector("#translation-model-download-progress"),
+  settingsTranslationModelDownloadProgressBar: document.querySelector("#translation-model-download-progress-bar"),
+  settingsTranslationModelDownloadStatus: document.querySelector("#translation-model-download-status"),
+  settingsImageToTextDFlashEnabled: document.querySelector("#settings-image-to-text-dflash-enabled"),
+  settingsTranslationDFlashEnabled: document.querySelector("#settings-translation-dflash-enabled"),
+  settingsDFlashBlockSize: document.querySelector("#settings-dflash-block-size"),
+  settingsAgentModel: document.querySelector("#settings-agent-model"),
+  settingsAgentModelVariant: document.querySelector("#settings-agent-model-variant"),
+  settingsAgentModelDownload: document.querySelector("#download-agent-model"),
+  settingsAgentModelClear: document.querySelector("#clear-agent-model"),
+  settingsAgentModelDelete: document.querySelector("#delete-agent-model"),
+  settingsAgentModelDownloadProgress: document.querySelector("#agent-model-download-progress"),
+  settingsAgentModelDownloadProgressBar: document.querySelector("#agent-model-download-progress-bar"),
+  settingsAgentModelDownloadStatus: document.querySelector("#agent-model-download-status"),
   settingsImageToImageModel: document.querySelector("#settings-image-to-image-model"),
   settingsImageColorizationModel: document.querySelector("#settings-image-colorization-model"),
   settingsImageColorizationModelVariant: document.querySelector("#settings-image-colorization-model-variant"),
@@ -231,6 +254,7 @@ const elements = {
   fontNameValue: document.querySelector("#font-name-value"),
   fontNameList: document.querySelector("#font-name-list"),
   textLocalizationMethod: document.querySelector("#text-localization-method"),
+  translationModel: document.querySelector("#translation-model"),
   translationPageContext: document.querySelector("#translation-page-context"),
   translationReviewPass: document.querySelector("#translation-review-pass"),
   translationQualityCheck: document.querySelector("#translation-quality-check"),
@@ -380,9 +404,19 @@ function activePage() {
 function availableTranslationModels() {
   const settings = state?.globalSettings;
   const models = [];
+  for (const model of settings?.translationModelOptions ?? []) {
+    if (!model.installed) continue;
+    models.push({
+      method: "textToText",
+      capability: "textToText",
+      variantID: model.id,
+      displayName: model.displayName,
+    });
+  }
   for (const model of settings?.imageToTextModelOptions ?? []) {
     if (!model.installed) continue;
     models.push({
+      method: "imageToText",
       capability: "imageToText",
       variantID: model.id,
       displayName: model.displayName,
@@ -394,7 +428,18 @@ function availableTranslationModels() {
     if (loaded.capability !== "imageToText") continue;
     if (models.some((model) => model.displayName === loaded.displayName)) continue;
     models.push({
+      method: "imageToText",
       capability: "imageToText",
+      variantID: null,
+      displayName: loaded.displayName,
+    });
+  }
+  for (const loaded of state?.loadedModels ?? []) {
+    if (loaded.capability !== "textToText") continue;
+    if (models.some((model) => model.displayName === loaded.displayName)) continue;
+    models.push({
+      method: "textToText",
+      capability: "textToText",
       variantID: null,
       displayName: loaded.displayName,
     });
@@ -913,6 +958,10 @@ function advanceWorkflowStep() {
   if (!pages.length) {
     showError(new Error(t("selectAtLeastOnePage")));
     return Promise.resolve();
+  }
+  if (activeWorkflowStep === "translate"
+      && pages.some((page) => !hasWorkflowStepData(page, "translate"))) {
+    return selectOrCalculateWorkflowStep("translate", "translate");
   }
   const canLeaveIncompleteTranslation = activeWorkflowStep === "translate"
     && pages.every(hasTranslationPreview);
@@ -3150,6 +3199,9 @@ function renderPage() {
       `${page.maskAppliedPreviewURL}?updated=${page.maskRevision ?? "current"}`,
       t("maskedComicPage")
     );
+  } else if (activeWorkflowStep === "translate" && page.translationPreviewURL) {
+    elements.resultPreviewCaption.textContent = t("translationResult");
+    showOutputPreview(page.translationPreviewURL, t("translationPreview"));
   } else if (activeWorkflowStep === "translate" && page.superResolvedBackgroundPreviewURL) {
     elements.resultPreviewCaption.textContent = t("translationResult");
     showOutputPreview(
@@ -3169,9 +3221,6 @@ function renderPage() {
   } else if (page.outputPreviewURL) {
     elements.resultPreviewCaption.textContent = t("translationResult");
     showOutputPreview(page.outputPreviewURL, t("translatedComicPage"));
-  } else if (page.translationPreviewURL) {
-    elements.resultPreviewCaption.textContent = t("translationResult");
-    showOutputPreview(page.translationPreviewURL, t("translationPreview"));
   } else if (page.maskAppliedPreviewURL) {
     elements.resultPreviewCaption.textContent = t("maskAppliedPreview");
     showOutputPreview(
@@ -3189,6 +3238,75 @@ function renderPage() {
   applyCanvasViewport();
   renderTranslationLayer(page);
   renderRegions(page);
+}
+
+function renderTranslationModelSelect() {
+  const settings = state.globalSettings;
+  const options = state.options;
+  if (!settings || !options) return;
+  const selectedMethod = options.translationModelMethod ?? "imageToText";
+  const selectedVariant = selectedMethod === "textToText"
+    ? settings.translationModelVariant
+    : settings.imageToTextModelVariant;
+  const choices = availableTranslationModels()
+    .filter((model) => model.variantID)
+    .map((model) => ({ ...model, unavailable: false }));
+  if (!choices.some((model) =>
+    model.method === selectedMethod && model.variantID === selectedVariant
+  ) && selectedVariant) {
+    const catalogOptions = selectedMethod === "textToText"
+      ? settings.translationModelOptions ?? []
+      : settings.imageToTextModelOptions ?? [];
+    const selectedCatalogModel = catalogOptions.find((model) => model.id === selectedVariant);
+    if (selectedCatalogModel) {
+      choices.push({
+        method: selectedMethod,
+        capability: selectedMethod === "textToText" ? "textToText" : "imageToText",
+        variantID: selectedVariant,
+        displayName: `${selectedCatalogModel.displayName} · ${t("modelNotDownloaded")}`,
+        unavailable: true,
+      });
+    }
+  }
+  const signature = choices.map((model) => [
+    model.method,
+    model.variantID,
+    model.displayName,
+    model.unavailable,
+  ].join(":")).join("\n");
+  if (elements.translationModel.dataset.optionsSignature !== signature) {
+    const groups = [
+      ["textToText", t("textToText")],
+      ["imageToText", t("imageToText")],
+    ].map(([method, label]) => {
+      const groupChoices = sortModelOptionsAlphabetically(
+        choices.filter((model) => model.method === method)
+      );
+      if (!groupChoices.length) return null;
+      const group = document.createElement("optgroup");
+      group.label = label;
+      for (const model of groupChoices) {
+        const option = document.createElement("option");
+        option.value = model.variantID;
+        option.dataset.translationModelMethod = model.method;
+        option.dataset.modelVariantID = model.variantID;
+        option.textContent = model.displayName;
+        option.disabled = model.unavailable;
+        group.append(option);
+      }
+      return group;
+    }).filter(Boolean);
+    if (!groups.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = t("translationModelNotLoaded");
+      option.disabled = true;
+      groups.push(option);
+    }
+    elements.translationModel.replaceChildren(...groups);
+    elements.translationModel.dataset.optionsSignature = signature;
+  }
+  elements.translationModel.value = selectedVariant ?? "";
 }
 
 function renderSettings() {
@@ -3252,20 +3370,23 @@ function renderSettings() {
     option.setAttribute("aria-selected", String(option.dataset.fontName === selectedFont));
   }
   const selectedLocalizationMethod = options.textLocalizationMethod ?? "ppocrv6MediumDet";
-  const localizationOptions = [];
+  const mlCoreGroup = document.createElement("optgroup");
+  mlCoreGroup.label = t("extractionModelGroupMLCore");
   const ppocrOption = document.createElement("option");
   ppocrOption.value = "ppocrv6MediumDet";
   ppocrOption.textContent = "PP-OCRv6 Medium Det + Rec";
-  localizationOptions.push(ppocrOption);
+  mlCoreGroup.append(ppocrOption);
+  const multimodalGroup = document.createElement("optgroup");
+  multimodalGroup.label = t("extractionModelGroupMultimodal");
   const availableVLMs = availableTextLocalizationVLMs();
   const selectedImageToTextVariant = state.globalSettings?.imageToTextModelVariant;
   for (const model of availableVLMs) {
     const vlmOption = document.createElement("option");
     vlmOption.value = "vlm";
     vlmOption.dataset.modelVariantID = model.variantID ?? "";
-    vlmOption.textContent = `${model.displayName} · VLM`;
+    vlmOption.textContent = model.displayName;
     vlmOption.selected = model.variantID === selectedImageToTextVariant;
-    localizationOptions.push(vlmOption);
+    multimodalGroup.append(vlmOption);
   }
   if (availableVLMs.length === 0 && selectedLocalizationMethod === "vlm") {
     // 保留舊專案的選擇，讓使用者看得出目前缺少模型並可切回 PP-OCRv6。
@@ -3273,16 +3394,19 @@ function renderSettings() {
     unavailableVLMOption.value = "vlm";
     unavailableVLMOption.textContent = t("vlmLocalizationUnavailable");
     unavailableVLMOption.disabled = true;
-    localizationOptions.push(unavailableVLMOption);
+    multimodalGroup.append(unavailableVLMOption);
   }
-  elements.textLocalizationMethod.replaceChildren(...localizationOptions);
-  elements.textLocalizationMethod.value = selectedLocalizationMethod;
-  if (selectedLocalizationMethod === "vlm") {
-    const selectedOption = localizationOptions.find(
-      (option) => option.dataset.modelVariantID === selectedImageToTextVariant
-    );
-    if (selectedOption) selectedOption.selected = true;
-  }
+  elements.textLocalizationMethod.replaceChildren(mlCoreGroup, multimodalGroup);
+  const localizationDOMOptions = [...elements.textLocalizationMethod.options];
+  const selectedLocalizationOption = localizationDOMOptions.find(
+    (option) => option.value === selectedLocalizationMethod
+      && (selectedLocalizationMethod !== "vlm"
+        || option.dataset.modelVariantID === selectedImageToTextVariant)
+  ) ?? localizationDOMOptions.find(
+    (option) => option.value === selectedLocalizationMethod
+  );
+  if (selectedLocalizationOption) selectedLocalizationOption.selected = true;
+  renderTranslationModelSelect();
   const quality = options.translationQuality ?? {};
   elements.translationPageContext.checked = quality.usePageContext ?? true;
   elements.translationReviewPass.checked = quality.reviewPassEnabled ?? false;
@@ -3300,6 +3424,7 @@ function renderSettings() {
     elements.writingDirection,
     elements.fontName,
     elements.textLocalizationMethod,
+    elements.translationModel,
     elements.translationPageContext,
     elements.translationReviewPass,
     elements.translationQualityCheck,
@@ -3310,6 +3435,7 @@ function renderSettings() {
     control.disabled = !state.activeProjectID;
   }
   elements.textLocalizationMethod.disabled = !state.activeProjectID || state.isProcessing;
+  elements.translationModel.disabled = !state.activeProjectID || state.isProcessing;
   elements.eraseColorTrigger.disabled = !state.activeProjectID;
   elements.eraseColorEyedropper.disabled = activeWorkflowStep !== "pages"
     || !activePage()
@@ -3393,6 +3519,14 @@ function globalSettingsPayload(overrides = {}) {
     imageToTextModelPath: current.imageToTextModelPath,
     imageToTextModelDownloadDirectoryPath: current.imageToTextModelDownloadDirectoryPath,
     imageToTextModelVariant: current.imageToTextModelVariant,
+    translationModelPath: current.translationModelPath,
+    translationModelDownloadDirectoryPath: current.translationModelDownloadDirectoryPath,
+    translationModelVariant: current.translationModelVariant,
+    dflashEnabled: current.dflashEnabled ?? false,
+    dflashBlockSize: current.dflashBlockSize ?? 5,
+    agentModelPath: current.agentModelPath,
+    agentModelDownloadDirectoryPath: current.agentModelDownloadDirectoryPath,
+    agentModelVariant: current.agentModelVariant,
     modelThinkingEnabled: current.modelThinkingEnabled,
     imageToImageModelPath: current.imageToImageModelPath,
     imageColorizationModelPath: current.imageColorizationModelPath,
@@ -3427,6 +3561,14 @@ function imageToTextModelMatchesFormat(model, format) {
   return format === "all" || (model.format ?? "mlxDirectory") === format;
 }
 
+function sortModelOptionsAlphabetically(models) {
+  return [...models].sort((left, right) => left.displayName.localeCompare(
+    right.displayName,
+    undefined,
+    { numeric: true, sensitivity: "base" }
+  ));
+}
+
 function makeImageToTextModelOption(model) {
   const option = document.createElement("option");
   option.value = model.id;
@@ -3440,11 +3582,12 @@ function makeImageToTextModelOption(model) {
 }
 
 function makeImageToTextModelOptionNodes(models, format) {
-  if (format !== "all") return models.map(makeImageToTextModelOption);
+  const sortedModels = sortModelOptionsAlphabetically(models);
+  if (format !== "all") return sortedModels.map(makeImageToTextModelOption);
 
   const knownFormats = ["mlxDirectory", "ggufDirectory"];
   const groupedNodes = knownFormats.flatMap((groupFormat) => {
-    const groupModels = models.filter((model) =>
+    const groupModels = sortedModels.filter((model) =>
       (model.format ?? "mlxDirectory") === groupFormat
     );
     if (groupModels.length === 0) return [];
@@ -3457,6 +3600,38 @@ function makeImageToTextModelOptionNodes(models, format) {
     !knownFormats.includes(model.format ?? "mlxDirectory")
   );
   return groupedNodes.concat(unknownModels.map(makeImageToTextModelOption));
+}
+
+function modelFormatDisplayName(format) {
+  const translationKey = {
+    mlxDirectory: "modelFormatMLX",
+    ggufDirectory: "modelFormatGGUF",
+    coreMLZip: "modelFormatCoreML",
+    coreMLPackage: "modelFormatCoreML",
+  }[format];
+  return translationKey ? t(translationKey) : format || "—";
+}
+
+function renderModelInfo(button, tooltip, model) {
+  const hasModel = Boolean(model);
+  button.disabled = !hasModel;
+  button.title = t(hasModel ? "modelInfo" : "modelInfoUnavailable");
+  button.setAttribute("aria-label", button.title);
+  if (!hasModel) {
+    tooltip.textContent = "";
+    return;
+  }
+  const lines = [
+    `${t("modelInfoName")}: ${model.displayName}`,
+    `${t("modelInfoFormat")}: ${modelFormatDisplayName(model.format)}`,
+  ];
+  if (model.repositoryID) lines.push(`${t("modelInfoSource")}: ${model.repositoryID}`);
+  if (model.weightsFileName) lines.push(`${t("modelInfoWeights")}: ${model.weightsFileName}`);
+  if (model.mmprojFileName) lines.push(`${t("modelInfoProjector")}: ${model.mmprojFileName}`);
+  if (model.auxiliaryRepositoryID) {
+    lines.push(`${t("modelInfoAuxiliarySource")}: ${model.auxiliaryRepositoryID}`);
+  }
+  tooltip.textContent = lines.join("\n");
 }
 
 function renderMCPWhitelist(settings) {
@@ -3580,6 +3755,165 @@ function renderGlobalSettings() {
           speed: textModelDownload.bytesPerSecond > 0
             ? formatByteCount(textModelDownload.bytesPerSecond)
             : "—",
+        })
+      : t("modelDownloadProgress", { progress });
+  }
+  elements.settingsTranslationModel.value = settings.translationModelDownloadDirectoryPath ?? "";
+  const translationModelOptions = settings.translationModelOptions ?? [];
+  const selectedTranslationModelFormat = normalizedImageToTextModelFormat(
+    localStorage.getItem(translationModelFormatStorageKey)
+  );
+  elements.settingsTranslationModelFormat.value = selectedTranslationModelFormat;
+  const filteredTranslationModelOptions = translationModelOptions.filter((model) =>
+    imageToTextModelMatchesFormat(model, selectedTranslationModelFormat)
+  );
+  const selectedTranslationModelIsVisible = filteredTranslationModelOptions.some(
+    (model) => model.id === settings.translationModelVariant
+  );
+  const selectedTranslationModelVariantForUI = selectedTranslationModelIsVisible
+    ? settings.translationModelVariant
+    : filteredTranslationModelOptions[0]?.id ?? settings.translationModelVariant;
+  const translationModelSignature = translationModelOptions.map((model) => [
+    model.id,
+    model.displayName,
+    model.recommended,
+    model.installed,
+    model.format,
+    model.repositoryID,
+    model.auxiliaryRepositoryID,
+    model.weightsFileName,
+    model.mmprojFileName,
+    t("recommended"),
+    t("modelDownloaded"),
+  ].join(":")).join("\n");
+  const translationModelOptionsSignature = `${selectedTranslationModelFormat}\n${translationModelSignature}`;
+  if (elements.settingsTranslationModelVariant.dataset.optionsSignature !== translationModelOptionsSignature) {
+    elements.settingsTranslationModelVariant.replaceChildren(
+      ...makeImageToTextModelOptionNodes(
+        filteredTranslationModelOptions,
+        selectedTranslationModelFormat
+      )
+    );
+    elements.settingsTranslationModelVariant.dataset.optionsSignature = translationModelOptionsSignature;
+  }
+  elements.settingsTranslationModelVariant.value = selectedTranslationModelVariantForUI;
+  const selectedTranslationModel = translationModelOptions.find(
+    (model) => model.id === selectedTranslationModelVariantForUI
+  );
+  renderModelInfo(
+    elements.settingsTranslationModelInfo,
+    elements.settingsTranslationModelInfoTooltip,
+    selectedTranslationModel
+  );
+  const selectedTranslationModelInstalled = selectedTranslationModel?.installed
+    ?? settings.translationModelInstalled;
+  const translationModelDownload = settings.modelDownloadState?.variantID
+    && translationModelOptions.some((model) => model.id === settings.modelDownloadState.variantID)
+    ? settings.modelDownloadState
+    : null;
+  const translationModelDownloading = Boolean(translationModelDownload);
+  const translationModelDirectorySelected = Boolean(settings.translationModelDownloadDirectoryPath);
+  elements.settingsTranslationModelDownload.disabled = !translationModelDirectorySelected
+    || selectedTranslationModelInstalled
+    || translationModelDownloading;
+  elements.settingsTranslationModelDownload.textContent = selectedTranslationModelInstalled
+    ? t("modelInstalled")
+    : translationModelDownloading ? t("downloadingModel") : t("downloadModel");
+  elements.settingsTranslationModelVariant.disabled = translationModelDownloading;
+  elements.settingsTranslationModelFormat.disabled = translationModelDownloading;
+  elements.settingsTranslationModelClear.disabled = !translationModelDownloading
+    && !settings.translationModelDownloadDirectoryPath
+    && !settings.translationModelPath;
+  elements.settingsTranslationModelClear.textContent = translationModelDownloading
+    ? t("stopDownload") : t("clear");
+  elements.settingsTranslationModelClear.classList.toggle("danger-text", translationModelDownloading);
+  elements.settingsTranslationModelDelete.hidden = !selectedTranslationModelInstalled;
+  elements.settingsTranslationModelDelete.disabled = translationModelDownloading || state.isProcessing;
+  elements.settingsTranslationModelDownloadProgress.hidden = !translationModelDownloading;
+  if (translationModelDownload) {
+    const progress = Math.round(translationModelDownload.progress * 100);
+    elements.settingsTranslationModelDownloadProgressBar.value = translationModelDownload.progress;
+    elements.settingsTranslationModelDownloadStatus.textContent = translationModelDownload.totalByteCount > 0
+      ? t("modelDownloadProgressDetail", {
+          progress,
+          downloaded: formatByteCount(translationModelDownload.downloadedByteCount),
+          total: formatByteCount(translationModelDownload.totalByteCount),
+          speed: translationModelDownload.bytesPerSecond > 0
+            ? formatByteCount(translationModelDownload.bytesPerSecond) : "—",
+        })
+      : t("modelDownloadProgress", { progress });
+  }
+  if (document.activeElement !== elements.settingsDFlashBlockSize) {
+    elements.settingsDFlashBlockSize.value = String(settings.dflashBlockSize ?? 5);
+  }
+  const dflashEnabled = settings.dflashEnabled ?? false;
+  elements.settingsImageToTextDFlashEnabled.checked = dflashEnabled;
+  elements.settingsTranslationDFlashEnabled.checked = dflashEnabled;
+  elements.settingsImageToTextDFlashEnabled.disabled = state.isProcessing;
+  elements.settingsTranslationDFlashEnabled.disabled = state.isProcessing;
+  elements.settingsDFlashBlockSize.disabled = state.isProcessing;
+  elements.settingsAgentModel.value = settings.agentModelDownloadDirectoryPath ?? "";
+  const agentModelOptions = settings.agentModelOptions ?? [];
+  const agentModelSignature = agentModelOptions.map((model) => [
+    model.id,
+    model.displayName,
+    model.recommended,
+    model.installed,
+    t("recommended"),
+    t("modelDownloaded"),
+  ].join(":")).join("\n");
+  if (elements.settingsAgentModelVariant.dataset.optionsSignature !== agentModelSignature) {
+    elements.settingsAgentModelVariant.replaceChildren(...agentModelOptions.map((model) => {
+      const option = document.createElement("option");
+      option.value = model.id;
+      const annotations = [];
+      if (model.recommended) annotations.push(t("recommended"));
+      if (model.installed) annotations.push(t("modelDownloaded"));
+      option.textContent = annotations.length > 0
+        ? `${model.displayName}（${annotations.join(" · ")}）`
+        : model.displayName;
+      return option;
+    }));
+    elements.settingsAgentModelVariant.dataset.optionsSignature = agentModelSignature;
+  }
+  elements.settingsAgentModelVariant.value = settings.agentModelVariant;
+  const agentModelDownload = settings.modelDownloadState?.variantID
+      && agentModelOptions.some((model) => model.id === settings.modelDownloadState.variantID)
+    ? settings.modelDownloadState
+    : null;
+  const agentModelDownloading = Boolean(agentModelDownload);
+  const agentModelDirectorySelected = Boolean(settings.agentModelDownloadDirectoryPath);
+  const selectedAgentModel = agentModelOptions.find(
+    (model) => model.id === settings.agentModelVariant
+  );
+  const selectedAgentModelInstalled = selectedAgentModel?.installed
+    ?? settings.agentModelInstalled;
+  elements.settingsAgentModelDownload.disabled = !agentModelDirectorySelected
+    || selectedAgentModelInstalled
+    || agentModelDownloading;
+  elements.settingsAgentModelDownload.textContent = selectedAgentModelInstalled
+    ? t("modelInstalled")
+    : agentModelDownloading ? t("downloadingModel") : t("downloadModel");
+  elements.settingsAgentModelVariant.disabled = agentModelDownloading;
+  elements.settingsAgentModelClear.disabled = !agentModelDownloading
+    && !settings.agentModelDownloadDirectoryPath
+    && !settings.agentModelPath;
+  elements.settingsAgentModelClear.textContent = agentModelDownloading
+    ? t("stopDownload") : t("clear");
+  elements.settingsAgentModelClear.classList.toggle("danger-text", agentModelDownloading);
+  elements.settingsAgentModelDelete.hidden = !selectedAgentModelInstalled;
+  elements.settingsAgentModelDelete.disabled = agentModelDownloading || state.isProcessing;
+  elements.settingsAgentModelDownloadProgress.hidden = !agentModelDownloading;
+  if (agentModelDownload) {
+    const progress = Math.round(agentModelDownload.progress * 100);
+    elements.settingsAgentModelDownloadProgressBar.value = agentModelDownload.progress;
+    elements.settingsAgentModelDownloadStatus.textContent = agentModelDownload.totalByteCount > 0
+      ? t("modelDownloadProgressDetail", {
+          progress,
+          downloaded: formatByteCount(agentModelDownload.downloadedByteCount),
+          total: formatByteCount(agentModelDownload.totalByteCount),
+          speed: agentModelDownload.bytesPerSecond > 0
+            ? formatByteCount(agentModelDownload.bytesPerSecond) : "—",
         })
       : t("modelDownloadProgress", { progress });
   }
@@ -4111,6 +4445,11 @@ function updateSettings() {
   const selectedImageToTextVariant = nextLocalizationMethod === "vlm"
     ? selectedLocalizationOption?.dataset.modelVariantID || null
     : null;
+  const previousTranslationModelMethod = state?.options.translationModelMethod ?? "imageToText";
+  const selectedTranslationOption = elements.translationModel.selectedOptions[0];
+  const nextTranslationModelMethod = selectedTranslationOption?.dataset.translationModelMethod
+    ?? previousTranslationModelMethod;
+  const selectedTranslationModelVariant = selectedTranslationOption?.dataset.modelVariantID || null;
   const previousColorizationColorRange = state?.options.colorizationColorRange ?? "unrestricted";
   const previousColorizationMode = state?.options.colorizationMode ?? "watercolor";
   const nextColorizationColorRange = elements.colorizationColorRange.value || "unrestricted";
@@ -4131,7 +4470,7 @@ function updateSettings() {
     renderTranslationLayer(activePage());
   }
   if (state) state.options.textLocalizationMethod = nextLocalizationMethod;
-  if (state) state.options.translationModelMethod = "imageToText";
+  if (state) state.options.translationModelMethod = nextTranslationModelMethod;
   if (state) state.options.colorizationColorRange = nextColorizationColorRange;
   if (state) state.options.colorizationMode = nextColorizationMode;
   const persistLocalizationModel = selectedImageToTextVariant
@@ -4156,9 +4495,11 @@ function updateSettings() {
       styleGuide: elements.translationStyleGuide.value,
     },
     useImageToImageRestoration: false,
-    imageToTextModelVariant: selectedImageToTextVariant,
+    translationModelMethod: nextTranslationModelMethod,
+    translationModelVariant: selectedTranslationModelVariant,
   })).catch((error) => {
     if (state) state.options.textLocalizationMethod = previousLocalizationMethod;
+    if (state) state.options.translationModelMethod = previousTranslationModelMethod;
     if (state) state.options.colorizationColorRange = previousColorizationColorRange;
     if (state) state.options.colorizationMode = previousColorizationMode;
     if (state && previousDefaultFont !== nextDefaultFont) {
@@ -4747,6 +5088,99 @@ document.querySelector("#choose-default-output-directory").addEventListener("cli
 document.querySelector("#reset-default-output-directory").addEventListener("click", () => {
   updateGlobalSettings({ defaultOutputDirectoryPath: null });
 });
+document.querySelector("#choose-translation-model").addEventListener("click", () => {
+  invoke("chooseModelDownloadDirectory", {
+    capability: "textToText",
+    modelRole: "translation",
+  })
+    .then((result) => {
+      if (!result?.path) return;
+      updateGlobalSettings({
+        translationModelDownloadDirectoryPath: result.path,
+        translationModelVariant: result.variant ?? state.globalSettings.translationModelVariant,
+      });
+    })
+    .catch(showError);
+});
+elements.settingsTranslationModelFormat.addEventListener("change", () => {
+  const format = normalizedImageToTextModelFormat(
+    elements.settingsTranslationModelFormat.value
+  );
+  localStorage.setItem(translationModelFormatStorageKey, format);
+  const settings = state?.globalSettings;
+  const filteredModelOptions = (settings?.translationModelOptions ?? []).filter((model) =>
+    imageToTextModelMatchesFormat(model, format)
+  );
+  const currentVariant = settings?.translationModelVariant;
+  const nextVariant = filteredModelOptions.some((model) => model.id === currentVariant)
+    ? currentVariant
+    : filteredModelOptions[0]?.id;
+  if (nextVariant && nextVariant !== currentVariant) {
+    elements.settingsTranslationModelVariant.value = nextVariant;
+    updateGlobalSettings({ translationModelVariant: nextVariant })
+      .then(() => renderGlobalSettings());
+  } else {
+    renderGlobalSettings();
+  }
+});
+elements.settingsTranslationModelVariant.addEventListener("change", () => {
+  updateGlobalSettings({
+    translationModelVariant: elements.settingsTranslationModelVariant.value,
+  });
+});
+elements.settingsTranslationModelDownload.addEventListener("click", () => {
+  invoke("downloadPreferredModel", {
+    capability: "textToText",
+    modelRole: "translation",
+    variantID: elements.settingsTranslationModelVariant.value,
+  }).catch(showError);
+});
+elements.settingsTranslationModelClear.addEventListener("click", () => {
+  if (state.globalSettings.modelDownloadState?.variantID
+      && (state.globalSettings.translationModelOptions ?? []).some(
+        (model) => model.id === state.globalSettings.modelDownloadState.variantID
+      )) {
+    invoke("cancelModelDownload").catch(showError);
+    return;
+  }
+  updateGlobalSettings({
+    translationModelPath: null,
+    translationModelDownloadDirectoryPath: null,
+  });
+});
+elements.settingsTranslationModelDelete.addEventListener("click", () => {
+  const settings = state.globalSettings;
+  if (!settings.translationModelInstalled) return;
+  const modelName = elements.settingsTranslationModelVariant.selectedOptions[0]?.textContent
+    ?? settings.translationModelVariant;
+  requestConfirmation(
+    t("deleteInstalledModelTitle"),
+    t("deleteInstalledModelConfirmation", { name: modelName }),
+    t("delete")
+  ).then((confirmed) => {
+    if (!confirmed) return;
+    return invoke("deleteInstalledModel", {
+      capability: "textToText",
+      modelRole: "translation",
+      variantID: elements.settingsTranslationModelVariant.value,
+    });
+  }).catch(showError);
+});
+[elements.settingsImageToTextDFlashEnabled, elements.settingsTranslationDFlashEnabled]
+  .forEach((control) => {
+    control.addEventListener("change", () => {
+      updateGlobalSettings({ dflashEnabled: control.checked });
+    });
+  });
+elements.settingsDFlashBlockSize.addEventListener("change", () => {
+  const blockSize = Number(elements.settingsDFlashBlockSize.value);
+  if (!Number.isInteger(blockSize) || blockSize < 2 || blockSize > 256) {
+    showError(new Error(t("invalidDFlashBlockSize")));
+    renderGlobalSettings();
+    return;
+  }
+  updateGlobalSettings({ dflashBlockSize: blockSize });
+});
 document.querySelector("#choose-image-to-text-model").addEventListener("click", () => {
   invoke("chooseModelDownloadDirectory", { capability: "imageToText" })
     .then((result) => {
@@ -4814,6 +5248,63 @@ elements.settingsImageToTextModelDelete.addEventListener("click", () => {
     return invoke("deleteInstalledModel", {
       capability: "imageToText",
       variantID: elements.settingsImageToTextModelVariant.value,
+    });
+  }).catch(showError);
+});
+document.querySelector("#choose-agent-model").addEventListener("click", () => {
+  invoke("chooseModelDownloadDirectory", {
+    capability: "textToText",
+    modelRole: "agent",
+  })
+    .then((result) => {
+      if (!result?.path) return;
+      updateGlobalSettings({
+        agentModelDownloadDirectoryPath: result.path,
+        agentModelVariant: result.variant ?? state.globalSettings.agentModelVariant,
+      });
+    })
+    .catch(showError);
+});
+elements.settingsAgentModelVariant.addEventListener("change", () => {
+  updateGlobalSettings({
+    agentModelVariant: elements.settingsAgentModelVariant.value,
+  });
+});
+elements.settingsAgentModelDownload.addEventListener("click", () => {
+  invoke("downloadPreferredModel", {
+    capability: "textToText",
+    modelRole: "agent",
+    variantID: elements.settingsAgentModelVariant.value,
+  }).catch(showError);
+});
+elements.settingsAgentModelClear.addEventListener("click", () => {
+  if (state.globalSettings.modelDownloadState?.variantID
+      && (state.globalSettings.agentModelOptions ?? []).some(
+        (model) => model.id === state.globalSettings.modelDownloadState.variantID
+      )) {
+    invoke("cancelModelDownload").catch(showError);
+    return;
+  }
+  updateGlobalSettings({
+    agentModelPath: null,
+    agentModelDownloadDirectoryPath: null,
+  });
+});
+elements.settingsAgentModelDelete.addEventListener("click", () => {
+  const settings = state.globalSettings;
+  if (!settings.agentModelInstalled) return;
+  const modelName = elements.settingsAgentModelVariant.selectedOptions[0]?.textContent
+    ?? settings.agentModelVariant;
+  requestConfirmation(
+    t("deleteInstalledModelTitle"),
+    t("deleteInstalledModelConfirmation", { name: modelName }),
+    t("delete")
+  ).then((confirmed) => {
+    if (!confirmed) return;
+    return invoke("deleteInstalledModel", {
+      capability: "textToText",
+      modelRole: "agent",
+      variantID: elements.settingsAgentModelVariant.value,
     });
   }).catch(showError);
 });
@@ -5029,7 +5520,6 @@ for (const control of [
   elements.readingDirection,
   elements.writingDirection,
   elements.fontName,
-  elements.textLocalizationMethod,
   elements.useImageModel,
   elements.translationPageContext,
   elements.translationReviewPass,
@@ -5039,6 +5529,19 @@ for (const control of [
 ]) {
   control.addEventListener("change", updateSettings);
 }
+elements.textLocalizationMethod.addEventListener("change", () => {
+  if (elements.textLocalizationMethod.value === "vlm") {
+    const localizationOption = elements.textLocalizationMethod.selectedOptions[0];
+    const variantID = localizationOption?.dataset.modelVariantID;
+    const translationOption = [...elements.translationModel.options].find((option) =>
+      option.dataset.translationModelMethod === "imageToText"
+        && option.dataset.modelVariantID === variantID
+    );
+    if (translationOption) elements.translationModel.value = variantID;
+  }
+  updateSettings();
+});
+elements.translationModel.addEventListener("change", updateSettings);
 elements.translationStyleGuide.addEventListener("change", updateSettings);
 
 window.addEventListener("error", (event) => {
