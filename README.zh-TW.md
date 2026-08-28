@@ -8,6 +8,8 @@
   <img src="AppPic/screen01.jpg" alt="MangaKitchen 應用程式畫面" width="800">
 </p>
 
+[下載最新的公證 DMG](https://github.com/VaderChen/MangaKitchen/releases/latest) · 需要 macOS 14 或更新版本
+
 ## 著作權與合法使用
 
 所有匯入 MangaKitchen 的漫畫原稿、角色、文字、美術、商標及其他內容，其著作權與相關權利均屬原作者、出版社、授權平台或各自的合法權利人。使用本工具不會移轉這些權利，也不代表使用者取得重製、翻譯、公開傳輸、散布或販售作品的授權。
@@ -139,6 +141,27 @@ GUI 無論 MCP 開關都會啟動；省略 `--mcp` 時使用設定 DLG 中保存
 
 資料儲存位置在重新啟動後生效；`imageToText`、`imageColorization` 與 `superResolution` 模型位置選取後立即切換。MCP 開關、連接埠與白名單變更時會重新啟動 listener。
 
+### SwiftPM 與 Metal 建置疑難排解
+
+MLX 依賴其內建 Metal 資源（`default.metallib`）。打包腳本會將應用程式專用的 `mlx.metallib` 建置一次並保存於 SwiftPM `.build` 快取之外的 `Artifacts/MLXMetal/<configuration>/`；`--clean` 不會在 MLX shader 原始碼未變更時重建它。如果 `swift test` 出現 `Failed to load the default metallib`，代表測試在初始化 MLX 時失敗，尚未進入 MangaKitchen GGUF loader；這不是 MangaKitchen 或 GGUF kernel 錯誤。
+
+先清理 SwiftPM 相依套件與建置快取：
+
+```bash
+swift package clean
+swift package resolve
+swift test
+```
+
+確認 Apple Metal 命令列工具可用：
+
+```bash
+xcrun --find metal
+xcrun --find metallib
+```
+
+兩個命令都應列出 Apple Metal toolchain 內的路徑。支援環境為 Apple Silicon、macOS 14 或更新版本，以及完整的 Xcode Command Line Tools／Metal 安裝。若命令可解析但 `default.metallib` 仍缺少，請修復或重新安裝 Command Line Tools、重新開啟終端機，再重做乾淨建置。`swift build` 成功只代表編譯通過；MLX runtime 測試還需要測試執行時存在 Metal 資源。
+
 專案索引、個別專案狀態與中間檔預設放在：
 
 ```text
@@ -188,6 +211,43 @@ App 以 `MLXTextRuntime` 提供純文字翻譯，並以 `MLXVLMRuntime` 提供 `
 ### DFlash 推測解碼
 
 「設定 → 模型 → 翻譯」或「多模態」可開啟相容 Qwen3／Qwen3.5 的 DFlash。App 會從所選主模型同一個模型根目錄自動尋找 Draft，讓文字與多模態模型在相同的 Metal runtime 上執行原生 Swift／MLX DFlash 1／2 推測解碼；不需要額外選取或保存 Draft 路徑。Qwen3-VL 與 Qwen3.5-VL 會先完成視覺 prefill，再進入相同的 speculative decoding；其他 VLM 架構會安全回退標準生成。這不會取代既有 Safetensors／MLX checkpoint 或 GGUF 載入。Draft 遺失、不相容、格式錯誤、生成設定不支援或初始化失敗時，App 會記錄原因並安全回退標準生成。Draft 權重不隨 App 內建發佈。
+
+### GGUF 權重
+
+`MLXTextRuntime` 與 `MLXVLMRuntime` 支援直接從模型目錄載入 `.gguf` 權重，不需要先轉成 Safetensors。正式 App 預設以 `group64`、`quality` profile 直接從 GGUF raw block 建立 MLX `wq/scales/biases`：`Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 目標為 `INT4`，`Q8_0`／`Q5_K`／`Q6_K` 目標為 `INT8`。開發者可用 `speed` profile 將 Q5_K／Q6_K 二次量化為 `INT4`，降低 decode 記憶體頻寬但可能降低品質；未指定時維持 `quality`。所有 GGUF F32／F16 compute 權重會轉為 BF16，唯一例外是 Qwen3.5 的 `blk.N.ssm_a`（`linear_attn.A_log`）保留 F32；mmproj 也會沿用相同 group size。其他未列出的 GGUF 量化型別（包含 `Q8_K`）會在 inspect 與載入前明確回報不支援。llama.cpp bridge 僅保留在 `Tools/GGUFBackendPOC` 作為 parser 對照，不是 App 的正式載入依賴。
+
+GGUF loader 會優先從主 `.gguf` 的 metadata 建立模型設定與 tokenizer；外部 `config.json`、`tokenizer.json`、`tokenizer_config.json` 僅作為 fallback。因此具備完整 GGUF metadata 的純文字模型可以只保留 `.gguf`；多模態模型仍必須提供配對的 `mmproj-*.gguf`。若 processor 設定不在目錄中，會由 `mmproj` metadata 建立基本設定。外部 tokenizer fallback 至少需要 `tokenizer.json`，`tokenizer_config.json` 可與內嵌或外部 tokenizer data 組合使用。
+
+`FP8`（包含 `F8_E4M3`／`F8_E5M2` 變體）仍採 `INT8` 重新量化；一般 GGUF `F16`／`F32` compute 權重則依上述規則轉成 BF16，僅 `blk.N.ssm_a` 保留 F32。目前 llama.cpp 的標準 GGUF 型別表沒有獨立的 FP8 tensor type，因此 Swift loader 不會把未知的 GGUF type 假裝成 FP8；`GGUFStoragePolicy.targetStorageType(for:)` 已固定 `quality` profile 的目標策略，`targetStorageType(for:profile:)` 可查詢速度 profile，待上游 parser 或其他 tensor 格式提供明確 FP8 encoding 後再接入實際解碼。
+
+```bash
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-GGUF \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128 \
+  --gguf-group-size 64 --gguf-profile quality
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-MLX-4bit \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
+```
+
+`GGUFSmoke` 與 `Tools/GGUFBackendPOC` 只供開發者進行格式、數值與效能驗證。`GGUFSmoke` 可用 `--gguf-profile quality|speed` 切換 Q5_K／Q6_K 的 INT8 或 INT4 目標；`quality` 是正式 App 預設值，`speed` 只適合在完成品質驗證後比較。它們的 benchmark 與 fixture 結果不會被 App 讀取，也不會決定 runtime 的模型選擇或品質門檻；正式載入只依 `GGUFStoragePolicy` 與 loader 的實際能力檢查。要比較不同格式，請在相同硬體與參數下分別執行上述命令，將結果視為當次測量，而非產品固定值。
+
+多模態 GGUF 不是只有主模型檔。模型目錄必須同時保留 `config.json`、Hugging Face tokenizer／chat template，以及與主模型配對的 `mmproj-*.gguf` 視覺投影檔；缺少 `mmproj` 時不會假裝以純文字模型載入。模型下載器會先檢查 repository 是否存在指定的 `mmproj`，只下載主 GGUF、該 `mmproj` 與必要的 Qwen 基礎設定檔，不會把其他 Q4／Q8 或 IQ GGUF 一起下載。
+
+可在 `mangakitchen-model.json` 指定權重檔：
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "local-llama-q4",
+  "displayName": "Local Llama Q4",
+  "capability": "imageToText",
+  "backend": "mlxSwift",
+  "weightsFile": "model-q4_0.gguf",
+  "weightsFormat": "gguf",
+  "mmprojFile": "mmproj-F16.gguf"
+}
+```
+
+模型目錄同時保留兩個 Qwen3.8 27B 選項：原本的 [`lmstudio-community/Qwen3.8-27B-MLX-4bit`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-MLX-4bit) checkpoint，以及新增的 [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Qwen3.8-27B-Q4_0.gguf`。GGUF 選項會搭配同 repository 的 `mmproj-F16.gguf`，tokenizer 與模型設定由 [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) 提供。若目錄同時有 GGUF 與 Safetensors checkpoint，未以 `weightsFormat: "gguf"` 或 GGUF 的 `weightsFile` 明確指定時，仍會使用既有的 `LLMModelFactory`／`VLMModelFactory` checkpoint 載入流程。
 
 ## Qwen Image Edit Worker
 

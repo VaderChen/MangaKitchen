@@ -8,6 +8,8 @@
   <img src="AppPic/screen01.jpg" alt="MangaKitchen 애플리케이션 화면" width="800">
 </p>
 
+[최신 공증 DMG 다운로드](https://github.com/VaderChen/MangaKitchen/releases/latest) · macOS 14 이상 필요
+
 ## 저작권 및 적법한 사용
 
 MangaKitchen으로 가져오는 만화 원고, 등장인물, 문구, 그림, 상표 및 기타 콘텐츠의 저작권과 관련 권리는 원작자, 출판사, 정식 라이선스 플랫폼 및 각 적법한 권리자에게 있습니다. 이 도구를 사용한다고 해서 해당 권리가 이전되거나 작품의 복제, 번역, 공개 전송, 배포 또는 판매 권한이 부여되는 것은 아닙니다.
@@ -33,7 +35,9 @@ GPLv3 자체도 상업적 사용과 유료 배포를 허용하지만 소스 코�
 - Command／Shift 다중 선택, 검색, 상태 필터, 선택 페이지의 마스크·번역·합성 일괄 처리.
 - 단일 순차 배치 큐, 현재 페이지, 성공／실패 수, 취소, 기록 정리 및 실패 페이지 재시도. 영역별 번역 중에는 현재 영역／전체 영역과 실제 진행률도 표시합니다.
 - 프로젝트별 다국어 용어집. 한 원문 용어에 여러 BCP-47 번역을 저장하고 현재 대상 언어에 맞게 자동 선택합니다.
+- 전역 설정에서 캔버스 선택 색상과 기본 출력 루트를 저장합니다. 새 프로젝트는 그 아래에 정리된 프로젝트 이름의 하위 폴더를 만들며 기존 프로젝트의 명시적 출력 위치는 덮어쓰지 않습니다.
 - 번역은 페이지, 텍스트／마스크와 글자 제거 배경, 번역／조판 미리보기, 출력 저장의 4단계를 사용합니다. 컬러화는 별도 4단계와 독립 상태를 사용합니다.
+- 단계별 산출물 소유권을 분리한 재개 가능한 워크플로를 제공하며, 이후 단계가 이전 단계를 암묵적으로 다시 실행하지 않습니다.
 - 이미지마다 버전이 지정된 `.str` JSON을 만들고 텍스트, 위치, 글꼴, 고정／자동 크기 및 마스크 스트로크를 저장합니다.
 - 원본 이미지의 픽셀 레이어에서 팽창하여 안티앨리어싱 가장자리를 포함한 뒤 정규화 브러시로 마스크를 추가·삭제·영역별 실행 취소하고 이진 PNG를 생성합니다. 각 run 사각형을 벡터 선으로 그리는 방식은 제거하여 회색 가장자리를 방지합니다. 2단계 완료 후 이미지→이미지 모델을 시작하지 않고 원문을 제거한 CPU／GPU 마스크 확인 미리보기를 즉시 표시합니다.
 - 내장된 manga109 말풍선 분할 Core ML 모델이 Apple Neural Engine을 우선 사용하여 흑백 만화의 대화 BBOX와 말풍선 형상을 만듭니다. 2단계는 항상 확인된 말풍선을 원본 이미지 픽셀에서 글자 마스크로 정밀화하며 OCR／VLM 선택은 이 마스크 경로를 바꾸지 않습니다. Apple Vision OCR은 사용하지 않습니다. 효과음, 페이지 번호, 하단 정보, 인물 및 빈 영역은 주 처리 흐름에서 제외합니다.
@@ -46,6 +50,10 @@ GPLv3 자체도 상업적 사용과 유료 배포를 허용하지만 소스 코�
 - 대화 상자 반전 마스크와 다운로드형 DDColor Tiny Core ML을 사용하는 별도 4단계 컬러화 흐름. 번역 출력이 있으면 우선 입력으로 사용하고 없으면 원본으로 대체하며, 컬러화 상태·미리보기·출력은 번역 흐름과 분리됩니다. DDColor Tiny가 사용하지 않는 색상 범위와 컬러화 모드 카드는 현재 비활성화됩니다.
 - 대화 텍스트 마스크는 하나 이상의 픽셀 형상으로 원문을 덮고 말풍선 경계에서 잘린 뒤 브러시 추가·지우기를 겹칠 수 있습니다. 이미지 모델이 없으면 CPU 또는 Metal GPU 복원을 선택할 수 있습니다.
 - HTML/CSS를 번역 조판의 유일한 기준으로 사용하며 가로／세로 쓰기, 고정 또는 자동 글자 크기, 드래그와 영역 크기 조정을 지원합니다. 최종 PNG도 WebKit이 동일한 텍스트 레이어를 렌더링하므로 3단계 배치가 출력 시 다른 방식으로 바뀌지 않습니다.
+- WebKit은 실제 SR 픽셀 크기로 3단계 미리보기를 렌더링하고 4단계는 이를 다시 만들지 않고 저장합니다. 2×／4× 초고해상도는 이전 1× 출력을 무효화하여 PNG와 PSD가 SR 이전 이미지로 되돌아가지 않게 합니다.
+- 편집기는 영역 추가, 복제, 삭제, 정렬과 페이지마다 최대 50개의 undo／redo를 지원합니다. 캔버스는 가로·세로로 이동할 수 있고 스크롤 확대／축소는 보이는 캔버스 중심을 기준으로 합니다. 텍스트 레이어는 표시, 투명도, 회전, 정렬, 글자색, 외곽선 및 설치된 글꼴의 즉시 미리보기를 지원합니다.
+- PSD의 병합 미리보기, 글자별 Raster Layer, 깨끗한 배경 및 숨겨진 원본은 HTML/CSS 렌더링 결과에서 함께 만들어집니다. 초고해상도 적용 후에도 사용 가능한 모든 레이어는 같은 확대 크기를 유지합니다.
+- 이미지, 폴더, ZIP／CBZ, RAR／CBR, PDF를 프로젝트로 가져오거나 추가할 수 있으며 페이지 이름 변경, 정렬, 삭제를 지원합니다. 가져온 데이터는 관리 폴더로 복사, 압축 해제 또는 래스터화됩니다.
 - 임의 파일을 노출하지 않고 제한된 사용자 정의 URL Scheme로 원본／출력 이미지를 Web UI에 제공합니다.
 - 프로젝트 색인과 상태를 버전 JSON으로 자동 저장하고 쓰기 전 이전 버전을 `.bak`으로 보존한 뒤 시작 시 검증하여 복원합니다.
 - 선택 사항인 macOS 26 Swift/MLX Qwen Image Edit worker. 마스크를 모델 조건과 최종 합성 범위에 모두 사용합니다.
@@ -55,6 +63,7 @@ GPLv3 자체도 상업적 사용과 유료 배포를 허용하지만 소스 코�
 - **Think Mode (Beta)** 는 기본적으로 꺼져 있습니다. 짧은 추론을 안전한 Markdown으로 표시하고 LOG에 저장하지 않으며, 완전한 JSON이 없으면 같은 모델로 비사고 최종 JSON을 생성합니다.
 - 도구 막대에서 메모리 내 LOG를 열고 지울 수 있습니다. 하단 상태 막대의 GPU, MEMORY, 해상도, 배율은 transient 경로로 갱신되어 선택이나 드래그를 방해하지 않습니다.
 - 시작 시 GitHub 최신 안정 버전을 확인하고, ‘설정 → 정보’에 공식 GitHub／Releases URL과 수동 ‘업데이트 확인’을 표시합니다. App은 공식 경로만 열며 자동으로 다운로드하거나 설치하지 않습니다.
+- 로컬 번역은 페이지 전체 문맥 초안, 전체 2차 교정, 직역 초안／표시 번역 분리, 역할과 말투 표기, 신뢰도 및 deterministic QA를 지원합니다. MCP는 외부 Provider 확장 경계이며 Agent가 처리 결과를 App에 다시 씁니다.
 
 ## 두 가지 번역 방식과 독립 컬러화 흐름
 
@@ -127,6 +136,27 @@ GUI는 항상 시작됩니다. `--mcp`를 생략하면 저장된 설정을 사�
 
 데이터 저장 위치 변경은 다시 시작한 뒤 적용됩니다. `imageToText`, `imageColorization`, `superResolution` 모델 변경은 즉시 적용되며 MCP 스위치, 포트 또는 허용 목록 변경 시 listener를 재시작합니다.
 
+### SwiftPM 및 Metal 빌드 문제 해결
+
+MLX는 포함된 Metal 리소스(`default.metallib`)에 의존합니다. 패키징 스크립트는 앱 전용 `mlx.metallib`를 한 번 빌드한 뒤 SwiftPM의 `.build` 캐시 밖인 `Artifacts/MLXMetal/<configuration>/`에 보관합니다. MLX shader 소스가 바뀌지 않으면 `--clean`을 실행해도 다시 빌드하지 않습니다. `swift test`가 `Failed to load the default metallib`에서 멈추면 MLX 초기화 중 실패한 것이며 MangaKitchen GGUF loader까지 도달하지 않은 것입니다. 이는 MangaKitchen 또는 GGUF kernel 오류가 아닙니다.
+
+SwiftPM 의존성과 빌드 캐시를 정리합니다.
+
+```bash
+swift package clean
+swift package resolve
+swift test
+```
+
+Apple Metal 명령줄 도구를 확인합니다.
+
+```bash
+xcrun --find metal
+xcrun --find metallib
+```
+
+두 명령 모두 Apple Metal toolchain 내부의 경로를 출력해야 합니다. 지원 환경은 Apple Silicon, macOS 14 이상, 완전한 Xcode Command Line Tools／Metal 설치입니다. 명령이 정상적으로 경로를 찾는데도 `default.metallib`가 없다면 Command Line Tools를 복구하거나 재설치하고 터미널을 다시 연 다음 클린 빌드를 반복합니다. `swift build` 성공은 컴파일만 확인하며, MLX runtime 테스트는 실행 시 Metal 리소스도 필요합니다.
+
 기본 데이터 저장 위치:
 
 ```text
@@ -163,6 +193,45 @@ App은 텍스트 전용 번역을 `MLXTextRuntime`으로, `mlx-swift-lm`이 지�
 3. 표시 이름이나 생성 설정을 명시적으로 덮어쓸 때만 `Examples/Models/MLXVLMModel/mangakitchen-model.json`을 추가합니다.
 
 단일 safetensors 파일만으로는 충분하지 않습니다. `config.json`, tokenizer 및 chat template를 함께 보존해야 합니다. 다른 멀티모달 모델은 processor 설정도 보존해야 합니다. `vision_config`가 있는 Qwen3.5 체크포인트에서 `processor_config.json`과 `preprocessor_config.json`이 없으면 factory가 `config.json`에서 호환 가능한 Qwen3VLProcessor 설정을 추론합니다.
+
+### DFlash speculative decoding
+
+번역 및 멀티모달 모델 설정에서 호환되는 Qwen3／Qwen3.5 대상에 DFlash를 켤 수 있습니다. App은 선택한 대상 모델과 같은 모델 루트에서 Draft를 자동으로 찾으므로 Draft 경로를 따로 저장하지 않습니다. 네이티브 Swift／MLX 구현은 대상 모델과 같은 Metal runtime을 사용하며 기존 Safetensors／MLX checkpoint 또는 GGUF 로딩을 대체하지 않습니다. Qwen3-VL과 Qwen3.5-VL은 vision-aware prefill 후 같은 speculative decoding loop에 들어가고, 다른 VLM 아키텍처는 표준 생성으로 안전하게 fallback합니다. Draft가 없거나 호환되지 않거나 유효하지 않거나 지원하지 않는 생성 설정을 만나면 이유를 LOG에 기록하고 표준 생성으로 돌아갑니다. Draft 가중치는 App에 포함되지 않습니다.
+
+### GGUF 가중치
+
+`MLXTextRuntime`과 `MLXVLMRuntime`은 Safetensors로 먼저 변환하지 않고 모델 폴더의 `.gguf` 가중치를 직접 로드합니다. 정식 App은 기본적으로 `group64`와 `quality` profile을 사용하여 GGUF raw block에서 MLX `wq/scales/biases`를 만듭니다. `Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K`는 `INT4`, `Q8_0`／`Q5_K`／`Q6_K`는 `INT8`을 목표로 합니다. `speed` profile은 Q5_K／Q6_K를 `INT4`로 재양자화하여 decode 메모리 대역폭을 줄일 수 있지만 품질이 낮아질 수 있습니다. profile을 지정하지 않으면 `quality`를 사용합니다. 모든 GGUF F32／F16 compute 가중치는 BF16으로 변환하고, Qwen3.5의 `blk.N.ssm_a`(`linear_attn.A_log`)만 F32로 유지합니다. `mmproj`도 같은 group size를 사용합니다. 목록에 없는 GGUF 양자화 형식(`Q8_K` 포함)은 inspect 및 로드 전에 지원되지 않는 것으로 명시합니다. llama.cpp bridge는 parser 비교를 위해 `Tools/GGUFBackendPOC`에만 남아 있으며 정식 App 로드 의존성이 아닙니다.
+
+GGUF loader는 우선 기본 `.gguf`의 metadata에서 모델 설정과 tokenizer를 만들고 외부 `config.json`, `tokenizer.json`, `tokenizer_config.json`은 fallback으로만 사용합니다. 완전한 GGUF metadata가 있는 텍스트 모델은 `.gguf` 하나만 남겨도 됩니다. 멀티모달 모델은 대응하는 `mmproj-*.gguf`를 제공해야 합니다. 폴더에 processor 설정이 없으면 `mmproj` metadata에서 기본 설정을 만듭니다. 외부 tokenizer fallback에는 최소한 `tokenizer.json`이 필요하며 `tokenizer_config.json`은 내장 또는 외부 tokenizer data와 함께 사용할 수 있습니다.
+
+`FP8`(`F8_E4M3`／`F8_E5M2` 변형 포함)은 계속 `INT8`로 재양자화합니다. 일반 GGUF `F16`／`F32` compute 가중치는 위 규칙에 따라 BF16으로 바꾸고 `blk.N.ssm_a`만 F32으로 유지합니다. 표준 llama.cpp GGUF type table에는 독립적인 FP8 tensor type이 없으므로 Swift loader는 알 수 없는 GGUF type을 FP8이라고 처리하지 않습니다. `GGUFStoragePolicy.targetStorageType(for:)`는 `quality` profile의 목표 전략을 고정하며 `targetStorageType(for:profile:)`로 speed profile을 조회할 수 있습니다.
+
+```bash
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-GGUF \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128 \
+  --gguf-group-size 64 --gguf-profile quality
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-MLX-4bit \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
+```
+
+`GGUFSmoke`와 `Tools/GGUFBackendPOC`는 형식, 수치 및 성능을 검증하는 개발자 전용 도구입니다. `GGUFSmoke`는 `--gguf-profile quality|speed`로 Q5_K／Q6_K의 INT8 또는 INT4 목표를 전환할 수 있습니다. `quality`는 정식 App의 기본값이고 `speed`는 품질 검증 후 비교할 때만 사용합니다. benchmark와 fixture 결과는 App이 읽지 않으며 runtime 모델 선택이나 품질 기준을 결정하지 않습니다. 형식을 비교할 때는 같은 하드웨어와 매개변수로 위 명령을 각각 실행하고 결과를 제품의 고정값이 아닌 해당 측정값으로 취급합니다.
+
+멀티모달 GGUF는 기본 모델 파일만으로 충분하지 않습니다. 모델 폴더에 `config.json`, Hugging Face tokenizer／chat template 및 기본 모델과 짝을 이루는 `mmproj-*.gguf` vision projection 파일을 함께 보관해야 합니다. `mmproj`가 없으면 텍스트 모델인 것처럼 로드하지 않습니다. 모델 다운로더는 repository에 지정된 `mmproj`가 있는지 먼저 확인하고 기본 GGUF, 해당 `mmproj` 및 필요한 Qwen 기본 설정 파일만 다운로드합니다.
+
+`mangakitchen-model.json`에서 가중치 파일을 지정할 수 있습니다.
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "local-llama-q4",
+  "displayName": "Local Llama Q4",
+  "capability": "imageToText",
+  "backend": "mlxSwift",
+  "weightsFile": "model-q4_0.gguf",
+  "weightsFormat": "gguf",
+  "mmprojFile": "mmproj-F16.gguf"
+}
+```
 
 ## Qwen Image Edit Worker
 

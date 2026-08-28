@@ -1,6 +1,6 @@
 # MangaKitchen
 
-[繁體中文](README.zh-TW.md) | English | [日本語](README.ja.md) | [한국어](README.ko.md)
+[Traditional Chinese](README.zh-TW.md) | English | [Japanese](README.ja.md) | [Korean](README.ko.md)
 
 MangaKitchen is a native macOS workspace for translating comics. Its frontend remains HTML + JavaScript, while the Swift Package backend is separated into a domain core, a Metal/Core ML runtime, and a WKWebView app. The core focuses on model boundaries, page-by-page workflows, dialogue regions, masks, and typesetting without coupling them to a particular UI layout.
 
@@ -203,13 +203,13 @@ The Translation and Multimodal model settings can enable DFlash for compatible Q
 
 The `mlx-swift-lm` factory selects architecture from `config.json`, so a single safetensors file is not enough. Keep the tokenizer, chat template, and config files together. Other multimodal models should also retain their processor configuration; for Qwen3.5 checkpoints with `vision_config`, the factory derives a compatible Qwen3VLProcessor configuration when `processor_config.json` and `preprocessor_config.json` are absent.
 
-### GGUF 權重
+### GGUF Weights
 
-`MLXTextRuntime` 與 `MLXVLMRuntime` 支援直接從模型目錄載入 `.gguf` 權重，不需要先轉成 Safetensors。正式 App 預設以 `group64`、`quality` profile 直接從 GGUF raw block 建立 MLX `wq/scales/biases`：`Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` 目標為 `INT4`，`Q8_0`／`Q5_K`／`Q6_K` 目標為 `INT8`。開發者可用 `speed` profile 將 Q5_K／Q6_K 二次量化為 `INT4`，降低 decode 記憶體頻寬但可能降低品質；未指定時維持 `quality`。所有 GGUF F32／F16 compute 權重會轉為 BF16，唯一例外是 Qwen3.5 的 `blk.N.ssm_a`（`linear_attn.A_log`）保留 F32；mmproj 也會沿用相同 group size。其他未列出的 GGUF 量化型別（包含 `Q8_K`）會在 inspect 與載入前明確回報不支援。llama.cpp bridge 僅保留在 `Tools/GGUFBackendPOC` 作為 parser 對照，不是 App 的正式載入依賴。
+`MLXTextRuntime` and `MLXVLMRuntime` support loading `.gguf` weights directly from a model directory without converting them to Safetensors first. The production App uses the `group64` and `quality` profile by default to build MLX `wq/scales/biases` directly from GGUF raw blocks: `Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K` target `INT4`, while `Q8_0`／`Q5_K`／`Q6_K` target `INT8`. Developers can use the `speed` profile to requantize Q5_K／Q6_K to `INT4`, reducing decode memory bandwidth at the possible cost of quality; `quality` remains the default when no profile is specified. All GGUF F32／F16 compute weights are converted to BF16, except Qwen3.5 `blk.N.ssm_a` (`linear_attn.A_log`), which remains F32; `mmproj` uses the same group size. Other GGUF quantization types not listed here, including `Q8_K`, are explicitly reported as unsupported during inspection and before loading. The llama.cpp bridge remains only under `Tools/GGUFBackendPOC` for parser comparison and is not a production App loading dependency.
 
-GGUF loader 會優先從主 `.gguf` 的 metadata 建立模型設定與 tokenizer；外部 `config.json`、`tokenizer.json`、`tokenizer_config.json` 僅作為 fallback。因而具備完整 GGUF metadata 的純文字模型可以只保留 `.gguf`，多模態模型仍必須提供配對的 `mmproj-*.gguf`；若 processor 設定不在目錄中，會由 `mmproj` metadata 建立基本設定。外部 tokenizer fallback 至少需要 `tokenizer.json`，`tokenizer_config.json` 可與內嵌或外部 tokenizer data 組合使用。
+The GGUF loader first uses metadata embedded in the primary `.gguf` to build the model configuration and tokenizer; external `config.json`, `tokenizer.json`, and `tokenizer_config.json` files are fallback sources only. A text-only model with complete GGUF metadata can therefore consist of only the `.gguf` file. A multimodal model must still provide its matching `mmproj-*.gguf`; if processor settings are absent from the directory, basic settings are built from `mmproj` metadata. The external tokenizer fallback requires at least `tokenizer.json`; `tokenizer_config.json` can be combined with embedded or external tokenizer data.
 
-`FP8`（包含 `F8_E4M3`／`F8_E5M2` 變體）仍採 `INT8` 重新量化；一般 GGUF `F16`／`F32` compute 權重則依上述規則轉成 BF16，僅 `blk.N.ssm_a` 保留 F32。目前 llama.cpp 的標準 GGUF 型別表沒有獨立的 FP8 tensor type，因此 Swift loader 不會把未知的 GGUF type 假裝成 FP8；`GGUFStoragePolicy.targetStorageType(for:)` 已固定 `quality` profile 的目標策略，`targetStorageType(for:profile:)` 可查詢速度 profile，待上游 parser 或其他 tensor 格式提供明確 FP8 encoding 後再接入實際解碼。
+`FP8`, including the `F8_E4M3`／`F8_E5M2` variants, is still requantized to `INT8`. General GGUF `F16`／`F32` compute weights follow the rules above and are converted to BF16, with only `blk.N.ssm_a` remaining F32. The standard llama.cpp GGUF type table currently has no independent FP8 tensor type, so the Swift loader does not pretend that an unknown GGUF type is FP8. `GGUFStoragePolicy.targetStorageType(for:)` fixes the target strategy for the `quality` profile, while `targetStorageType(for:profile:)` can query the speed profile. Actual FP8 decoding can be added once an upstream parser or another tensor format provides an explicit FP8 encoding.
 
 ```bash
 swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-GGUF \
@@ -219,11 +219,11 @@ swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-MLX-4bit \
   --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
 ```
 
-`GGUFSmoke` 與 `Tools/GGUFBackendPOC` 只供開發者進行格式、數值與效能驗證。`GGUFSmoke` 可用 `--gguf-profile quality|speed` 切換 Q5_K／Q6_K 的 INT8 或 INT4 目標；`quality` 是正式 App 預設值，`speed` 只適合在完成品質驗證後比較。它們的 benchmark 與 fixture 結果不會被 App 讀取，也不會決定 runtime 的模型選擇或品質門檻；正式載入只依 `GGUFStoragePolicy` 與 loader 的實際能力檢查。要比較不同格式，請在相同硬體與參數下分別執行上述命令，將結果視為當次測量，而非產品固定值。
+`GGUFSmoke` and `Tools/GGUFBackendPOC` are intended only for developer validation of format handling, numerical behavior, and performance. `GGUFSmoke` accepts `--gguf-profile quality|speed` to switch the Q5_K／Q6_K target between INT8 and INT4; `quality` is the production App default, while `speed` is intended for comparison only after quality has been validated. The benchmark and fixture results are not read by the App and do not determine runtime model selection or quality thresholds; production loading relies only on the actual checks in `GGUFStoragePolicy` and the loader. To compare formats, run the commands above separately with the same hardware and parameters, and treat the results as measurements for that run rather than fixed product values.
 
-多模態 GGUF 不是只有主模型檔。模型目錄必須同時保留 `config.json`、Hugging Face tokenizer／chat template，以及與主模型配對的 `mmproj-*.gguf` 視覺投影檔；缺少 `mmproj` 時不會假裝以純文字模型載入。模型下載器會先檢查 repository 是否存在指定的 `mmproj`，只下載主 GGUF、該 `mmproj` 與必要的 Qwen 基礎設定檔，不會把其他 Q4／Q8 或 IQ GGUF 一起下載。
+Multimodal GGUF models require more than the primary model file. The model directory must also retain `config.json`, the Hugging Face tokenizer／chat template, and the `mmproj-*.gguf` vision projection file paired with the primary model; without `mmproj`, the loader does not masquerade as a text-only model. The model downloader first checks whether the repository contains the requested `mmproj`, then downloads only the primary GGUF, that `mmproj`, and the required Qwen base configuration files. It does not download other Q4／Q8 or IQ GGUF files.
 
-可在 `mangakitchen-model.json` 指定權重檔：
+Specify the weight files in `mangakitchen-model.json`:
 
 ```json
 {
@@ -238,7 +238,7 @@ swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-MLX-4bit \
 }
 ```
 
-模型目錄同時保留兩個 Qwen3.8 27B 選項：原本的 [`lmstudio-community/Qwen3.8-27B-MLX-4bit`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-MLX-4bit) checkpoint，以及新增的 [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Qwen3.8-27B-Q4_0.gguf`。GGUF 選項會搭配同 repository 的 `mmproj-F16.gguf`，tokenizer 與模型設定由 [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) 提供。若目錄同時有 GGUF 與 Safetensors checkpoint，未以 `weightsFormat: "gguf"` 或 GGUF 的 `weightsFile` 明確指定時，仍會使用既有的 `LLMModelFactory`／`VLMModelFactory` checkpoint 載入流程。
+The model catalog retains two Qwen3.8 27B options: the original [`lmstudio-community/Qwen3.8-27B-MLX-4bit`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-MLX-4bit) checkpoint and the new [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Qwen3.8-27B-Q4_0.gguf`. The GGUF option uses the `mmproj-F16.gguf` from the same repository, while the tokenizer and model configuration are provided by [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B). If a directory contains both GGUF and Safetensors checkpoints, the existing `LLMModelFactory`／`VLMModelFactory` checkpoint loading path remains in use unless `weightsFormat: "gguf"` or a GGUF `weightsFile` is explicitly specified.
 
 ## Qwen Image Edit Worker
 

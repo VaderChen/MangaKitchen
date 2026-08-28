@@ -8,6 +8,8 @@
   <img src="AppPic/screen01.jpg" alt="MangaKitchen アプリケーション画面" width="800">
 </p>
 
+[最新の公証済み DMG をダウンロード](https://github.com/VaderChen/MangaKitchen/releases/latest) · macOS 14以降が必要です
+
 ## 著作権と適法な利用
 
 MangaKitchenに読み込まれる漫画原稿、キャラクター、文章、作画、商標その他のコンテンツに関する著作権および関連する権利は、原作者、出版社、正規配信プラットフォーム、その他それぞれの正当な権利者に帰属します。本ツールを使用してもこれらの権利は移転せず、作品の複製、翻訳、公衆送信、配布、販売の許諾が与えられるものではありません。
@@ -33,7 +35,9 @@ GPLv3自体も商用利用と有償配布を認めていますが、ソースコ
 - Command／Shiftによる複数選択、検索、状態フィルタ、選択ページのマスク・翻訳・合成の一括処理。
 - 単一の逐次バッチキュー、現在ページ、成功／失敗数、キャンセル、履歴消去、失敗ページの再試行。領域単位の翻訳中は現在の領域／総領域数と実際の進捗も表示します。
 - プロジェクトごとの多言語用語集。1つの原語に複数のBCP-47翻訳を保存し、対象言語に応じて自動選択します。
+- グローバル設定でキャンバス選択色と既定の出力ルートを保存できます。新規プロジェクトはその配下に安全化したプロジェクト名のフォルダを作成し、既存プロジェクトの明示的な出力先は置き換えません。
 - 翻訳は4段階で、ページ、文字／マスクと文字消去済み背景、翻訳／組版プレビュー、出力保存を分離します。カラー化は別の4段階と独立状態を使用します。
+- 各段階が管理する成果物を分離し、後の段階が前の段階を暗黙に再実行しない再開可能なワークフローを提供します。
 - 画像ごとのバージョン付き`.str` JSONに、文字、位置、フォント、固定／自動サイズ、マスクストロークを保存。
 - 原画像のピクセル層で膨張してアンチエイリアスの縁を取り込み、正規化ブラシでマスクを追加・消去・領域単位に取り消して二値PNGを生成します。各run矩形をベクター描画する方式は廃止し、灰色の毛羽立ちを防ぎます。ステップ2の完了後、画像編集モデルを起動せず、原文を消去したCPU／GPUマスク確認プレビューを直ちに表示します。
 - 同梱の manga109 吹き出し分割 Core ML モデルが、Apple Neural Engine を優先して白黒漫画の対話 BBOX と吹き出し形状を生成します。ステップ2は常にその吹き出しを原画像ピクセルから文字マスクへ精修し、OCR／VLM の選択でこのマスク処理は変化しません。Apple Vision OCR は使用しません。効果音、ページ番号、フッター情報、人物、空白領域は主処理から除外します。
@@ -46,6 +50,10 @@ GPLv3自体も商用利用と有償配布を認めていますが、ソースコ
 - 反吹き出しマスクとダウンロード式DDColor Tiny Core MLを使う独立した4段階カラー化フロー。翻訳済み出力があれば優先し、なければ原稿へフォールバックします。カラー化の状態、プレビュー、出力は翻訳フローと分離されます。DDColor Tinyが利用しない色数範囲とカラー化モードのカードは現在無効です。
 - 台詞マスクは1つ以上のピクセル形状で元文字を覆い、吹き出し境界でクリップした上でブラシによる追加・消去を重ねられます。画像モデルがない場合はCPUまたはMetal GPU修復を選択できます。
 - HTML/CSSを翻訳組版の唯一の基準とし、横書き／縦書き、固定または自動文字サイズ、ドラッグ、領域サイズ変更に対応します。最終PNGもWebKitが同じ文字レイヤーを描画するため、ステップ3の組版が出力時に別方式へ置き換わりません。
+- WebKitは実際のSRピクセルサイズでステップ3のプレビューを描画し、ステップ4はそのプレビューを再構築せず保存します。2×／4×超解像は古い1×出力を無効化して、PNGとPSDがSR前の画像へ戻らないようにします。
+- エディターは領域の追加、複製、削除、並べ替えと、ページごとに最大50件のundo／redoに対応します。キャンバスは水平・垂直にパンでき、スクロールズームは表示キャンバスの中心を基準にします。テキストレイヤーは表示、透明度、回転、整列、文字色、縁取り、インストール済みフォントの即時プレビューに対応します。
+- PSDは結合プレビュー、文字ごとのRaster Layer、クリーン背景、非表示の原稿をHTML/CSSの描画結果からまとめます。超解像後は利用可能な全レイヤーが同じ拡大後サイズを保ちます。
+- 画像、フォルダ、ZIP／CBZ、RAR／CBR、PDFをプロジェクトへ追加・取り込みでき、ページの名前変更、並べ替え、削除にも対応します。取り込んだデータは管理対象フォルダへコピー、展開、またはラスタライズされます。
 - 任意のファイルを公開せず、制限付きカスタムURL SchemeでWeb UIに原稿と出力画像を提供。
 - プロジェクト索引と状態をバージョン付きJSONとして自動保存。書き込み前に旧版を`.bak`として残し、起動時に検証して復元。
 - オプションのmacOS 26 Swift/MLX Qwen Image Edit worker。マスクをモデル条件と最終合成範囲の両方に使用。
@@ -55,6 +63,7 @@ GPLv3自体も商用利用と有償配布を認めていますが、ソースコ
 - **Think Mode (Beta)** は既定でオフです。短い推論を安全な Markdown で表示し、推論を LOG に保存しません。完全な JSON が得られなければ、同じモデルで非思考の最終 JSON を生成します。
 - ツールバーからメモリ内 LOG を開いて消去できます。下部ステータスバーの GPU、MEMORY、解像度、倍率は transient 更新され、選択やドラッグ操作を中断しません。
 - 起動時に GitHub の最新安定版を確認し、「設定 → 情報」に公式 GitHub／Releases URL と手動の「更新を確認」を表示します。App は公式パスだけを開き、自動ダウンロードやインストールは行いません。
+- ローカル翻訳ではページ全体の文脈、二次校正、直訳稿と表示訳の分離、役割・口調、信頼度、deterministic QAを設定できます。MCPは外部Providerとの拡張境界として機能し、Agentが処理結果をアプリへ書き戻します。
 
 ## 翻訳の2つの利用方法と独立したカラー化フロー
 
@@ -127,6 +136,27 @@ GUIは常に起動します。`--mcp`を省略すると保存済み設定を使�
 
 データ保存先の変更は再起動後に反映されます。`imageToText`、`imageColorization`、`superResolution`モデルの変更は即時反映され、MCPスイッチ、ポート、許可リストの変更時はlistenerが再起動します。
 
+### SwiftPMとMetalのトラブルシューティング
+
+MLXは同梱Metalリソース（`default.metallib`）に依存します。パッケージングスクリプトはアプリ専用の`mlx.metallib`を一度だけビルドし、SwiftPMの`.build`キャッシュ外にある`Artifacts/MLXMetal/<configuration>/`へ保存します。MLX shaderのソースが変わらない限り、`--clean`でも再ビルドしません。`swift test`が`Failed to load the default metallib`で停止した場合、MLXの初期化中に失敗しており、MangaKitchenのGGUF loaderには到達していません。これはMangaKitchenやGGUF kernelのエラーではありません。
+
+SwiftPMの依存関係とビルドキャッシュをクリーンにします。
+
+```bash
+swift package clean
+swift package resolve
+swift test
+```
+
+Apple Metalのコマンドラインツールを確認します。
+
+```bash
+xcrun --find metal
+xcrun --find metallib
+```
+
+両方ともApple Metal toolchain内のパスを表示する必要があります。対応環境はApple Silicon、macOS 14以降、完全なXcode Command Line Tools／Metal環境です。コマンドが解決できても`default.metallib`がない場合はCommand Line Toolsを修復または再インストールし、ターミナルを開き直してクリーンビルドをやり直してください。`swift build`の成功はコンパイル成功だけを示し、MLX runtimeテストには実行時のMetalリソースも必要です。
+
 既定のデータ保存先：
 
 ```text
@@ -163,6 +193,45 @@ Appはテキストのみの翻訳を`MLXTextRuntime`、`mlx-swift-lm`対応の�
 3. 表示名や生成設定を明示的に上書きする場合だけ`Examples/Models/MLXVLMModel/mangakitchen-model.json`を追加します。
 
 単一のsafetensorsだけでは利用できません。`config.json`、tokenizer、chat templateを保持してください。その他のマルチモーダルモデルではprocessor設定も保持してください。`vision_config`を含むQwen3.5チェックポイントで`processor_config.json`と`preprocessor_config.json`がない場合、factoryは`config.json`から互換性のあるQwen3VLProcessor設定を推論します。
+
+### DFlash speculative decoding
+
+翻訳とマルチモーダルモデルの設定では、対応するQwen3／Qwen3.5ターゲットでDFlashを有効にできます。Appは選択したターゲットと同じモデルルートからDraftを自動検出するため、Draftのパスを別途保存しません。ネイティブSwift／MLX実装はターゲットと同じMetal runtimeを使い、Safetensors／MLX checkpointやGGUFの読み込みを置き換えません。Qwen3-VLとQwen3.5-VLは視覚対応prefill後に同じspeculative decoding loopへ入り、その他のVLMは標準生成へ安全にフォールバックします。Draftがない、互換性がない、無効、または未対応の生成設定の場合は理由をログに記録して標準生成へ戻ります。Draftの重みはAppに同梱されません。
+
+### GGUF重み
+
+`MLXTextRuntime`と`MLXVLMRuntime`は`.gguf`重みをSafetensorsへ変換せず、モデルフォルダから直接読み込めます。本番Appは`group64`と`quality` profileを既定とし、GGUF raw blockからMLXの`wq/scales/biases`を生成します。`Q4_0`／`Q4_1`／`Q1_0`／`Q2_0`／`Q2_K`／`Q3_K`／`Q4_K`は`INT4`、`Q8_0`／`Q5_K`／`Q6_K`は`INT8`を目標にします。`speed` profileではQ5_K／Q6_Kを`INT4`へ再量子化してdecodeのメモリ帯域を減らせますが、品質が低下する可能性があります。指定しない場合は`quality`を使用します。GGUFのF32／F16 compute重みはBF16へ変換し、Qwen3.5の`blk.N.ssm_a`（`linear_attn.A_log`）だけはF32のまま保持します。`mmproj`も同じgroup sizeを使用します。列挙されていない型（`Q8_K`を含む）はinspectと読み込み前に未対応として報告されます。llama.cpp bridgeは`Tools/GGUFBackendPOC`のparser比較用にのみ残され、本番Appの依存ではありません。
+
+GGUF loaderは主`.gguf`のmetadataからモデル設定とtokenizerを優先して構築し、外部の`config.json`、`tokenizer.json`、`tokenizer_config.json`はfallbackとして使います。完全なmetadataを含むテキストモデルは`.gguf`だけで構成できます。マルチモーダルモデルには対応する`mmproj-*.gguf`が必要です。processor設定がない場合は`mmproj` metadataから基本設定を作成します。外部tokenizer fallbackには少なくとも`tokenizer.json`が必要で、`tokenizer_config.json`は埋め込みまたは外部のtokenizer dataと組み合わせられます。
+
+`FP8`（`F8_E4M3`／`F8_E5M2`を含む）は`INT8`へ再量子化します。一般のGGUF `F16`／`F32` compute重みは上記規則でBF16へ変換し、`blk.N.ssm_a`だけF32のままです。標準llama.cpp GGUF type tableに独立したFP8 tensor typeはないため、Swift loaderは未知のtypeをFP8として扱いません。`GGUFStoragePolicy.targetStorageType(for:)`は`quality` profileの目標を固定し、`targetStorageType(for:profile:)`でspeed profileを確認できます。
+
+```bash
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-GGUF \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128 \
+  --gguf-group-size 64 --gguf-profile quality
+swift run GGUFSmoke --directory /path/to/Qwen3.8-27B-MLX-4bit \
+  --load --benchmark --image /path/to/page.png --prompt "Describe this image." --tokens 128
+```
+
+`GGUFSmoke`と`Tools/GGUFBackendPOC`はformat、数値、性能の開発者検証専用です。`--gguf-profile quality|speed`でQ5_K／Q6_KのINT8またはINT4目標を切り替えられます。benchmarkとfixtureの結果はAppから読み込まず、runtimeのモデル選択や品質基準も決定しません。異なる形式を比較する場合は同じハードウェアとパラメータで個別に実行し、その回の測定値として扱ってください。
+
+マルチモーダルGGUFは主モデルだけでは成立しません。モデルフォルダには`config.json`、Hugging Face tokenizer／chat template、対応する`mmproj-*.gguf`視覚投影ファイルを置く必要があります。`mmproj`がない場合、テキストモデルとして偽装して読み込みません。ダウンローダーはrepositoryに指定された`mmproj`があることを確認し、主GGUF、その`mmproj`、必要なQwen基本設定だけを取得します。
+
+`mangakitchen-model.json`で重みファイルを指定できます。
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "local-llama-q4",
+  "displayName": "Local Llama Q4",
+  "capability": "imageToText",
+  "backend": "mlxSwift",
+  "weightsFile": "model-q4_0.gguf",
+  "weightsFormat": "gguf",
+  "mmprojFile": "mmproj-F16.gguf"
+}
+```
 
 ## Qwen Image Edit Worker
 
