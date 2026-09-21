@@ -2965,83 +2965,19 @@ final class AppStore: ObservableObject {
         _ scanned: [ScannedComicPage],
         sourceDirectoryURL: URL
     ) async {
-        let previousPages = pages
-        let known = Dictionary(
-            uniqueKeysWithValues: previousPages.map { ($0.sourceURL.standardizedFileURL.path, $0) }
+        var merged = ComicPageScanMerger.merge(
+            scanned, previousPages: pages, excludedRelativePaths: excludedSourceRelativePaths
         )
-        let knownRelative = Dictionary(
-            uniqueKeysWithValues: previousPages.compactMap { page in
-                page.relativeSourcePath.map { ($0, page) }
-            }
-        )
-        let relocationGroups = Dictionary(grouping: previousPages) {
-            Self.pageFingerprint(title: $0.title, width: $0.pixelWidth, height: $0.pixelHeight)
-        }
-        let relocated = relocationGroups.compactMapValues { $0.count == 1 ? $0[0] : nil }
-        var reusedPageIDs: Set<UUID> = []
-        var merged: [ComicPage] = []
-        let previousOrder = Dictionary(
-            uniqueKeysWithValues: previousPages.enumerated().map { ($0.element.id, $0.offset) }
-        )
-        var discoveredOrder: [UUID: Int] = [:]
-
-        let included = scanned.filter { !excludedSourceRelativePaths.contains($0.relativePath) }
-        for (offset, item) in included.enumerated() {
-            let title = item.sourceURL.deletingPathExtension().lastPathComponent
-            let fingerprint = Self.pageFingerprint(
-                title: title,
-                width: item.pixelWidth,
-                height: item.pixelHeight
-            )
-            let movedPage = relocated[fingerprint].flatMap {
-                reusedPageIDs.contains($0.id) ? nil : $0
-            }
-            var page = known[item.sourceURL.path]
-                ?? knownRelative[item.relativePath]
-                ?? movedPage
-                ?? ComicPage(
-                index: offset + 1,
-                title: title,
-                sourceURL: item.sourceURL,
-                relativeSourcePath: item.relativePath,
-                pixelWidth: item.pixelWidth,
-                pixelHeight: item.pixelHeight,
-                stage: .scanned
-            )
-            reusedPageIDs.insert(page.id)
-            page.index = offset + 1
-            page.sourceURL = item.sourceURL
-            page.relativeSourcePath = item.relativePath
-            page.pixelWidth = item.pixelWidth
-            page.pixelHeight = item.pixelHeight
-            if page.stage == .pending { page.stage = .scanned }
-
-            if let tableURL = try? stringTableURL(for: page),
+        for index in merged.indices {
+            guard !Task.isCancelled else { return }
+            if let tableURL = try? stringTableURL(for: merged[index]),
                let table = try? await stringTables.load(from: tableURL) {
-                page.regions = table.regions
-                page.stringTableURL = tableURL
-                page.stage = Self.completedArtifactStage(for: page)
-            }
-            discoveredOrder[page.id] = offset
-            merged.append(page)
-        }
-
-        merged.sort { left, right in
-            let leftPrevious = previousOrder[left.id]
-            let rightPrevious = previousOrder[right.id]
-            switch (leftPrevious, rightPrevious) {
-            case let (.some(leftIndex), .some(rightIndex)):
-                return leftIndex < rightIndex
-            case (.some, .none):
-                return true
-            case (.none, .some):
-                return false
-            case (.none, .none):
-                return (discoveredOrder[left.id] ?? .max) < (discoveredOrder[right.id] ?? .max)
+                merged[index].regions = table.regions
+                merged[index].stringTableURL = tableURL
+                merged[index].stage = Self.completedArtifactStage(for: merged[index])
             }
         }
-        for index in merged.indices { merged[index].index = index + 1 }
-
+        guard !Task.isCancelled else { return }
         let validIDs = Set(merged.map(\.id))
         let oldSelection = selectedPageID
         pages = merged
@@ -3053,10 +2989,6 @@ final class AppStore: ObservableObject {
             selectedPageIDs = [selectedPageID]
         }
         await migrateStringTablesToSource()
-    }
-
-    private static func pageFingerprint(title: String, width: Int, height: Int) -> String {
-        "\(title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current))|\(width)x\(height)"
     }
 
     private func persistStringTableNow(pageID: UUID) async throws {
@@ -3081,8 +3013,11 @@ final class AppStore: ObservableObject {
     private func migrateStringTablesToSource() async {
         var failures: [String] = []
         var migrated = false
-        for index in pages.indices where !pages[index].regions.isEmpty {
-            let page = pages[index]
+        let projectID = activeProjectID
+        let languageCode = options.resolvedTargetLanguageCode
+        let candidates = pages.filter { !$0.regions.isEmpty }
+        for page in candidates {
+            guard !Task.isCancelled, activeProjectID == projectID else { return }
             let targetURL = pathResolver.stringTableURL(for: page.sourceURL)
             if page.stringTableURL?.standardizedFileURL == targetURL.standardizedFileURL,
                FileManager.default.fileExists(atPath: targetURL.path) {
@@ -3097,16 +3032,25 @@ final class AppStore: ObservableObject {
                 } else {
                     table = ComicStringTable(
                         page: page,
-                        targetLanguageCode: options.resolvedTargetLanguageCode
+                        targetLanguageCode: languageCode
                     )
                 }
+                guard !Task.isCancelled, activeProjectID == projectID else { return }
+                // 跨 await 後重新依 ID 找頁面；刪除、重排或編輯後不能沿用舊索引／快照。
+                guard pages.first(where: { $0.id == page.id }) == page else { continue }
                 try await stringTables.save(table, to: targetURL)
+                guard !Task.isCancelled, activeProjectID == projectID else { return }
+                guard let index = pages.firstIndex(where: { $0.id == page.id }),
+                      pages[index].sourceURL == page.sourceURL else { continue }
                 pages[index].stringTableURL = targetURL
                 migrated = true
+            } catch is CancellationError {
+                return
             } catch {
                 failures.append("\(page.title): \(error.localizedDescription)")
             }
         }
+        guard !Task.isCancelled, activeProjectID == projectID else { return }
         if !failures.isEmpty {
             statusMessage = "部分 .str 無法遷移到原圖旁：\n" + failures.joined(separator: "\n")
         }
@@ -3125,20 +3069,15 @@ final class AppStore: ObservableObject {
         projectName: String? = nil
     ) -> URL? {
         guard let defaultOutputDirectoryURL else { return nil }
-        let sourcePath = sourceURL.standardizedFileURL.path
         let baseURL = defaultOutputDirectoryURL.standardizedFileURL
-        let outputPath = baseURL.path
-        guard outputPath != sourcePath,
-              !outputPath.hasPrefix(sourcePath + "/") else { return nil }
+        guard !OutputDirectoryPolicy.isInsideSource(baseURL, source: sourceURL) else { return nil }
         guard let component = Self.safeOutputDirectoryComponent(
             projectName ?? sourceURL.lastPathComponent
         ) else {
             return baseURL
         }
         let projectURL = baseURL.appendingPathComponent(component, isDirectory: true).standardizedFileURL
-        let projectPath = projectURL.path
-        guard projectPath != sourcePath,
-              !projectPath.hasPrefix(sourcePath + "/") else { return nil }
+        guard !OutputDirectoryPolicy.isInsideSource(projectURL, source: sourceURL) else { return nil }
         return projectURL
     }
 

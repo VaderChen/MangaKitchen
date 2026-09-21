@@ -9,13 +9,19 @@ struct ManagedImportService {
     func materialize(_ inputs: [URL], under root: URL) throws -> URL {
         let destination = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
-        try append(inputs, to: destination)
+        do {
+            try append(inputs, to: destination)
+        } catch {
+            try? fileManager.removeItem(at: destination)
+            throw error
+        }
         return destination
     }
 
     func append(_ inputs: [URL], to destination: URL) throws {
         try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
         for input in inputs {
+            try Task.checkCancellation()
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: input.path, isDirectory: &isDirectory) else { continue }
             if isDirectory.boolValue {
@@ -41,9 +47,21 @@ struct ManagedImportService {
     }
 
     private func copyImages(from source: URL, to destination: URL) throws {
-        let urls = fileManager.enumerator(at: source, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles, .skipsPackageDescendants])?.compactMap { $0 as? URL } ?? []
-        for url in urls where ComicDirectoryScanner.supportedExtensions.contains(url.pathExtension.lowercased()) {
-            let relative = url.path.replacingOccurrences(of: source.path + "/", with: "")
+        let root = source.standardizedFileURL
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+            throw ManagedImportError.noSupportedPages
+        }
+        for case let url as URL in enumerator {
+            try Task.checkCancellation()
+            if url.standardizedFileURL.resolvingSymlinksInPath() == destination.standardizedFileURL.resolvingSymlinksInPath() {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard ComicDirectoryScanner.supportedExtensions.contains(url.pathExtension.lowercased()),
+                  try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true,
+                  url.path.hasPrefix(prefix) else { continue }
+            let relative = String(url.path.dropFirst(prefix.count))
             let target = destination.appendingPathComponent(relative)
             try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fileManager.copyItem(at: url, to: uniqueDestination(for: target.lastPathComponent, in: target.deletingLastPathComponent()))
@@ -56,18 +74,21 @@ struct ManagedImportService {
             in: destination
         )
         try fileManager.createDirectory(at: extraction, withIntermediateDirectories: true)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: useBSDTar ? "/usr/bin/bsdtar" : "/usr/bin/ditto")
-        process.arguments = useBSDTar
+        var succeeded = false
+        defer {
+            if !succeeded { try? fileManager.removeItem(at: extraction) }
+        }
+        let arguments = useBSDTar
             ? ["-xf", input.path, "-C", extraction.path]
             : ["-x", "-k", input.path, extraction.path]
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
+        let result = try ArchiveProcessRunner.run(
+            executableURL: URL(fileURLWithPath: useBSDTar ? "/usr/bin/bsdtar" : "/usr/bin/ditto"),
+            arguments: arguments
+        )
+        guard result.terminationStatus == 0 else {
             throw ManagedImportError.archiveExtractionFailed(input.lastPathComponent)
         }
+        succeeded = true
     }
 
     private func renderPDF(_ input: URL, to destination: URL) throws {
@@ -80,6 +101,7 @@ struct ManagedImportService {
         )
         try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
         for index in 0..<document.pageCount {
+            try Task.checkCancellation()
             guard let page = document.page(at: index) else { continue }
             let bounds = page.bounds(for: .mediaBox)
             let scale = min(2.0, max(1.0, 2400.0 / max(bounds.width, bounds.height)))

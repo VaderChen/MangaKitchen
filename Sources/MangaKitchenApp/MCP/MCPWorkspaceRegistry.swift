@@ -11,6 +11,7 @@ struct MCPWorkspaceContext: Sendable {
     var glossary: ProjectGlossary
     var pages: [ComicPage]
     var regionSource: MCPRegionSource
+    var excludedSourceRelativePaths: Set<String> = []
 }
 
 /// 管理多工作區索引與查找；工作流服務只負責載入／儲存目前作用中的快照。

@@ -24,6 +24,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     /// `prepare()` 會 suspend 並讓 actor 重入；記錄正在載入的身分，避免原文
     /// 抽取與翻譯同時請求同一個 VLM 時各建立一份 runtime。
     private var activeLoadIdentities: [ModelCapability: ModelLoadIdentity] = [:]
+    private var loadGenerations: [ModelCapability: UUID] = [:]
     private var thinkingEnabled: Bool
 
     public init(
@@ -47,6 +48,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     }
 
     public func loadModel(at directoryURL: URL) async throws -> LoadedModelInfo {
+        try Task.checkCancellation()
         let directoryURL = directoryURL.standardizedFileURL.resolvingSymlinksInPath()
         let manifest = try ModelManifest.load(from: directoryURL)
         let requestedIdentity = ModelLoadIdentity(
@@ -112,6 +114,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
             return loaded
         }
         activeLoadIdentities[manifest.capability] = requestedIdentity
+        let generation = UUID()
+        loadGenerations[manifest.capability] = generation
         defer {
             if activeLoadIdentities[manifest.capability] == requestedIdentity {
                 activeLoadIdentities[manifest.capability] = nil
@@ -169,6 +173,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                     reasoningStream: reasoningStream
                 )
                 try await runtime.prepare { _ in }
+                try requireCurrentLoad(generation, capability: manifest.capability)
                 info = runtime.info
                 textToTextRuntime = runtime
             case .imageToText:
@@ -184,6 +189,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
                     reasoningStream: reasoningStream
                 )
                 try await runtime.prepare { _ in }
+                try requireCurrentLoad(generation, capability: manifest.capability)
                 info = runtime.info
                 imageToTextRuntime = runtime
             case .superResolution:
@@ -224,6 +230,7 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     }
 
     public func unloadModel(capability: ModelCapability) async {
+        loadGenerations[capability] = nil
         switch capability {
         case .textToText: textToTextRuntime = nil
         case .imageToText: imageToTextRuntime = nil
@@ -239,6 +246,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
     public func setThinkingEnabled(_ enabled: Bool) {
         guard thinkingEnabled != enabled else { return }
         thinkingEnabled = enabled
+        loadGenerations[.textToText] = nil
+        loadGenerations[.imageToText] = nil
         textToTextRuntime = nil
         imageToTextRuntime = nil
         modelInfos[.textToText] = nil
@@ -255,6 +264,8 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
         }
         dflashEnabled = enabled
         dflashBlockSize = normalizedBlockSize
+        loadGenerations[.textToText] = nil
+        loadGenerations[.imageToText] = nil
         textToTextRuntime = nil
         imageToTextRuntime = nil
         modelInfos[.textToText] = nil
@@ -263,6 +274,11 @@ public actor ModelRuntimeHub: ModelManaging, TextGenerating, ImageToTextGenerati
 
     public func loadedModels() async -> [LoadedModelInfo] {
         modelInfos.values.sorted { $0.capability.rawValue < $1.capability.rawValue }
+    }
+
+    private func requireCurrentLoad(_ generation: UUID, capability: ModelCapability) throws {
+        try Task.checkCancellation()
+        guard loadGenerations[capability] == generation else { throw CancellationError() }
     }
 
     public func isLoaded(_ capability: ModelCapability) -> Bool {

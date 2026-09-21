@@ -56,7 +56,10 @@ actor MangaKitchenMCPHTTPHost {
                 .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                 .childChannelInitializer { channel in
                     channel.pipeline.configureHTTPServerPipeline().flatMap {
-                        channel.pipeline.addHandler(MCPHTTPHandler(host: self))
+                        channel.pipeline.addHandlers([
+                            MCPRequestBodyLimitHandler(maximumBytes: self.configuration.maximumRequestBytes),
+                            MCPHTTPHandler(host: self)
+                        ])
                     }
                 }
                 .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)

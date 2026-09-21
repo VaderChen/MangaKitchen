@@ -25,8 +25,7 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
     }
 
     private var renderer: HTMLTypesettingRenderer?
-    private var rendererInUse = false
-    private var rendererWaiters: [CheckedContinuation<Void, Never>] = []
+    private let rendererGate = AsyncOperationGate()
 
     func renderTextLayers(
         canvasURL: URL,
@@ -129,27 +128,27 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
             try? FileManager.default.removeItem(at: renderedLayerURL)
         }
 
-        await acquireRenderer()
-        defer { releaseRenderer() }
-        try Task.checkCancellation()
-        let renderer = await typesettingRenderer()
-        try await renderer.render(
-            htmlURL: temporaryURL,
-            readAccessURL: backgroundURL.deletingLastPathComponent(),
-            outputURL: renderedLayerURL,
-            outputWidth: width.intValue,
-            outputHeight: height.intValue,
-            viewportWidth: viewportWidth,
-            viewportHeight: viewportHeight
-        )
-        try Task.checkCancellation()
-        try Self.composite(
-            backgroundURL: backgroundURL,
-            renderedLayerURL: renderedLayerURL,
-            outputURL: outputURL,
-            width: width.intValue,
-            height: height.intValue
-        )
+        try await rendererGate.withPermit {
+            try Task.checkCancellation()
+            let renderer = await self.typesettingRenderer()
+            try await renderer.render(
+                htmlURL: temporaryURL,
+                readAccessURL: backgroundURL.deletingLastPathComponent(),
+                outputURL: renderedLayerURL,
+                outputWidth: width.intValue,
+                outputHeight: height.intValue,
+                viewportWidth: viewportWidth,
+                viewportHeight: viewportHeight
+            )
+            try Task.checkCancellation()
+            try Self.composite(
+                backgroundURL: backgroundURL,
+                renderedLayerURL: renderedLayerURL,
+                outputURL: outputURL,
+                width: width.intValue,
+                height: height.intValue
+            )
+        }
     }
 
     private func typesettingRenderer() async -> HTMLTypesettingRenderer {
@@ -157,24 +156,6 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
         let renderer = await HTMLTypesettingRenderer()
         self.renderer = renderer
         return renderer
-    }
-
-    private func acquireRenderer() async {
-        guard rendererInUse else {
-            rendererInUse = true
-            return
-        }
-        await withCheckedContinuation { continuation in
-            rendererWaiters.append(continuation)
-        }
-    }
-
-    private func releaseRenderer() {
-        guard !rendererWaiters.isEmpty else {
-            rendererInUse = false
-            return
-        }
-        rendererWaiters.removeFirst().resume()
     }
 
     private static func document(
@@ -399,18 +380,19 @@ actor HTMLDialogueTypesetter: DialogueTypesetting {
             throw HTMLDialogueTypesetterError.snapshotFailed
         }
         context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        guard let image = context.makeImage(),
-              let destination = CGImageDestinationCreateWithURL(
-               outputURL as CFURL,
-               "public.png" as CFString,
-               1,
-               nil
-              ) else {
+        guard let image = context.makeImage() else {
             throw HTMLDialogueTypesetterError.snapshotFailed
         }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw HTMLDialogueTypesetterError.snapshotFailed
+        try AtomicFileWriter.write(to: outputURL) { stagedURL in
+            guard let destination = CGImageDestinationCreateWithURL(
+                stagedURL as CFURL, "public.png" as CFString, 1, nil
+            ) else {
+                throw HTMLDialogueTypesetterError.snapshotFailed
+            }
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else {
+                throw HTMLDialogueTypesetterError.snapshotFailed
+            }
         }
     }
 
@@ -486,6 +468,7 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
     private var activeNavigation: WKNavigation?
     private var navigationCompletion: ((Result<Void, Error>) -> Void)?
     private var activeOperationFailure: ((Error) -> Void)?
+    private var activeOperationID: UUID?
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -666,33 +649,43 @@ private final class HTMLTypesettingRenderer: NSObject, WKNavigationDelegate {
     ) async throws -> Value {
         try Task.checkCancellation()
         let gate = ContinuationGate<Value>()
+        let operationID = UUID()
+        activeOperationID = operationID
         activeOperationFailure = { error in
             gate.resume(.failure(error))
         }
-        let timeoutTask = Task { @MainActor [weak webView] in
+        let timeoutTask = Task { @MainActor [weak self, weak webView] in
             do {
                 try await Task.sleep(nanoseconds: Self.operationTimeoutNanoseconds)
             } catch {
                 return
             }
+            guard !Task.isCancelled, self?.activeOperationID == operationID else { return }
             webView?.stopLoading()
             gate.resume(.failure(HTMLDialogueTypesetterError.operationTimedOut(operationName)))
         }
         defer {
             timeoutTask.cancel()
             activeOperationFailure = nil
+            activeOperationID = nil
         }
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 gate.install(continuation)
+                guard !Task.isCancelled else {
+                    gate.resume(.failure(CancellationError()))
+                    return
+                }
                 start { result in
                     gate.resume(result)
                 }
             }
         } onCancel: {
             gate.resume(.failure(CancellationError()))
-            Task { @MainActor [weak webView] in
+            Task { @MainActor [weak self, weak webView] in
+                // 取消回呼可能比下一項工作更晚排上 MainActor，不可中止新工作。
+                guard self?.activeOperationID == operationID else { return }
                 webView?.stopLoading()
             }
         }

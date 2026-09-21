@@ -201,6 +201,8 @@ enum MCPResourcePayload: Sendable {
 }
 
 actor MCPWorkflowService {
+    /// 所有 session 的工具與資源請求共用，避免 await 期間切換工作區。
+    let operationGate = AsyncOperationGate()
     typealias Progress = @Sendable (_ completed: Double, _ message: String) -> Void
     typealias StateChangeHandler = @MainActor @Sendable (MCPWorkspaceState) async -> Void
     typealias StateProvider = @MainActor @Sendable (URL) async -> WorkspaceSnapshot?
@@ -235,6 +237,7 @@ actor MCPWorkflowService {
     private var regionSource: MCPRegionSource = .local
     private var glossary = ProjectGlossary()
     private var pages: [ComicPage] = []
+    private var excludedSourceRelativePaths: Set<String> = []
     private var workspaceRegistry = MCPWorkspaceRegistry()
     private let stateChangeHandler: StateChangeHandler?
     private let stateProvider: StateProvider?
@@ -275,6 +278,7 @@ actor MCPWorkflowService {
             regionSource = .local
             glossary = snapshot.glossary
             pages = snapshot.pages
+            excludedSourceRelativePaths = snapshot.excludedSourceRelativePaths
         } else {
             saveActiveWorkspace()
             let newWorkspaceID = UUID()
@@ -285,6 +289,7 @@ actor MCPWorkflowService {
             regionSource = .local
             glossary = ProjectGlossary()
             pages = []
+            excludedSourceRelativePaths = []
         }
         if let outputDirectoryURL {
             self.outputDirectoryURL = outputDirectoryURL.standardizedFileURL
@@ -300,26 +305,11 @@ actor MCPWorkflowService {
         }.value
         try Task.checkCancellation()
 
-        let knownPages = Dictionary(
-            uniqueKeysWithValues: pages.map { ($0.sourceURL.standardizedFileURL.path, $0) }
+        let knownPaths = Set(pages.map { $0.sourceURL.standardizedFileURL.path })
+        pages = ComicPageScanMerger.merge(
+            scanned, previousPages: pages, excludedRelativePaths: excludedSourceRelativePaths
         )
-        pages = scanned.enumerated().map { offset, item in
-            var page = knownPages[item.sourceURL.path] ?? ComicPage(
-                index: offset + 1,
-                title: item.sourceURL.deletingPathExtension().lastPathComponent,
-                sourceURL: item.sourceURL,
-                relativeSourcePath: item.relativePath,
-                pixelWidth: item.pixelWidth,
-                pixelHeight: item.pixelHeight,
-                stage: .scanned
-            )
-            page.index = offset + 1
-            page.relativeSourcePath = item.relativePath
-            page.pixelWidth = item.pixelWidth
-            page.pixelHeight = item.pixelHeight
-            return page
-        }
-        for index in pages.indices where knownPages[pages[index].sourceURL.path] == nil {
+        for index in pages.indices where !knownPaths.contains(pages[index].sourceURL.standardizedFileURL.path) {
             let tableURL = try stringTableURL(for: pages[index])
             if let table = try await stringTables.load(from: tableURL) {
                 pages[index].regions = table.regions
@@ -365,50 +355,26 @@ actor MCPWorkflowService {
         try await requireWorkspace(workspaceID)
         guard let sourceDirectoryURL else { throw MCPServiceError.workspaceNotOpen }
         let previousPages = pages
-        let oldPages = Dictionary(
-            uniqueKeysWithValues: previousPages.map { ($0.sourceURL.standardizedFileURL.path, $0) }
-        )
-        let fingerprint: (String, Int, Int) -> String = { title, width, height in
-            "\(title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current))|\(width)x\(height)"
-        }
-        let relocationGroups = Dictionary(grouping: previousPages) {
-            fingerprint($0.title, $0.pixelWidth, $0.pixelHeight)
-        }
-        let relocated = relocationGroups.compactMapValues { $0.count == 1 ? $0[0] : nil }
-        var reusedPageIDs: Set<UUID> = []
         let scanner = self.scanner
         let scanned = try await Task.detached {
             try scanner.scan(sourceDirectoryURL)
         }.value
-        var rescanned: [ComicPage] = []
-        for (offset, item) in scanned.enumerated() {
-            let title = item.sourceURL.deletingPathExtension().lastPathComponent
-            let movedPage = relocated[fingerprint(title, item.pixelWidth, item.pixelHeight)].flatMap {
-                reusedPageIDs.contains($0.id) ? nil : $0
-            }
-            var page = oldPages[item.sourceURL.path] ?? movedPage ?? ComicPage(
-                index: offset + 1,
-                title: title,
-                sourceURL: item.sourceURL,
-                relativeSourcePath: item.relativePath,
-                pixelWidth: item.pixelWidth,
-                pixelHeight: item.pixelHeight,
-                stage: .scanned
-            )
-            reusedPageIDs.insert(page.id)
-            page.index = offset + 1
-            page.sourceURL = item.sourceURL
-            page.relativeSourcePath = item.relativePath
-            page.pixelWidth = item.pixelWidth
-            page.pixelHeight = item.pixelHeight
-            let tableURL = pathResolver.stringTableURL(for: item.sourceURL)
+        try Task.checkCancellation()
+        var rescanned = ComicPageScanMerger.merge(
+            scanned, previousPages: previousPages, excludedRelativePaths: excludedSourceRelativePaths
+        )
+        for index in rescanned.indices {
+            try Task.checkCancellation()
+            var page = rescanned[index]
+            let tableURL = pathResolver.stringTableURL(for: page.sourceURL)
             if let table = try await stringTables.load(from: tableURL) {
                 page.regions = table.regions
                 page.stringTableURL = tableURL
                 page.stage = Self.completedArtifactStage(for: page)
             }
-            rescanned.append(page)
+            rescanned[index] = page
         }
+        try Task.checkCancellation()
         pages = rescanned
         await publishStateChange()
         return await currentState()
@@ -1947,6 +1913,7 @@ actor MCPWorkflowService {
             regionSource = workspaceRegistry.context(for: id)?.regionSource ?? regionSource
             glossary = snapshot.glossary
             pages = snapshot.pages
+            excludedSourceRelativePaths = snapshot.excludedSourceRelativePaths
             saveActiveWorkspace()
         } else {
             try activateWorkspaceContext(id)
@@ -1968,6 +1935,7 @@ actor MCPWorkflowService {
         regionSource = context.regionSource
         glossary = context.glossary
         pages = context.pages
+        excludedSourceRelativePaths = context.excludedSourceRelativePaths
     }
 
     private func saveActiveWorkspace() {
@@ -1981,7 +1949,8 @@ actor MCPWorkflowService {
             options: options,
             glossary: glossary,
             pages: pages,
-            regionSource: regionSource
+            regionSource: regionSource,
+            excludedSourceRelativePaths: excludedSourceRelativePaths
         ))
     }
 
@@ -2054,21 +2023,19 @@ actor MCPWorkflowService {
               ) else {
             throw MCPServiceError.invalidArguments("無法解碼上色結果圖片。")
         }
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        guard let destination = CGImageDestinationCreateWithURL(
-            outputURL as CFURL,
-            UTType.png.identifier as CFString,
-            1,
-            nil
-        ) else {
-            throw MCPServiceError.invalidArguments("無法建立上色預覽檔案。")
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw MCPServiceError.invalidArguments("無法寫入上色預覽 PNG。")
+        try AtomicFileWriter.write(to: outputURL) { stagedURL in
+            guard let destination = CGImageDestinationCreateWithURL(
+                stagedURL as CFURL,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+            ) else {
+                throw MCPServiceError.invalidArguments("無法建立上色預覽檔案。")
+            }
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else {
+                throw MCPServiceError.invalidArguments("無法寫入上色預覽 PNG。")
+            }
         }
     }
 

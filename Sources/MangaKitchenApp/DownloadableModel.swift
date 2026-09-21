@@ -350,20 +350,19 @@ enum DownloadableModelCatalog {
         model: DownloadableModelDescriptor? = nil
     ) -> Bool {
         let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: directoryURL.appendingPathComponent(HuggingFaceModelDownloader.inProgressMarker).path) else { return false }
         if model?.format == .ggufDirectory {
             guard let model,
                   let weightsFileName = model.weightsFileName,
-                  fileManager.fileExists(
-                    atPath: directoryURL.appendingPathComponent("config.json").path
-                  ),
-                  fileManager.fileExists(atPath: directoryURL.appendingPathComponent(weightsFileName).path)
+                  isValidConfiguration(in: directoryURL),
+                  isNonemptyRegularFile(directoryURL.appendingPathComponent(weightsFileName))
             else { return false }
             if let mmprojFileName = model.mmprojFileName,
-               !fileManager.fileExists(atPath: directoryURL.appendingPathComponent(mmprojFileName).path) {
+               !isNonemptyRegularFile(directoryURL.appendingPathComponent(mmprojFileName)) {
                 return false
             }
             return model.auxiliaryFileNames.allSatisfy {
-                fileManager.fileExists(atPath: directoryURL.appendingPathComponent($0).path)
+                isNonemptyRegularFile(directoryURL.appendingPathComponent($0))
             }
         }
         if model?.format == .coreMLZip || model?.format == .coreMLPackage {
@@ -372,13 +371,22 @@ enum DownloadableModelCatalog {
                   let modelFile = manifest.modelFile else { return false }
             return fileManager.fileExists(atPath: directoryURL.appendingPathComponent(modelFile).path)
         }
-        let configURL = directoryURL.appendingPathComponent("config.json")
-        guard fileManager.fileExists(atPath: configURL.path),
+        guard isValidConfiguration(in: directoryURL),
               let enumerator = fileManager.enumerator(
                 at: directoryURL,
                 includingPropertiesForKeys: [.isRegularFileKey],
                 options: [.skipsHiddenFiles]
               ) else { return false }
+        let indexURL = directoryURL.appendingPathComponent("model.safetensors.index.json")
+        if fileManager.fileExists(atPath: indexURL.path) {
+            guard let data = try? Data(contentsOf: indexURL),
+                  let index = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let weights = index["weight_map"] as? [String: String], !weights.isEmpty else { return false }
+            guard Set(weights.values).allSatisfy({ name in
+                let file = directoryURL.appendingPathComponent(name)
+                return FilePathBoundary.contains(file, in: directoryURL) && isNonemptyRegularFile(file)
+            }) else { return false }
+        }
         let rootComponentCount = directoryURL.standardizedFileURL.pathComponents.count
         let draftDirectoryNames = Set([
             "dflashdraftmodel",
@@ -393,9 +401,22 @@ enum DownloadableModelCatalog {
             guard !parentComponents.contains(where: {
                 draftDirectoryNames.contains($0.lowercased())
             }) else { continue }
+            guard isNonemptyRegularFile(fileURL) else { continue }
             return true
         }
         return false
+    }
+
+    static func isNonemptyRegularFile(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]) else { return false }
+        return values.isRegularFile == true && (values.fileSize ?? 0) > 0
+    }
+
+    private static func isValidConfiguration(in directoryURL: URL) -> Bool {
+        let url = directoryURL.appendingPathComponent("config.json")
+        guard isNonemptyRegularFile(url), let data = try? Data(contentsOf: url),
+              (try? JSONSerialization.jsonObject(with: data)) is [String: Any] else { return false }
+        return true
     }
 }
 

@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import MangaKitchenCore
 import UniformTypeIdentifiers
 
 enum CGImageIO {
@@ -26,21 +27,19 @@ enum CGImageIO {
     }
 
     static func writePNG(_ image: CGImage, to url: URL) throws {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        guard let destination = CGImageDestinationCreateWithURL(
-            url as CFURL,
-            UTType.png.identifier as CFString,
-            1,
-            nil
-        ) else {
-            throw ImageProcessingError.cannotCreateOutput(url)
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw ImageProcessingError.cannotCreateOutput(url)
+        try AtomicFileWriter.write(to: url) { stagedURL in
+            guard let destination = CGImageDestinationCreateWithURL(
+                stagedURL as CFURL,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+            ) else {
+                throw ImageProcessingError.cannotCreateOutput(url)
+            }
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else {
+                throw ImageProcessingError.cannotCreateOutput(url)
+            }
         }
     }
 }

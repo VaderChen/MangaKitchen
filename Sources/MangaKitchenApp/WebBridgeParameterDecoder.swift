@@ -11,13 +11,19 @@ enum WebBridgeParameterDecoder {
     }
 
     static func double(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber { return number.doubleValue }
-        if let string = value as? String { return Double(string) }
-        return nil
+        let result: Double?
+        if let number = value as? NSNumber { result = number.doubleValue }
+        else if let string = value as? String { result = Double(string) }
+        else { result = nil }
+        guard let result, result.isFinite else { return nil }
+        return result
     }
 
     static func integer(_ value: Any?) -> Int? {
-        if let number = value as? NSNumber { return number.intValue }
+        if let number = value as? NSNumber {
+            // 先保留完整的 Int 精度，再處理 42.0 等浮點表示；不截斷或溢位。
+            return Int(number.stringValue) ?? Int(exactly: number.doubleValue)
+        }
         if let string = value as? String { return Int(string) }
         return nil
     }

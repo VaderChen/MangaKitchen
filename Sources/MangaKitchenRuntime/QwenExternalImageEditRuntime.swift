@@ -133,7 +133,7 @@ actor QwenExternalImageEditRuntime: ImageToImageGenerating {
                 }
             }
         } catch is CancellationError {
-            await terminate(process)
+            await Self.terminate(process)
             throw CancellationError()
         }
 
@@ -161,17 +161,21 @@ actor QwenExternalImageEditRuntime: ImageToImageGenerating {
         progress(1)
     }
 
-    private func terminate(_ process: Process) async {
-        if process.isRunning { process.terminate() }
-        for _ in 0..<20 where process.isRunning {
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        if process.isRunning {
-            Darwin.kill(process.processIdentifier, SIGKILL)
-        }
-        while process.isRunning {
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+    static func terminate(_ process: Process) async {
+        // 清理工作不可繼承呼叫者的取消狀態，否則 sleep 立即拋錯而形成忙迴圈。
+        // 等待此獨立 Task 完成，避免尚未終止 worker 就釋放工作目錄。
+        await Task {
+            if process.isRunning { process.terminate() }
+            for _ in 0..<20 where process.isRunning {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if process.isRunning {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+            while process.isRunning {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+        }.value
     }
 
     private nonisolated static func validateModelDirectory(

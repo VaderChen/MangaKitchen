@@ -50,6 +50,7 @@ final class AppBatchWorkflowCoordinator {
             candidate.projectID == job.projectID
                 && [.queued, .running].contains(candidate.status)
                 && candidate.operation == job.operation
+                && candidate.forceRecalculation == job.forceRecalculation
                 && Set(candidate.pageIDs) == pageIDs
         }) {
             return .existing(existing)
@@ -186,7 +187,7 @@ final class AppBatchWorkflowCoordinator {
                 }
                 self.jobs[finalIndex].currentPageID = nil
                 self.jobs[finalIndex].finishedAt = Date()
-                if Task.isCancelled {
+                if wasCancelled || Task.isCancelled {
                     self.jobs[finalIndex].status = .cancelled
                     wasCancelled = true
                 } else {

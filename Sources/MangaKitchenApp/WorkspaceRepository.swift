@@ -3,21 +3,13 @@ import MangaKitchenCore
 
 actor WorkspaceRepository {
     private let fileURL: URL
-    private let backupURL: URL
 
     init(fileURL: URL) {
         self.fileURL = fileURL
-        self.backupURL = fileURL.appendingPathExtension("bak")
     }
 
     func load() throws -> WorkspaceSnapshot? {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-        do {
-            return try decode(fileURL)
-        } catch {
-            guard FileManager.default.fileExists(atPath: backupURL.path) else { throw error }
-            return try decode(backupURL)
-        }
+        try RecoverableFile.load(from: fileURL, decode: decode)
     }
 
     func save(_ snapshot: WorkspaceSnapshot) throws {
@@ -26,23 +18,17 @@ actor WorkspaceRepository {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(snapshot)
 
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            if FileManager.default.fileExists(atPath: backupURL.path) {
-                try FileManager.default.removeItem(at: backupURL)
-            }
-            try FileManager.default.copyItem(at: fileURL, to: backupURL)
-        }
-        try data.write(to: fileURL, options: .atomic)
+        try RecoverableFile.save(data, to: fileURL) { _ = try decode($0) }
     }
 
-    private func decode(_ url: URL) throws -> WorkspaceSnapshot {
+    private func decode(_ data: Data) throws -> WorkspaceSnapshot {
+        let version = try RecoverableFile.schemaVersion(in: data) ?? 1
+        guard (1...4).contains(version) else {
+            throw WorkspaceRepositoryError.unsupportedSchema(version)
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let value = try decoder.decode(WorkspaceSnapshot.self, from: Data(contentsOf: url))
+        let value = try decoder.decode(WorkspaceSnapshot.self, from: data)
         guard (1...4).contains(value.schemaVersion) else {
             throw WorkspaceRepositoryError.unsupportedSchema(value.schemaVersion)
         }
@@ -52,21 +38,13 @@ actor WorkspaceRepository {
 
 actor ProjectLibraryRepository {
     private let fileURL: URL
-    private let backupURL: URL
 
     init(fileURL: URL) {
         self.fileURL = fileURL
-        backupURL = fileURL.appendingPathExtension("bak")
     }
 
     func load() throws -> ProjectLibrarySnapshot? {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-        do {
-            return try decode(fileURL)
-        } catch {
-            guard FileManager.default.fileExists(atPath: backupURL.path) else { throw error }
-            return try decode(backupURL)
-        }
+        try RecoverableFile.load(from: fileURL, decode: decode)
     }
 
     func save(_ snapshot: ProjectLibrarySnapshot) throws {
@@ -75,23 +53,17 @@ actor ProjectLibraryRepository {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(snapshot)
 
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            if FileManager.default.fileExists(atPath: backupURL.path) {
-                try FileManager.default.removeItem(at: backupURL)
-            }
-            try FileManager.default.copyItem(at: fileURL, to: backupURL)
-        }
-        try data.write(to: fileURL, options: .atomic)
+        try RecoverableFile.save(data, to: fileURL) { _ = try decode($0) }
     }
 
-    private func decode(_ url: URL) throws -> ProjectLibrarySnapshot {
+    private func decode(_ data: Data) throws -> ProjectLibrarySnapshot {
+        let version = try RecoverableFile.schemaVersion(in: data) ?? 1
+        guard version == 1 else {
+            throw WorkspaceRepositoryError.unsupportedSchema(version)
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let value = try decoder.decode(ProjectLibrarySnapshot.self, from: Data(contentsOf: url))
+        let value = try decoder.decode(ProjectLibrarySnapshot.self, from: data)
         guard value.schemaVersion == 1 else {
             throw WorkspaceRepositoryError.unsupportedSchema(value.schemaVersion)
         }
@@ -99,7 +71,7 @@ actor ProjectLibraryRepository {
     }
 }
 
-private enum WorkspaceRepositoryError: LocalizedError {
+private enum WorkspaceRepositoryError: LocalizedError, NonRecoverableFileError {
     case unsupportedSchema(Int)
 
     var errorDescription: String? {

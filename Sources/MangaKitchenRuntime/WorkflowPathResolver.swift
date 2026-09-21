@@ -1,4 +1,5 @@
 import Foundation
+import MangaKitchenCore
 
 public struct WorkflowPagePaths: Hashable, Sendable {
     public var stringTableURL: URL
@@ -41,7 +42,7 @@ public struct WorkflowPathResolver: Sendable {
             $0.appendingPathComponent($1)
         }
         let baseURL = relativeURL.deletingPathExtension()
-        return baseURL.appendingPathExtension("png")
+        return try containedOutput(baseURL.appendingPathExtension("png"), in: outputDirectoryURL)
     }
 
     public func colorizationOutputURL(
@@ -52,9 +53,18 @@ public struct WorkflowPathResolver: Sendable {
             relativeSourcePath: relativeSourcePath,
             outputDirectoryURL: outputDirectoryURL
         )
-        return translationURL.deletingPathExtension()
-            .appendingPathComponent("-colorized")
-            .appendingPathExtension("png")
+        let filename = translationURL.deletingPathExtension().lastPathComponent + "-colorized.png"
+        return try containedOutput(
+            translationURL.deletingLastPathComponent().appendingPathComponent(filename),
+            in: outputDirectoryURL
+        )
+    }
+
+    private func containedOutput(_ url: URL, in root: URL) throws -> URL {
+        guard FilePathBoundary.contains(url, in: root) else {
+            throw WorkflowPathResolverError.invalidRelativePath(url.path)
+        }
+        return url
     }
 
     private func validatedComponents(_ path: String) throws -> [String] {
@@ -62,7 +72,7 @@ public struct WorkflowPathResolver: Sendable {
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
         guard !components.isEmpty,
-              !path.hasPrefix("/"),
+              !path.hasPrefix("/"), !path.contains("\0"),
               !components.contains("."),
               !components.contains("..") else {
             throw WorkflowPathResolverError.invalidRelativePath(path)

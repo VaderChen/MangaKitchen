@@ -5,14 +5,7 @@ public actor ComicStringTableRepository {
     public init() {}
 
     public func load(from fileURL: URL) throws -> ComicStringTable? {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-        do {
-            return try decode(fileURL)
-        } catch {
-            let backupURL = fileURL.appendingPathExtension("bak")
-            guard FileManager.default.fileExists(atPath: backupURL.path) else { throw error }
-            return try decode(backupURL)
-        }
+        try RecoverableFile.load(from: fileURL, decode: decode)
     }
 
     public func save(_ table: ComicStringTable, to fileURL: URL) throws {
@@ -20,24 +13,17 @@ public actor ComicStringTableRepository {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(table)
-        let fileManager = FileManager.default
-        let parentURL = fileURL.deletingLastPathComponent()
-        try fileManager.createDirectory(at: parentURL, withIntermediateDirectories: true)
-
-        let backupURL = fileURL.appendingPathExtension("bak")
-        if fileManager.fileExists(atPath: fileURL.path) {
-            if fileManager.fileExists(atPath: backupURL.path) {
-                try fileManager.removeItem(at: backupURL)
-            }
-            try fileManager.copyItem(at: fileURL, to: backupURL)
-        }
-        try data.write(to: fileURL, options: .atomic)
+        try RecoverableFile.save(data, to: fileURL) { _ = try decode($0) }
     }
 
-    private func decode(_ fileURL: URL) throws -> ComicStringTable {
+    private func decode(_ data: Data) throws -> ComicStringTable {
+        let version = try RecoverableFile.schemaVersion(in: data) ?? 1
+        guard version == 1 else {
+            throw ComicStringTableRepositoryError.unsupportedSchema(version)
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let value = try decoder.decode(ComicStringTable.self, from: Data(contentsOf: fileURL))
+        let value = try decoder.decode(ComicStringTable.self, from: data)
         guard value.schemaVersion == 1 else {
             throw ComicStringTableRepositoryError.unsupportedSchema(value.schemaVersion)
         }
@@ -45,7 +31,7 @@ public actor ComicStringTableRepository {
     }
 }
 
-public enum ComicStringTableRepositoryError: LocalizedError, Sendable {
+public enum ComicStringTableRepositoryError: LocalizedError, Sendable, NonRecoverableFileError {
     case unsupportedSchema(Int)
 
     public var errorDescription: String? {

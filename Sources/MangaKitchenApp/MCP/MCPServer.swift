@@ -45,363 +45,367 @@ struct MangaKitchenMCPServer {
         }
 
         await server.withMethodHandler(CallTool.self) { [weak server] request in
+            let currentServer = server
             do {
-                let arguments = request.arguments ?? [:]
-                guard let toolName = MCPToolName(rawValue: request.name) else {
-                    return .init(
-                        content: [.text(
-                            text: "未知工具：\(request.name)",
-                            annotations: nil,
-                            _meta: nil
-                        )],
-                        isError: true
-                    )
-                }
-                switch toolName {
-                case .contractDescribe:
-                    return try success("目前 MCP 契約版本。", await service.contractDescription())
-
-                case .workspaceList:
-                    let states = await service.listWorkspaces()
-                    return try success("目前共有 \(states.count) 個工作區。", states)
-
-                case .workspaceOpen:
-                    let source = try requiredFileURL(arguments, "source_directory")
-                    let output = try optionalFileURL(arguments, "output_directory")
-                    let state = try await service.openWorkspace(
-                        sourceDirectoryURL: source,
-                        outputDirectoryURL: output,
-                        targetLanguageCode: arguments["target_language_code"]?.stringValue
-                    )
-                    return try success("工作區已開啟，共 \(state.pages.count) 頁。", state)
-
-                case .workspacePages:
-                    let workflow = try optionalEnum(
-                        arguments,
-                        "workflow",
-                        as: MCPWorkflowKind.self
-                    ) ?? .translation
-                    let list = try await service.pageTasks(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pendingOnly: arguments["pending_only"]?.boolValue ?? true,
-                        workflow: workflow
-                    )
-                    return try success(
-                        "\(workflow.rawValue) 工作流共 \(list.totalPageCount) 頁，其中 \(list.pendingPageCount) 頁仍有待辦。",
-                        list
-                    )
-
-                case .workspaceActivate:
-                    let id = try requiredUUID(arguments, "workspace_id")
-                    let state = try await service.activateWorkspace(workspaceID: id)
-                    return try success("已切換目前工作區。", state)
-
-                case .workspaceRescan:
-                    let id = try requiredUUID(arguments, "workspace_id")
-                    let state = try await service.rescanWorkspace(workspaceID: id)
-                    return try success("來源目錄已重新掃描，共 \(state.pages.count) 頁。", state)
-
-                case .workspaceSetOutput:
-                    let id = try requiredUUID(arguments, "workspace_id")
-                    let directory = try requiredFileURL(arguments, "output_directory")
-                    let state = try await service.setOutputDirectory(workspaceID: id, directoryURL: directory)
-                    return try success("輸出目錄已設定。", state)
-
-                case .workspaceConfigure:
-                    let id = try requiredUUID(arguments, "workspace_id")
-                    let reading = try optionalEnum(arguments, "reading_direction", as: ReadingDirection.self)
-                    let writing = try optionalEnum(arguments, "writing_direction", as: WritingDirection.self)
-                    let configuration = try await service.configure(
-                        workspaceID: id,
-                        targetLanguageCode: arguments["target_language_code"]?.stringValue,
-                        readingDirection: reading,
-                        writingDirection: writing,
-                        fontName: arguments["font_name"]?.stringValue,
-                        maskExpansion: number(arguments["mask_expansion"]),
-                        useImageToImageRestoration: arguments["use_image_to_image_restoration"]?.boolValue,
-                        regionSource: try optionalEnum(arguments, "region_source", as: MCPRegionSource.self)
-                    )
-                    return try success(
-                        "工作流設定已更新；區域來源為 \(configuration.regionSource.rawValue)，翻譯一律由 Agent 提供。",
-                        configuration
-                    )
-
-                case .glossaryList:
-                    let id = try requiredUUID(arguments, "workspace_id")
-                    let entries = try await service.glossaryEntries(workspaceID: id)
-                    return try success("專有名詞表共有 \(entries.count) 筆。", entries)
-
-                case .glossaryUpsert:
-                    let entry = try await service.upsertGlossaryEntry(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        entryID: optionalUUID(arguments, "entry_id"),
-                        sourceTerm: requiredString(arguments, "source_term"),
-                        translations: requiredStringDictionary(arguments, "translations"),
-                        note: arguments["note"]?.stringValue
-                    )
-                    return try success("專有名詞詞條已儲存。", entry)
-
-                case .glossaryRemove:
-                    let entries = try await service.removeGlossaryEntry(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        entryID: requiredUUID(arguments, "entry_id")
-                    )
-                    return try success("專有名詞詞條已移除。", entries)
-
-                case .modelLoad:
-                    let directory = try requiredFileURL(arguments, "model_directory")
-                    let model = try await service.loadModel(directoryURL: directory)
-                    return try success("模型已載入：\(model.displayName)", model)
-
-                case .pageInspect:
-                    let inspection = try await service.inspectPage(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id")
-                    )
-                    return try success("頁面狀態與 revision 已讀取。", inspection)
-
-                case .pageUpdate:
-                    let result = try await service.updatePage(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        title: try optionalString(arguments, "title"),
-                        position: try optionalInteger(arguments, "position")
-                    )
-                    return try success("頁面資料已更新。", result)
-
-                case .pagePrepareAgentTask:
-                    let progress = progressReporter(request: request, server: server)
-                    let payload = try await service.prepareAgentTask(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        progress: progress
-                    )
-                    return try .init(
-                        content: [
-                            .text(
-                                text: try json(payload.bundle),
+                return try await service.operationGate.withPermit { [currentServer] in
+                    let server = currentServer
+                    let arguments = request.arguments ?? [:]
+                    guard let toolName = MCPToolName(rawValue: request.name) else {
+                        return .init(
+                            content: [.text(
+                                text: "未知工具：\(request.name)",
                                 annotations: nil,
                                 _meta: nil
-                            ),
-                            .image(
-                                data: payload.sourceImageData.base64EncodedString(),
-                                mimeType: payload.sourceImageMIMEType,
-                                annotations: nil,
-                                _meta: nil
-                            )
-                        ],
-                        structuredContent: payload.bundle,
-                        isError: false
-                    )
-
-                case .pageSubmitAgentResult:
-                    let result = try await service.submitAgentResult(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        results: try requiredAgentRegionResults(arguments, "regions"),
-                        progress: progressReporter(request: request, server: server)
-                    )
-                    return try success("Agent 結果已一次回寫，步驟三翻譯排字預覽完成。", result)
-
-                case .pageRender:
-                    let result = try await service.renderPage(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        progress: progressReporter(request: request, server: server)
-                    )
-                    return try success("步驟三預覽已儲存到輸出位置。", result)
-
-                case .pageColorize:
-                    let result = try await service.colorizePage(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        progress: progressReporter(request: request, server: server)
-                    )
-                    return try success("上色步驟三預覽已完成。", result)
-
-                case .pagePrepareColorizationTask:
-                    let payload = try await service.prepareAgentColorizationTask(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        progress: progressReporter(request: request, server: server)
-                    )
-                    return try .init(
-                        content: [
-                            .text(
-                                text: try json(payload.bundle),
-                                annotations: nil,
-                                _meta: nil
-                            ),
-                            .image(
-                                data: payload.inputImageData.base64EncodedString(),
-                                mimeType: payload.inputImageMIMEType,
-                                annotations: nil,
-                                _meta: nil
-                            ),
-                            .image(
-                                data: payload.maskImageData.base64EncodedString(),
-                                mimeType: "image/png",
-                                annotations: nil,
-                                _meta: nil
-                            )
-                        ],
-                        structuredContent: payload.bundle,
-                        isError: false
-                    )
-
-                case .pageSubmitColorizationResult:
-                    let result = try await service.submitAgentColorizationResult(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        resultImageBase64: requiredString(arguments, "result_image_base64"),
-                        resultMIMEType: requiredString(arguments, "result_mime_type"),
-                        progress: progressReporter(request: request, server: server)
-                    )
-                    return try success("Agent 上色結果已寫回步驟三預覽。", result)
-
-                case .pageRenderColorization:
-                    let result = try await service.renderColorizationPage(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        progress: progressReporter(request: request, server: server)
-                    )
-                    return try success("上色步驟四輸出已儲存。", result)
-
-                case .pageResetColorization:
-                    let result = try await service.resetColorizationPage(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments)
-                    )
-                    return try success("本頁上色遮罩修正、預覽、輸出與進度已清除。", result)
-
-                case .regionBatchUpdate:
-                    let result = try await service.batchUpdateRegions(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        patches: try requiredRegionPatches(arguments, "regions")
-                    )
-                    return try success("區域 patch 已原子套用。", result)
-
-                case .regionReorder:
-                    let result = try await service.reorderRegions(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        expectedRevision: try requiredRevision(arguments),
-                        orderedRegionIDs: try requiredUUIDArray(arguments, "ordered_region_ids")
-                    )
-                    return try success("區域順序已更新。", result)
-
-                case .pageDetectMasks:
-                    return try await runWorkflow(
-                        .detectMasks,
-                        request: request,
-                        arguments: arguments,
-                        server: server,
-                        service: service
-                    )
-
-                case .pageTranslate:
-                    return try await runWorkflow(
-                        .translate,
-                        request: request,
-                        arguments: arguments,
-                        server: server,
-                        service: service
-                    )
-
-                case .pageCompose:
-                    return try await runWorkflow(
-                        .compose,
-                        request: request,
-                        arguments: arguments,
-                        server: server,
-                        service: service
-                    )
-
-                case .pageRunFull:
-                    return try await runWorkflow(
-                        .fullPage,
-                        request: request,
-                        arguments: arguments,
-                        server: server,
-                        service: service
-                    )
-
-                case .pageSupplementRegions:
-                    let result = try await service.supplementRegions(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        proposals: try requiredAgentRegionProposals(arguments, "regions")
-                    )
-                    return try success(
-                        "Agent 已補入 \(result.acceptedRegionIDs.count) 個區域，略過 \(result.skippedCount) 個重複區域。",
-                        result
-                    )
-
-                case .regionCreate:
-                    let workspaceID = try requiredUUID(arguments, "workspace_id")
-                    let pageID = try requiredUUID(arguments, "page_id")
-                    let region = try await service.createRegion(
-                        workspaceID: workspaceID,
-                        pageID: pageID,
-                        bounds: try requiredRect(arguments, "bounds")
-                    )
-                    return try success("已新增對話區域。", region)
-
-                case .regionUpdate:
-                    let workspaceID = try requiredUUID(arguments, "workspace_id")
-                    let pageID = try requiredUUID(arguments, "page_id")
-                    let regionID = try requiredUUID(arguments, "region_id")
-                    guard arguments["mask_polygons"] == nil,
-                          arguments["automatic_mask_enabled"] == nil else {
-                        throw MCPServiceError.invalidArguments(
-                            "MCP 遮罩由系統產生，不接受 mask_polygons 或 automatic_mask_enabled。"
+                            )],
+                            isError: true
                         )
                     }
-                    let region = try await service.updateRegion(
-                        workspaceID: workspaceID,
-                        pageID: pageID,
-                        regionID: regionID,
-                        sourceText: arguments["source_text"]?.stringValue,
-                        translatedText: arguments["translated_text"]?.stringValue,
-                        translationAnchor: try optionalPointUpdate(arguments, "translation_anchor"),
-                        bounds: try optionalRect(arguments, "bounds"),
-                        bubbleBounds: try optionalRectUpdate(arguments, "bubble_bounds"),
-                        fontName: arguments["font_name"]?.stringValue,
-                        fontSize: try optionalNumberUpdate(arguments, "font_size"),
-                        fontWeight: try optionalEnum(
+                    switch toolName {
+                    case .contractDescribe:
+                        return try success("目前 MCP 契約版本。", await service.contractDescription())
+
+                    case .workspaceList:
+                        let states = await service.listWorkspaces()
+                        return try success("目前共有 \(states.count) 個工作區。", states)
+
+                    case .workspaceOpen:
+                        let source = try requiredFileURL(arguments, "source_directory")
+                        let output = try optionalFileURL(arguments, "output_directory")
+                        let state = try await service.openWorkspace(
+                            sourceDirectoryURL: source,
+                            outputDirectoryURL: output,
+                            targetLanguageCode: arguments["target_language_code"]?.stringValue
+                        )
+                        return try success("工作區已開啟，共 \(state.pages.count) 頁。", state)
+
+                    case .workspacePages:
+                        let workflow = try optionalEnum(
                             arguments,
-                            "font_weight",
-                            as: DialogueFontWeight.self
-                        ),
-                        useAutomaticFontSize: arguments["automatic_font_size"]?.boolValue,
-                        writingDirection: try optionalEnum(arguments, "writing_direction", as: WritingDirection.self),
-                        textAlignment: try optionalEnum(arguments, "text_alignment", as: DialogueTextAlignment.self),
-                        textColorHex: arguments["text_color"]?.stringValue,
-                        strokeColorHex: arguments["stroke_color"]?.stringValue,
-                        strokeWidth: number(arguments["stroke_width"]),
-                        opacity: number(arguments["opacity"]),
-                        rotationDegrees: number(arguments["rotation_degrees"]),
-                        isVisible: arguments["is_visible"]?.boolValue
-                    )
-                    return try success("對話區域已更新；未修改 bounds／bubble_bounds 時會保留既有遮罩。", region)
+                            "workflow",
+                            as: MCPWorkflowKind.self
+                        ) ?? .translation
+                        let list = try await service.pageTasks(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pendingOnly: arguments["pending_only"]?.boolValue ?? true,
+                            workflow: workflow
+                        )
+                        return try success(
+                            "\(workflow.rawValue) 工作流共 \(list.totalPageCount) 頁，其中 \(list.pendingPageCount) 頁仍有待辦。",
+                            list
+                        )
 
-                case .regionRemove:
-                    let page = try await service.removeRegion(
-                        workspaceID: requiredUUID(arguments, "workspace_id"),
-                        pageID: requiredUUID(arguments, "page_id"),
-                        regionID: requiredUUID(arguments, "region_id")
-                    )
-                    return try success("對話區域已移除並更新專案資料。", page)
+                    case .workspaceActivate:
+                        let id = try requiredUUID(arguments, "workspace_id")
+                        let state = try await service.activateWorkspace(workspaceID: id)
+                        return try success("已切換目前工作區。", state)
 
+                    case .workspaceRescan:
+                        let id = try requiredUUID(arguments, "workspace_id")
+                        let state = try await service.rescanWorkspace(workspaceID: id)
+                        return try success("來源目錄已重新掃描，共 \(state.pages.count) 頁。", state)
+
+                    case .workspaceSetOutput:
+                        let id = try requiredUUID(arguments, "workspace_id")
+                        let directory = try requiredFileURL(arguments, "output_directory")
+                        let state = try await service.setOutputDirectory(workspaceID: id, directoryURL: directory)
+                        return try success("輸出目錄已設定。", state)
+
+                    case .workspaceConfigure:
+                        let id = try requiredUUID(arguments, "workspace_id")
+                        let reading = try optionalEnum(arguments, "reading_direction", as: ReadingDirection.self)
+                        let writing = try optionalEnum(arguments, "writing_direction", as: WritingDirection.self)
+                        let configuration = try await service.configure(
+                            workspaceID: id,
+                            targetLanguageCode: arguments["target_language_code"]?.stringValue,
+                            readingDirection: reading,
+                            writingDirection: writing,
+                            fontName: arguments["font_name"]?.stringValue,
+                            maskExpansion: number(arguments["mask_expansion"]),
+                            useImageToImageRestoration: arguments["use_image_to_image_restoration"]?.boolValue,
+                            regionSource: try optionalEnum(arguments, "region_source", as: MCPRegionSource.self)
+                        )
+                        return try success(
+                            "工作流設定已更新；區域來源為 \(configuration.regionSource.rawValue)，翻譯一律由 Agent 提供。",
+                            configuration
+                        )
+
+                    case .glossaryList:
+                        let id = try requiredUUID(arguments, "workspace_id")
+                        let entries = try await service.glossaryEntries(workspaceID: id)
+                        return try success("專有名詞表共有 \(entries.count) 筆。", entries)
+
+                    case .glossaryUpsert:
+                        let entry = try await service.upsertGlossaryEntry(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            entryID: optionalUUID(arguments, "entry_id"),
+                            sourceTerm: requiredString(arguments, "source_term"),
+                            translations: requiredStringDictionary(arguments, "translations"),
+                            note: arguments["note"]?.stringValue
+                        )
+                        return try success("專有名詞詞條已儲存。", entry)
+
+                    case .glossaryRemove:
+                        let entries = try await service.removeGlossaryEntry(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            entryID: requiredUUID(arguments, "entry_id")
+                        )
+                        return try success("專有名詞詞條已移除。", entries)
+
+                    case .modelLoad:
+                        let directory = try requiredFileURL(arguments, "model_directory")
+                        let model = try await service.loadModel(directoryURL: directory)
+                        return try success("模型已載入：\(model.displayName)", model)
+
+                    case .pageInspect:
+                        let inspection = try await service.inspectPage(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id")
+                        )
+                        return try success("頁面狀態與 revision 已讀取。", inspection)
+
+                    case .pageUpdate:
+                        let result = try await service.updatePage(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            title: try optionalString(arguments, "title"),
+                            position: try optionalInteger(arguments, "position")
+                        )
+                        return try success("頁面資料已更新。", result)
+
+                    case .pagePrepareAgentTask:
+                        let progress = progressReporter(request: request, server: server)
+                        let payload = try await service.prepareAgentTask(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            progress: progress
+                        )
+                        return try .init(
+                            content: [
+                                .text(
+                                    text: try json(payload.bundle),
+                                    annotations: nil,
+                                    _meta: nil
+                                ),
+                                .image(
+                                    data: payload.sourceImageData.base64EncodedString(),
+                                    mimeType: payload.sourceImageMIMEType,
+                                    annotations: nil,
+                                    _meta: nil
+                                )
+                            ],
+                            structuredContent: payload.bundle,
+                            isError: false
+                        )
+
+                    case .pageSubmitAgentResult:
+                        let result = try await service.submitAgentResult(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            results: try requiredAgentRegionResults(arguments, "regions"),
+                            progress: progressReporter(request: request, server: server)
+                        )
+                        return try success("Agent 結果已一次回寫，步驟三翻譯排字預覽完成。", result)
+
+                    case .pageRender:
+                        let result = try await service.renderPage(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            progress: progressReporter(request: request, server: server)
+                        )
+                        return try success("步驟三預覽已儲存到輸出位置。", result)
+
+                    case .pageColorize:
+                        let result = try await service.colorizePage(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            progress: progressReporter(request: request, server: server)
+                        )
+                        return try success("上色步驟三預覽已完成。", result)
+
+                    case .pagePrepareColorizationTask:
+                        let payload = try await service.prepareAgentColorizationTask(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            progress: progressReporter(request: request, server: server)
+                        )
+                        return try .init(
+                            content: [
+                                .text(
+                                    text: try json(payload.bundle),
+                                    annotations: nil,
+                                    _meta: nil
+                                ),
+                                .image(
+                                    data: payload.inputImageData.base64EncodedString(),
+                                    mimeType: payload.inputImageMIMEType,
+                                    annotations: nil,
+                                    _meta: nil
+                                ),
+                                .image(
+                                    data: payload.maskImageData.base64EncodedString(),
+                                    mimeType: "image/png",
+                                    annotations: nil,
+                                    _meta: nil
+                                )
+                            ],
+                            structuredContent: payload.bundle,
+                            isError: false
+                        )
+
+                    case .pageSubmitColorizationResult:
+                        let result = try await service.submitAgentColorizationResult(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            resultImageBase64: requiredString(arguments, "result_image_base64"),
+                            resultMIMEType: requiredString(arguments, "result_mime_type"),
+                            progress: progressReporter(request: request, server: server)
+                        )
+                        return try success("Agent 上色結果已寫回步驟三預覽。", result)
+
+                    case .pageRenderColorization:
+                        let result = try await service.renderColorizationPage(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            progress: progressReporter(request: request, server: server)
+                        )
+                        return try success("上色步驟四輸出已儲存。", result)
+
+                    case .pageResetColorization:
+                        let result = try await service.resetColorizationPage(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments)
+                        )
+                        return try success("本頁上色遮罩修正、預覽、輸出與進度已清除。", result)
+
+                    case .regionBatchUpdate:
+                        let result = try await service.batchUpdateRegions(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            patches: try requiredRegionPatches(arguments, "regions")
+                        )
+                        return try success("區域 patch 已原子套用。", result)
+
+                    case .regionReorder:
+                        let result = try await service.reorderRegions(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            expectedRevision: try requiredRevision(arguments),
+                            orderedRegionIDs: try requiredUUIDArray(arguments, "ordered_region_ids")
+                        )
+                        return try success("區域順序已更新。", result)
+
+                    case .pageDetectMasks:
+                        return try await runWorkflow(
+                            .detectMasks,
+                            request: request,
+                            arguments: arguments,
+                            server: server,
+                            service: service
+                        )
+
+                    case .pageTranslate:
+                        return try await runWorkflow(
+                            .translate,
+                            request: request,
+                            arguments: arguments,
+                            server: server,
+                            service: service
+                        )
+
+                    case .pageCompose:
+                        return try await runWorkflow(
+                            .compose,
+                            request: request,
+                            arguments: arguments,
+                            server: server,
+                            service: service
+                        )
+
+                    case .pageRunFull:
+                        return try await runWorkflow(
+                            .fullPage,
+                            request: request,
+                            arguments: arguments,
+                            server: server,
+                            service: service
+                        )
+
+                    case .pageSupplementRegions:
+                        let result = try await service.supplementRegions(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            proposals: try requiredAgentRegionProposals(arguments, "regions")
+                        )
+                        return try success(
+                            "Agent 已補入 \(result.acceptedRegionIDs.count) 個區域，略過 \(result.skippedCount) 個重複區域。",
+                            result
+                        )
+
+                    case .regionCreate:
+                        let workspaceID = try requiredUUID(arguments, "workspace_id")
+                        let pageID = try requiredUUID(arguments, "page_id")
+                        let region = try await service.createRegion(
+                            workspaceID: workspaceID,
+                            pageID: pageID,
+                            bounds: try requiredRect(arguments, "bounds")
+                        )
+                        return try success("已新增對話區域。", region)
+
+                    case .regionUpdate:
+                        let workspaceID = try requiredUUID(arguments, "workspace_id")
+                        let pageID = try requiredUUID(arguments, "page_id")
+                        let regionID = try requiredUUID(arguments, "region_id")
+                        guard arguments["mask_polygons"] == nil,
+                              arguments["automatic_mask_enabled"] == nil else {
+                            throw MCPServiceError.invalidArguments(
+                                "MCP 遮罩由系統產生，不接受 mask_polygons 或 automatic_mask_enabled。"
+                            )
+                        }
+                        let region = try await service.updateRegion(
+                            workspaceID: workspaceID,
+                            pageID: pageID,
+                            regionID: regionID,
+                            sourceText: arguments["source_text"]?.stringValue,
+                            translatedText: arguments["translated_text"]?.stringValue,
+                            translationAnchor: try optionalPointUpdate(arguments, "translation_anchor"),
+                            bounds: try optionalRect(arguments, "bounds"),
+                            bubbleBounds: try optionalRectUpdate(arguments, "bubble_bounds"),
+                            fontName: arguments["font_name"]?.stringValue,
+                            fontSize: try optionalNumberUpdate(arguments, "font_size"),
+                            fontWeight: try optionalEnum(
+                                arguments,
+                                "font_weight",
+                                as: DialogueFontWeight.self
+                            ),
+                            useAutomaticFontSize: arguments["automatic_font_size"]?.boolValue,
+                            writingDirection: try optionalEnum(arguments, "writing_direction", as: WritingDirection.self),
+                            textAlignment: try optionalEnum(arguments, "text_alignment", as: DialogueTextAlignment.self),
+                            textColorHex: arguments["text_color"]?.stringValue,
+                            strokeColorHex: arguments["stroke_color"]?.stringValue,
+                            strokeWidth: number(arguments["stroke_width"]),
+                            opacity: number(arguments["opacity"]),
+                            rotationDegrees: number(arguments["rotation_degrees"]),
+                            isVisible: arguments["is_visible"]?.boolValue
+                        )
+                        return try success("對話區域已更新；未修改 bounds／bubble_bounds 時會保留既有遮罩。", region)
+
+                    case .regionRemove:
+                        let page = try await service.removeRegion(
+                            workspaceID: requiredUUID(arguments, "workspace_id"),
+                            pageID: requiredUUID(arguments, "page_id"),
+                            regionID: requiredUUID(arguments, "region_id")
+                        )
+                        return try success("對話區域已移除並更新專案資料。", page)
+
+                    }
                 }
             } catch is CancellationError {
                 return .init(content: [.text(text: "操作已取消。", annotations: nil, _meta: nil)], isError: true)
@@ -413,108 +417,110 @@ struct MangaKitchenMCPServer {
 
     private static func registerResources(on server: Server, service: MCPWorkflowService) async {
         await server.withMethodHandler(ListResources.self) { _ in
-            let pages = await service.resources()
-            var resources = [
-                Resource(
-                    name: "MangaKitchen MCP 契約",
-                    uri: "mangakitchen://contract/current",
-                    description: "目前工具、欄位、revision 與原子更新規則",
-                    mimeType: "application/json"
-                ),
-                Resource(
-                    name: "MangaKitchen 工作區列表",
-                    uri: "mangakitchen://workspace/list",
-                    description: "目前 MCP process 內已開啟的所有目錄專案",
-                    mimeType: "application/json"
-                ),
-                Resource(
-                    name: "MangaKitchen 工作區",
-                    uri: "mangakitchen://workspace/current",
-                    description: "目前工作區、處理設定、頁面與模型狀態",
-                    mimeType: "application/json"
-                ),
-                Resource(
-                    name: "目前專案待處理頁面",
-                    uri: "mangakitchen://workspace/current/pages",
-                    description: "每頁的進度與 next_action 狀態摘要；不含 regions，且不會授權 Agent 自行執行",
-                    mimeType: "application/json"
-                ),
-                Resource(
-                    name: "目前專案上色待處理頁面",
-                    uri: "mangakitchen://workspace/current/colorization-pages",
-                    description: "每頁獨立上色進度與 next_action 狀態摘要",
-                    mimeType: "application/json"
-                ),
-                Resource(
-                    name: "目前專案專有名詞表",
-                    uri: "mangakitchen://workspace/current/glossary",
-                    description: "目前工作區的一詞對多語言專有名詞對照",
-                    mimeType: "application/json"
-                )
-            ]
-            let state = await service.state()
-            if let workspaceID = state.workspaceID {
-                resources.append(Resource(
-                    name: "目前工作區能力",
-                    uri: "mangakitchen://workspace/\(workspaceID.uuidString.lowercased())/capabilities",
-                    description: "目前工作區可使用的 MCP 契約能力",
-                    mimeType: "application/json"
-                ))
+            try await service.operationGate.withPermit {
+                let pages = await service.resources()
+                var resources = [
+                    Resource(
+                        name: "MangaKitchen MCP 契約",
+                        uri: "mangakitchen://contract/current",
+                        description: "目前工具、欄位、revision 與原子更新規則",
+                        mimeType: "application/json"
+                    ),
+                    Resource(
+                        name: "MangaKitchen 工作區列表",
+                        uri: "mangakitchen://workspace/list",
+                        description: "目前 MCP process 內已開啟的所有目錄專案",
+                        mimeType: "application/json"
+                    ),
+                    Resource(
+                        name: "MangaKitchen 工作區",
+                        uri: "mangakitchen://workspace/current",
+                        description: "目前工作區、處理設定、頁面與模型狀態",
+                        mimeType: "application/json"
+                    ),
+                    Resource(
+                        name: "目前專案待處理頁面",
+                        uri: "mangakitchen://workspace/current/pages",
+                        description: "每頁的進度與 next_action 狀態摘要；不含 regions，且不會授權 Agent 自行執行",
+                        mimeType: "application/json"
+                    ),
+                    Resource(
+                        name: "目前專案上色待處理頁面",
+                        uri: "mangakitchen://workspace/current/colorization-pages",
+                        description: "每頁獨立上色進度與 next_action 狀態摘要",
+                        mimeType: "application/json"
+                    ),
+                    Resource(
+                        name: "目前專案專有名詞表",
+                        uri: "mangakitchen://workspace/current/glossary",
+                        description: "目前工作區的一詞對多語言專有名詞對照",
+                        mimeType: "application/json"
+                    )
+                ]
+                let state = await service.state()
+                if let workspaceID = state.workspaceID {
+                    resources.append(Resource(
+                        name: "目前工作區能力",
+                        uri: "mangakitchen://workspace/\(workspaceID.uuidString.lowercased())/capabilities",
+                        description: "目前工作區可使用的 MCP 契約能力",
+                        mimeType: "application/json"
+                    ))
+                }
+                for page in pages {
+                    let base = "mangakitchen://page/\(page.id.uuidString.lowercased())"
+                    resources.append(Resource(
+                        name: "頁面 \(page.index)：\(page.title)",
+                        uri: base,
+                        description: "漫畫頁面狀態與所有對話區域",
+                        mimeType: "application/json"
+                    ))
+                    resources.append(Resource(
+                        name: "\(page.title) 區域",
+                        uri: base + "/regions",
+                        description: "頁面 revision 與全部可編輯區域",
+                        mimeType: "application/json"
+                    ))
+                    resources.append(Resource(
+                        name: "\(page.title) 原圖",
+                        uri: base + "/source",
+                        description: "來源漫畫圖片",
+                        mimeType: imageMIMEType(for: page.sourceURL)
+                    ))
+                    if page.maskURL != nil {
+                        resources.append(Resource(
+                            name: "\(page.title) 遮罩",
+                            uri: base + "/mask",
+                            description: "目前合併後的文字遮罩",
+                            mimeType: "image/png"
+                        ))
+                    }
+                    if page.outputURL != nil {
+                        resources.append(Resource(
+                            name: "\(page.title) 輸出",
+                            uri: base + "/output",
+                            description: "翻譯排版後的合成圖片",
+                            mimeType: "image/png"
+                        ))
+                    }
+                    if page.colorizationPreviewURL != nil {
+                        resources.append(Resource(
+                            name: "\(page.title) 上色預覽",
+                            uri: base + "/colorization-preview",
+                            description: "DDColor 完成但尚未輸出的上色預覽",
+                            mimeType: "image/png"
+                        ))
+                    }
+                    if page.colorizationOutputURL != nil {
+                        resources.append(Resource(
+                            name: "\(page.title) 上色輸出",
+                            uri: base + "/colorization-output",
+                            description: "已儲存至輸出目錄的上色圖片",
+                            mimeType: "image/png"
+                        ))
+                    }
+                }
+                return .init(resources: resources)
             }
-            for page in pages {
-                let base = "mangakitchen://page/\(page.id.uuidString.lowercased())"
-                resources.append(Resource(
-                    name: "頁面 \(page.index)：\(page.title)",
-                    uri: base,
-                    description: "漫畫頁面狀態與所有對話區域",
-                    mimeType: "application/json"
-                ))
-                resources.append(Resource(
-                    name: "\(page.title) 區域",
-                    uri: base + "/regions",
-                    description: "頁面 revision 與全部可編輯區域",
-                    mimeType: "application/json"
-                ))
-                resources.append(Resource(
-                    name: "\(page.title) 原圖",
-                    uri: base + "/source",
-                    description: "來源漫畫圖片",
-                    mimeType: imageMIMEType(for: page.sourceURL)
-                ))
-                if page.maskURL != nil {
-                    resources.append(Resource(
-                        name: "\(page.title) 遮罩",
-                        uri: base + "/mask",
-                        description: "目前合併後的文字遮罩",
-                        mimeType: "image/png"
-                    ))
-                }
-                if page.outputURL != nil {
-                    resources.append(Resource(
-                        name: "\(page.title) 輸出",
-                        uri: base + "/output",
-                        description: "翻譯排版後的合成圖片",
-                        mimeType: "image/png"
-                    ))
-                }
-                if page.colorizationPreviewURL != nil {
-                    resources.append(Resource(
-                        name: "\(page.title) 上色預覽",
-                        uri: base + "/colorization-preview",
-                        description: "DDColor 完成但尚未輸出的上色預覽",
-                        mimeType: "image/png"
-                    ))
-                }
-                if page.colorizationOutputURL != nil {
-                    resources.append(Resource(
-                        name: "\(page.title) 上色輸出",
-                        uri: base + "/colorization-output",
-                        description: "已儲存至輸出目錄的上色圖片",
-                        mimeType: "image/png"
-                    ))
-                }
-            }
-            return .init(resources: resources)
         }
 
         await server.withMethodHandler(ListResourceTemplates.self) { _ in
@@ -570,11 +576,13 @@ struct MangaKitchenMCPServer {
         }
 
         await server.withMethodHandler(ReadResource.self) { request in
-            switch try await service.readResource(uri: request.uri) {
-            case let .text(text, mimeType):
-                return .init(contents: [.text(text, uri: request.uri, mimeType: mimeType)])
-            case let .binary(data, mimeType):
-                return .init(contents: [.binary(data, uri: request.uri, mimeType: mimeType)])
+            try await service.operationGate.withPermit {
+                switch try await service.readResource(uri: request.uri) {
+                case let .text(text, mimeType):
+                    return .init(contents: [.text(text, uri: request.uri, mimeType: mimeType)])
+                case let .binary(data, mimeType):
+                    return .init(contents: [.binary(data, uri: request.uri, mimeType: mimeType)])
+                }
             }
         }
     }
@@ -636,8 +644,8 @@ struct MangaKitchenMCPServer {
     private static func optionalInteger(_ arguments: [String: Value], _ key: String) throws -> Int? {
         guard let raw = arguments[key] else { return nil }
         if let value = raw.intValue { return value }
-        if let value = raw.doubleValue, value.isFinite, value.rounded() == value {
-            return Int(exactly: value)
+        if let value = raw.doubleValue, value.isFinite, let integer = Int(exactly: value) {
+            return integer
         }
         throw MCPServiceError.invalidArguments("\(key) 必須是整數。")
     }

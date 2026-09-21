@@ -77,6 +77,13 @@ let package = Package(
             dependencies: ["MangaKitchenCore", "MangaKitchenRuntime"]
         ),
         .testTarget(
+            name: "MangaKitchenAppTests",
+            dependencies: [
+                "MangaKitchenApp", "MangaKitchenCore", "MangaKitchenApplication", "MangaKitchenRuntime",
+                .product(name: "NIOEmbedded", package: "swift-nio")
+            ]
+        ),
+        .testTarget(
             name: "MangaKitchenRuntimeTests",
             dependencies: [
                 "MangaKitchenCore",
