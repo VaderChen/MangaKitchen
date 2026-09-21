@@ -21,6 +21,12 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
         var outputName: String
     }
 
+    struct DFlashDraft: Hashable, Sendable {
+        var repositoryID: String
+        var directoryName: String = "DFlashDraftModel"
+        var fileNames: [String] = ["config.json", "model.safetensors"]
+    }
+
     var id: String
     var displayName: String
     var repositoryID: String
@@ -35,6 +41,7 @@ struct DownloadableModelDescriptor: Hashable, Sendable {
     var mmprojFileName: String? = nil
     var auxiliaryRepositoryID: String? = nil
     var auxiliaryFileNames: [String] = []
+    var dflashDraft: DFlashDraft? = nil
 
     var directoryName: String {
         repositoryID.split(separator: "/").last.map(String.init) ?? id
@@ -120,7 +127,10 @@ enum DownloadableModelCatalog {
             displayName: "Qwen3.5-4B 4-bit",
             repositoryID: "lmstudio-community/Qwen3.5-4B-MLX-4bit",
             capability: .imageToText,
-            recommended: true
+            recommended: true,
+            dflashDraft: .init(
+                repositoryID: "yugeshkarunamurthy/Qwen3.5-4b-Dflash-6bit-MLX"
+            )
         ),
         DownloadableModelDescriptor(
             id: "gemma-4-e4b-it-4bit",
@@ -158,7 +168,10 @@ enum DownloadableModelCatalog {
                 "video_preprocessor_config.json",
                 "vocab.json",
                 "merges.txt"
-            ]
+            ],
+            dflashDraft: .init(
+                repositoryID: "yugeshkarunamurthy/Qwen3.5-4b-Dflash-6bit-MLX"
+            )
         ),
         DownloadableModelDescriptor(
             id: "qwen3.5-9b-4bit",
@@ -170,7 +183,10 @@ enum DownloadableModelCatalog {
             id: "qwen3.8-27b-4bit",
             displayName: "Qwen3.8-27B 4-bit",
             repositoryID: "lmstudio-community/Qwen3.8-27B-MLX-4bit",
-            capability: .imageToText
+            capability: .imageToText,
+            dflashDraft: .init(
+                repositoryID: "z-lab/Qwen3.8-27B-DFlash2"
+            )
         ),
         DownloadableModelDescriptor(
             id: "qwen3.8-27b-q4-0-gguf",
@@ -191,7 +207,10 @@ enum DownloadableModelCatalog {
                 "video_preprocessor_config.json",
                 "vocab.json",
                 "merges.txt"
-            ]
+            ],
+            dflashDraft: .init(
+                repositoryID: "z-lab/Qwen3.8-27B-DFlash2"
+            )
         ),
         DownloadableModelDescriptor(
             id: "qwen3-vl-4b-4bit",
@@ -360,7 +379,20 @@ enum DownloadableModelCatalog {
                 includingPropertiesForKeys: [.isRegularFileKey],
                 options: [.skipsHiddenFiles]
               ) else { return false }
+        let rootComponentCount = directoryURL.standardizedFileURL.pathComponents.count
+        let draftDirectoryNames = Set([
+            "dflashdraftmodel",
+            "dflash2draftmodel",
+            "dflash-draft",
+            "dflash2-draft",
+            "draft"
+        ])
         for case let fileURL as URL in enumerator where fileURL.pathExtension == "safetensors" {
+            let relativeComponents = fileURL.standardizedFileURL.pathComponents.dropFirst(rootComponentCount)
+            let parentComponents = relativeComponents.dropLast()
+            guard !parentComponents.contains(where: {
+                draftDirectoryNames.contains($0.lowercased())
+            }) else { continue }
             return true
         }
         return false

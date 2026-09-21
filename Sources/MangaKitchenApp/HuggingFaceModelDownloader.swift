@@ -18,13 +18,34 @@ struct HuggingFaceModelDownloader: Sendable {
             storageDirectoryURL: storageDirectoryURL,
             model: model
         )
+
+        try fileManager.createDirectory(
+            at: storageDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        let stagingRootURL = storageDirectoryURL
+            .appendingPathComponent(".mangakitchen-downloads", isDirectory: true)
+        let hub = HubApi(downloadBase: stagingRootURL)
+
         if DownloadableModelCatalog.isCompleteModelDirectory(targetDirectoryURL, model: model) {
+            let dflashFiles = try await optionalDFlashFiles(model: model, hub: hub)
+            let progress = ModelDownloadProgressTracker(
+                files: dflashFiles ?? [],
+                handler: progressHandler
+            )
+            await progress.report()
+            try await downloadDFlashIfNeeded(
+                model: model,
+                targetDirectoryURL: targetDirectoryURL,
+                stagingRootURL: stagingRootURL,
+                files: dflashFiles ?? [],
+                progress: progress
+            )
+            await progress.finish()
             progressHandler(.completed)
             return targetDirectoryURL
         }
 
-        let stagingRootURL = storageDirectoryURL
-            .appendingPathComponent(".mangakitchen-downloads", isDirectory: true)
         let downloadedDirectoryURL = try repositoryDirectoryURL(
             model: model,
             stagingRootURL: stagingRootURL
@@ -37,28 +58,40 @@ struct HuggingFaceModelDownloader: Sendable {
                 targetDirectoryURL: targetDirectoryURL,
                 model: model
             )
+            let dflashFiles = try await optionalDFlashFiles(model: model, hub: hub)
+            let progress = ModelDownloadProgressTracker(
+                files: dflashFiles ?? [],
+                handler: progressHandler
+            )
+            await progress.report()
+            try await downloadDFlashIfNeeded(
+                model: model,
+                targetDirectoryURL: finalizedURL,
+                stagingRootURL: stagingRootURL,
+                files: dflashFiles ?? [],
+                progress: progress
+            )
+            await progress.finish()
             progressHandler(.completed)
             return finalizedURL
         }
 
-        try fileManager.createDirectory(
-            at: storageDirectoryURL,
-            withIntermediateDirectories: true
-        )
-        let hub = HubApi(downloadBase: stagingRootURL)
         let repository = Hub.Repo(id: model.repositoryID)
         let filenames = try await hub.getFilenames(from: repository)
         guard !filenames.isEmpty else {
             throw ModelDownloadError.emptyRepository(model.repositoryID)
         }
 
-        let files = try await repositoryFiles(
+        let modelFiles = try await repositoryFiles(
             filenames: filenames,
             model: model,
             hub: hub
-        ).sorted {
+        )
+        let dflashFiles = try await optionalDFlashFiles(model: model, hub: hub) ?? []
+        let files = (modelFiles + dflashFiles).sorted {
             if $0.byteCount == $1.byteCount {
-                return "\($0.repositoryID)/\($0.filename)" < "\($1.repositoryID)/\($1.filename)"
+                return "\($0.repositoryID)/\($0.filename)/\($0.destinationFilename)"
+                    < "\($1.repositoryID)/\($1.filename)/\($1.destinationFilename)"
             }
             return $0.byteCount > $1.byteCount
         }
@@ -77,7 +110,7 @@ struct HuggingFaceModelDownloader: Sendable {
         )
         do {
             try await downloadFiles(
-                files,
+                modelFiles,
                 directoryURL: downloadedDirectoryURL,
                 progress: progress
             )
@@ -96,8 +129,164 @@ struct HuggingFaceModelDownloader: Sendable {
             targetDirectoryURL: targetDirectoryURL,
             model: model
         )
+        try await downloadDFlashIfNeeded(
+            model: model,
+            targetDirectoryURL: finalizedURL,
+            stagingRootURL: stagingRootURL,
+            files: dflashFiles,
+            progress: progress
+        )
         await progress.finish()
         return finalizedURL
+    }
+
+    private func optionalDFlashFiles(
+        model: DownloadableModelDescriptor,
+        hub: HubApi
+    ) async throws -> [RepositoryFile]? {
+        guard let dflash = model.dflashDraft else { return nil }
+
+        let filenames: [String]
+        do {
+            filenames = try await hub.getFilenames(from: Hub.Repo(id: dflash.repositoryID))
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
+        guard !filenames.isEmpty,
+              dflash.fileNames.allSatisfy({ filenames.contains($0) }) else {
+            return nil
+        }
+
+        var files: [RepositoryFile] = []
+        files.reserveCapacity(dflash.fileNames.count)
+        for filename in dflash.fileNames {
+            try Task.checkCancellation()
+            do {
+                let metadata = try await hub.getFileMetadata(
+                    url: sourceURL(repositoryID: dflash.repositoryID, filename: filename)
+                )
+                files.append(
+                    RepositoryFile(
+                        repositoryID: dflash.repositoryID,
+                        filename: filename,
+                        destinationFilename: filename,
+                        byteCount: Int64(max(metadata.size ?? 1, 1))
+                    )
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                return nil
+            }
+        }
+        return files
+    }
+
+    private func downloadDFlashIfNeeded(
+        model: DownloadableModelDescriptor,
+        targetDirectoryURL: URL,
+        stagingRootURL: URL,
+        files: [RepositoryFile],
+        progress: ModelDownloadProgressTracker
+    ) async throws {
+        guard let dflash = model.dflashDraft,
+              !isCompleteDFlashDirectory(
+                  targetDirectoryURL.appendingPathComponent(dflash.directoryName),
+                  descriptor: dflash
+              ),
+              !files.isEmpty else { return }
+
+        let fileManager = FileManager.default
+        let stagedDirectoryURL = try repositoryDirectoryURL(
+            repositoryID: dflash.repositoryID,
+            stagingRootURL: stagingRootURL
+        )
+        if isCompleteDFlashDirectory(stagedDirectoryURL, descriptor: dflash) {
+            try installDFlashDirectory(
+                stagedDirectoryURL,
+                targetDirectoryURL: targetDirectoryURL,
+                descriptor: dflash
+            )
+            return
+        }
+
+        if fileManager.fileExists(atPath: stagedDirectoryURL.path) {
+            try fileManager.removeItem(at: stagedDirectoryURL)
+        }
+        try fileManager.createDirectory(
+            at: stagedDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        do {
+            try await downloadFiles(
+                files,
+                directoryURL: stagedDirectoryURL,
+                progress: progress
+            )
+            guard isCompleteDFlashDirectory(stagedDirectoryURL, descriptor: dflash) else {
+                try? fileManager.removeItem(at: stagedDirectoryURL)
+                return
+            }
+            try installDFlashDirectory(
+                stagedDirectoryURL,
+                targetDirectoryURL: targetDirectoryURL,
+                descriptor: dflash
+            )
+        } catch is CancellationError {
+            try? fileManager.removeItem(at: stagedDirectoryURL)
+            throw CancellationError()
+        } catch {
+            try? fileManager.removeItem(at: stagedDirectoryURL)
+        }
+    }
+
+    private func installDFlashDirectory(
+        _ stagedDirectoryURL: URL,
+        targetDirectoryURL: URL,
+        descriptor: DownloadableModelDescriptor.DFlashDraft
+    ) throws {
+        let fileManager = FileManager.default
+        let destinationURL = try destinationURL(
+            for: descriptor.directoryName,
+            in: targetDirectoryURL
+        )
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
+        }
+        try fileManager.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try fileManager.moveItem(at: stagedDirectoryURL, to: destinationURL)
+        guard isCompleteDFlashDirectory(destinationURL, descriptor: descriptor) else {
+            try? fileManager.removeItem(at: destinationURL)
+            return
+        }
+    }
+
+    private func isCompleteDFlashDirectory(
+        _ directoryURL: URL,
+        descriptor: DownloadableModelDescriptor.DFlashDraft
+    ) -> Bool {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: directoryURL.appendingPathComponent("config.json").path),
+              descriptor.fileNames.allSatisfy({
+                  fileManager.fileExists(atPath: directoryURL.appendingPathComponent($0).path)
+              }),
+              let data = try? Data(contentsOf: directoryURL.appendingPathComponent("config.json")),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let architectures = object["architectures"] as? [Any] else {
+            return false
+        }
+        return architectures.contains { value in
+            guard let architecture = value as? String else { return false }
+            let normalized = architecture
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return normalized == "dflashdraftmodel" || normalized == "dflash2draftmodel"
+        }
     }
 
     private func finalizeDownloadedModel(
@@ -127,16 +316,28 @@ struct HuggingFaceModelDownloader: Sendable {
         let stagingRootURL = storageDirectoryURL
             .standardizedFileURL
             .appendingPathComponent(".mangakitchen-downloads", isDirectory: true)
-        let repositoryDirectoryURL = try repositoryDirectoryURL(
+        let modelRepositoryDirectoryURL = try repositoryDirectoryURL(
             model: model,
             stagingRootURL: stagingRootURL
         )
+        var repositoryDirectoryURLs = [modelRepositoryDirectoryURL]
+        if let dflashRepositoryID = model.dflashDraft?.repositoryID {
+            let dflashRepositoryDirectoryURL = try repositoryDirectoryURL(
+                repositoryID: dflashRepositoryID,
+                stagingRootURL: stagingRootURL
+            )
+            if dflashRepositoryDirectoryURL.path != modelRepositoryDirectoryURL.path {
+                repositoryDirectoryURLs.append(dflashRepositoryDirectoryURL)
+            }
+        }
 
-        if fileManager.fileExists(atPath: repositoryDirectoryURL.path) {
-            try fileManager.removeItem(at: repositoryDirectoryURL)
+        for repositoryDirectoryURL in repositoryDirectoryURLs {
+            if fileManager.fileExists(atPath: repositoryDirectoryURL.path) {
+                try fileManager.removeItem(at: repositoryDirectoryURL)
+            }
         }
         try removeEmptyDirectories(
-            startingAt: repositoryDirectoryURL.deletingLastPathComponent(),
+            startingAt: modelRepositoryDirectoryURL.deletingLastPathComponent(),
             through: stagingRootURL,
             fileManager: fileManager
         )
@@ -187,18 +388,26 @@ struct HuggingFaceModelDownloader: Sendable {
         model: DownloadableModelDescriptor,
         hub: HubApi
     ) async throws -> [RepositoryFile] {
-        let requests: [(repositoryID: String, filename: String)]
+        let requests: [RepositoryFileRequest]
         if model.format == .ggufDirectory {
             guard let weightsFileName = model.weightsFileName,
                   filenames.contains(weightsFileName) else {
                 throw ModelDownloadError.incompleteRepository(model.repositoryID)
             }
-            var selected: [(String, String)] = [(model.repositoryID, weightsFileName)]
+            var selected = [RepositoryFileRequest(
+                repositoryID: model.repositoryID,
+                sourceFilename: weightsFileName,
+                destinationFilename: weightsFileName
+            )]
             if let mmprojFileName = model.mmprojFileName {
                 guard filenames.contains(mmprojFileName) else {
                     throw ModelDownloadError.incompleteRepository(model.repositoryID)
                 }
-                selected.append((model.repositoryID, mmprojFileName))
+                selected.append(RepositoryFileRequest(
+                    repositoryID: model.repositoryID,
+                    sourceFilename: mmprojFileName,
+                    destinationFilename: mmprojFileName
+                ))
             }
 
             if let auxiliaryRepositoryID = model.auxiliaryRepositoryID {
@@ -208,29 +417,47 @@ struct HuggingFaceModelDownloader: Sendable {
                     guard auxiliaryFilenames.contains(filename) else {
                         throw ModelDownloadError.incompleteRepository(auxiliaryRepositoryID)
                     }
-                    selected.append((auxiliaryRepositoryID, filename))
+                    selected.append(RepositoryFileRequest(
+                        repositoryID: auxiliaryRepositoryID,
+                        sourceFilename: filename,
+                        destinationFilename: filename
+                    ))
                 }
             } else {
                 selected.append(contentsOf: model.auxiliaryFileNames.map {
-                    (model.repositoryID, $0)
+                    RepositoryFileRequest(
+                        repositoryID: model.repositoryID,
+                        sourceFilename: $0,
+                        destinationFilename: $0
+                    )
                 })
             }
             requests = selected
         } else {
-            requests = filenames.map { (model.repositoryID, $0) }
+            requests = filenames.map {
+                RepositoryFileRequest(
+                    repositoryID: model.repositoryID,
+                    sourceFilename: $0,
+                    destinationFilename: $0
+                )
+            }
         }
 
         var files: [RepositoryFile] = []
         files.reserveCapacity(requests.count)
-        for (repositoryID, filename) in requests {
+        for request in requests {
             try Task.checkCancellation()
             let metadata = try await hub.getFileMetadata(
-                url: sourceURL(repositoryID: repositoryID, filename: filename)
+                url: sourceURL(
+                    repositoryID: request.repositoryID,
+                    filename: request.sourceFilename
+                )
             )
             files.append(
                 RepositoryFile(
-                    repositoryID: repositoryID,
-                    filename: filename,
+                    repositoryID: request.repositoryID,
+                    filename: request.sourceFilename,
+                    destinationFilename: request.destinationFilename,
                     byteCount: Int64(max(metadata.size ?? 1, 1))
                 )
             )
@@ -408,19 +635,29 @@ struct HuggingFaceModelDownloader: Sendable {
         model: DownloadableModelDescriptor,
         stagingRootURL: URL
     ) throws -> URL {
-        let repositoryComponents = model.repositoryID
+        try repositoryDirectoryURL(
+            repositoryID: model.repositoryID,
+            stagingRootURL: stagingRootURL
+        )
+    }
+
+    private func repositoryDirectoryURL(
+        repositoryID: String,
+        stagingRootURL: URL
+    ) throws -> URL {
+        let repositoryComponents = repositoryID
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
         guard !repositoryComponents.isEmpty,
               repositoryComponents.allSatisfy({ $0 != "." && $0 != ".." }) else {
-            throw ModelDownloadError.invalidRepositoryID(model.repositoryID)
+            throw ModelDownloadError.invalidRepositoryID(repositoryID)
         }
         let modelsRootURL = stagingRootURL.appendingPathComponent("models", isDirectory: true)
         let directoryURL = repositoryComponents.reduce(modelsRootURL) { url, component in
             url.appendingPathComponent(component, isDirectory: true)
         }.standardizedFileURL
         guard directoryURL.path.hasPrefix(stagingRootURL.standardizedFileURL.path + "/") else {
-            throw ModelDownloadError.invalidRepositoryID(model.repositoryID)
+            throw ModelDownloadError.invalidRepositoryID(repositoryID)
         }
         return directoryURL
     }
@@ -440,17 +677,17 @@ struct HuggingFaceModelDownloader: Sendable {
             try? fileManager.removeItem(at: partDirectoryURL)
         }
         for file in files {
-            let destinationURL = try destinationURL(for: file.filename, in: directoryURL)
+            let destinationURL = try destinationURL(for: file.destinationFilename, in: directoryURL)
             try fileManager.createDirectory(
                 at: destinationURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
             guard fileManager.createFile(atPath: destinationURL.path, contents: nil) else {
-                throw ModelDownloadError.cannotCreateFile(file.filename)
+                throw ModelDownloadError.cannotCreateFile(file.destinationFilename)
             }
             let handle = try FileHandle(forWritingTo: destinationURL)
             try handle.truncate(atOffset: UInt64(file.byteCount))
-            fileHandles[file.filename] = handle
+            fileHandles[file.destinationFilename] = handle
         }
 
         let segments = files.flatMap(Self.segments(for:))
@@ -480,14 +717,14 @@ struct HuggingFaceModelDownloader: Sendable {
                         Int64(data.count)
                     )
                 }
-                guard let handle = fileHandles[downloaded.segment.filename] else {
-                    throw ModelDownloadError.cannotCreateFile(downloaded.segment.filename)
+                guard let handle = fileHandles[downloaded.segment.destinationFilename] else {
+                    throw ModelDownloadError.cannotCreateFile(downloaded.segment.destinationFilename)
                 }
                 try handle.seek(toOffset: UInt64(downloaded.segment.startOffset))
                 try handle.write(contentsOf: data)
                 try fileManager.removeItem(at: downloaded.partURL)
                 await progress.advance(
-                    filename: downloaded.segment.filename,
+                    fileKey: downloaded.segment.progressKey,
                     byteCount: downloaded.segment.byteCount
                 )
                 if let segment = iterator.next() {
@@ -512,11 +749,11 @@ struct HuggingFaceModelDownloader: Sendable {
         try fileManager.removeItem(at: partDirectoryURL)
 
         for file in files {
-            let fileURL = try destinationURL(for: file.filename, in: directoryURL)
+            let fileURL = try destinationURL(for: file.destinationFilename, in: directoryURL)
             let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
             guard Int64(values.fileSize ?? -1) == file.byteCount else {
                 throw ModelDownloadError.invalidSegment(
-                    file.filename,
+                    file.destinationFilename,
                     file.byteCount,
                     Int64(values.fileSize ?? -1)
                 )
@@ -544,6 +781,7 @@ struct HuggingFaceModelDownloader: Sendable {
             return [DownloadSegment(
                 repositoryID: file.repositoryID,
                 filename: file.filename,
+                destinationFilename: file.destinationFilename,
                 startOffset: 0,
                 endOffset: file.byteCount - 1,
                 usesRange: false
@@ -555,6 +793,7 @@ struct HuggingFaceModelDownloader: Sendable {
             result.append(DownloadSegment(
                 repositoryID: file.repositoryID,
                 filename: file.filename,
+                destinationFilename: file.destinationFilename,
                 startOffset: startOffset,
                 endOffset: min(startOffset + segmentByteCount, file.byteCount) - 1,
                 usesRange: true
@@ -660,17 +899,33 @@ struct ModelDownloadProgressUpdate: Sendable {
 private struct RepositoryFile: Sendable {
     var repositoryID: String
     var filename: String
+    var destinationFilename: String
     var byteCount: Int64
+
+    var progressKey: String {
+        repositoryID + "/" + destinationFilename
+    }
+}
+
+private struct RepositoryFileRequest: Sendable {
+    var repositoryID: String
+    var sourceFilename: String
+    var destinationFilename: String
 }
 
 private struct DownloadSegment: Sendable {
     var repositoryID: String
     var filename: String
+    var destinationFilename: String
     var startOffset: Int64
     var endOffset: Int64
     var usesRange: Bool
 
     var byteCount: Int64 { endOffset - startOffset + 1 }
+
+    var progressKey: String {
+        repositoryID + "/" + destinationFilename
+    }
 }
 
 private struct DownloadedSegment: Sendable {
@@ -697,7 +952,7 @@ private actor ModelDownloadProgressTracker {
         handler: @Sendable @escaping (ModelDownloadProgressUpdate) -> Void
     ) {
         fileByteCounts = Dictionary(uniqueKeysWithValues: files.map {
-            ($0.filename, $0.byteCount)
+            ($0.progressKey, $0.byteCount)
         })
         totalByteCount = max(1, files.reduce(0) { $0 + $1.byteCount })
         self.handler = handler
@@ -707,11 +962,11 @@ private actor ModelDownloadProgressTracker {
         sendProgress()
     }
 
-    func advance(filename: String, byteCount: Int64) {
-        let maximum = fileByteCounts[filename] ?? byteCount
-        downloadedByteCounts[filename] = min(
+    func advance(fileKey: String, byteCount: Int64) {
+        let maximum = fileByteCounts[fileKey] ?? byteCount
+        downloadedByteCounts[fileKey] = min(
             maximum,
-            (downloadedByteCounts[filename] ?? 0) + max(byteCount, 0)
+            (downloadedByteCounts[fileKey] ?? 0) + max(byteCount, 0)
         )
         transferSamples.append(TransferSample(
             timestamp: Date.timeIntervalSinceReferenceDate,
