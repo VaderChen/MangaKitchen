@@ -45,6 +45,84 @@ final class AtomicOutputSmokeTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["page.png"])
     }
 
+    func testCopyPreservesBytesAcrossChunksAndReplacesOldOutput() throws {
+        let root = try temporaryRoot()
+        let source = root.appendingPathComponent("preview.png")
+        let output = root.appendingPathComponent("output.png")
+        let pattern = Data((0..<65_536).map { UInt8(truncatingIfNeeded: $0 * 31) })
+        var original = Data()
+        for _ in 0..<33 { original.append(pattern) }
+        original.append(contentsOf: [0, 255, 1])
+        try original.write(to: source)
+        try Data([42]).write(to: output)
+
+        try AtomicFileWriter.copy(from: source, to: output)
+
+        XCTAssertEqual(try Data(contentsOf: output), original)
+        XCTAssertEqual(try Data(contentsOf: source), original)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+            ["preview.png", "output.png"])
+    }
+
+    func testCopyOfEmptyFileCreatesNestedOutput() throws {
+        let root = try temporaryRoot()
+        let source = root.appendingPathComponent("empty")
+        let output = root.appendingPathComponent("nested/output")
+        try Data().write(to: source)
+        try AtomicFileWriter.copy(from: source, to: output)
+        XCTAssertEqual(try Data(contentsOf: output), Data())
+    }
+
+    func testCopyReadsSymbolicLinkContentsWithoutLinkingOutput() throws {
+        let root = try temporaryRoot()
+        let source = root.appendingPathComponent("preview.png")
+        let link = root.appendingPathComponent("link.png")
+        let output = root.appendingPathComponent("output.png")
+        try Data([1, 2, 3]).write(to: source)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: source)
+        try AtomicFileWriter.copy(from: link, to: output)
+        XCTAssertEqual(try Data(contentsOf: output), Data([1, 2, 3]))
+        XCTAssertEqual(try output.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink, false)
+        try Data([9]).write(to: output)
+        XCTAssertEqual(try Data(contentsOf: source), Data([1, 2, 3]))
+    }
+
+    func testCopyToSameFileDoesNotTruncateSource() throws {
+        let url = try temporaryRoot().appendingPathComponent("preview.png")
+        let original = Data([1, 2, 3, 4])
+        try original.write(to: url)
+        try AtomicFileWriter.copy(from: url, to: url)
+        XCTAssertEqual(try Data(contentsOf: url), original)
+    }
+
+    func testUnreadableCopySourcePreservesOldOutputAndCleansStaging() throws {
+        let root = try temporaryRoot()
+        let output = root.appendingPathComponent("output.png")
+        try Data([42]).write(to: output)
+        for source in [root.appendingPathComponent("missing.png"), root] {
+            XCTAssertThrowsError(try AtomicFileWriter.copy(from: source, to: output))
+            XCTAssertEqual(try Data(contentsOf: output), Data([42]))
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["output.png"])
+        }
+    }
+
+    func testCancelledCopyPreservesOldOutput() async throws {
+        let root = try temporaryRoot()
+        let source = root.appendingPathComponent("preview.png")
+        let output = root.appendingPathComponent("output.png")
+        try Data([1, 2, 3]).write(to: source)
+        try Data([42]).write(to: output)
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try AtomicFileWriter.copy(from: source, to: output)
+        }
+        do { try await task.value; XCTFail("取消不得替換輸出") }
+        catch is CancellationError {} catch { XCTFail("\(error)") }
+        XCTAssertEqual(try Data(contentsOf: output), Data([42]))
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+            ["preview.png", "output.png"])
+    }
+
     func testPNGOutputCanBeDecodedAfterAtomicReplacement() throws {
         let output = try temporaryRoot().appendingPathComponent("nested/page.png")
         let context = try XCTUnwrap(CGContext(data: nil, width: 8, height: 8,

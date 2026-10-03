@@ -2648,8 +2648,7 @@ final class AppStore: ObservableObject {
             at: paths.outputURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let previewData = try Data(contentsOf: completedPreviewURL)
-        try previewData.write(to: paths.outputURL, options: .atomic)
+        try AtomicFileWriter.copy(from: completedPreviewURL, to: paths.outputURL)
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         pages[index].outputURL = paths.outputURL
         pages[index].stage = .completed
@@ -2689,7 +2688,7 @@ final class AppStore: ObservableObject {
             at: outputURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try Data(contentsOf: previewURL).write(to: outputURL, options: .atomic)
+        try AtomicFileWriter.copy(from: previewURL, to: outputURL)
         guard let index = pages.firstIndex(where: { $0.id == pageID }) else { return }
         pages[index].colorizationOutputURL = outputURL
         pages[index].colorizationState = ColorizationPageState(

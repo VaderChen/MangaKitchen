@@ -659,6 +659,23 @@ private class PixelUnshuffleBlock: Module, UnaryLayer {
 
 // MARK: - Processor
 
+private enum LFM2VLInputError: LocalizedError {
+    case missingImageToken
+    case imageCountMismatch(expected: Int, actual: Int)
+    case featureCountMismatch(tokens: Int, features: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingImageToken:
+            "The LFM tokenizer does not define <image>."
+        case let .imageCountMismatch(expected, actual):
+            "LFM image placeholders do not match the input images: \(actual) / \(expected)."
+        case let .featureCountMismatch(tokens, features):
+            "LFM image features and image tokens do not match: \(features) / \(tokens)."
+        }
+    }
+}
+
 /// LFM2 VL VLM `UserInputProcessor`.
 ///
 /// This is meant to be used with ``LFM2VL`` and is typically created by ``VLMModelFactory``.
@@ -695,25 +712,42 @@ public struct LFM2VLProcessor: UserInputProcessor {
         let tileSize = config.tileSize
         let patchSize = config.encoderPatchSize
 
-        // Calculate number of tiles
-        let numTilesH = max(1, min(config.maxTiles, Int(ceil(Double(height) / Double(tileSize)))))
-        let numTilesW = max(1, min(config.maxTiles, Int(ceil(Double(width) / Double(tileSize)))))
-
-        // Calculate actual resize dimensions
-        let resizedHeight = numTilesH * tileSize
-        let resizedWidth = numTilesW * tileSize
+        let resizedHeight: Int
+        let resizedWidth: Int
+        if config.doImageSplitting == false {
+            // Respect the nested, non-tiling processor config shipped with LFM2.5.
+            // Match the reference processor's aspect ratio and image-token budget.
+            let factor = patchSize * config.downsampleFactor
+            let minPixels = config.minImageTokens * factor * factor
+            let maxPixels = min(
+                config.maxImageTokens * factor * factor,
+                config.maxNumPatches * patchSize * patchSize)
+            var h = max(factor, Int((Double(height) / Double(factor)).rounded(.toNearestOrEven)) * factor)
+            var w = max(factor, Int((Double(width) / Double(factor)).rounded(.toNearestOrEven)) * factor)
+            if h * w > maxPixels {
+                let scale = sqrt(Double(height * width) / Double(maxPixels))
+                h = max(factor, Int(floor(Double(height) / scale / Double(factor))) * factor)
+                w = max(factor, Int(floor(Double(width) / scale / Double(factor))) * factor)
+            } else if h * w < minPixels {
+                let scale = sqrt(Double(minPixels) / Double(height * width))
+                h = Int(ceil(Double(height) * scale / Double(factor))) * factor
+                w = Int(ceil(Double(width) * scale / Double(factor))) * factor
+            }
+            resizedHeight = h
+            resizedWidth = w
+        } else {
+            // Preserve the behavior of older, flat processor configurations.
+            resizedHeight = max(1, min(config.maxTiles, Int(ceil(Double(height) / Double(tileSize))))) * tileSize
+            resizedWidth = max(1, min(config.maxTiles, Int(ceil(Double(width) / Double(tileSize))))) * tileSize
+        }
 
         // Resize the image
         let resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
         let resizedImage = image.toSRGB().resampled(to: resizedSize, method: .bicubic)
 
-        // Calculate patches per tile
-        let patchesPerTileH = tileSize / patchSize
-        let patchesPerTileW = tileSize / patchSize
-
         // Total number of patches
-        let totalPatchesH = numTilesH * patchesPerTileH
-        let totalPatchesW = numTilesW * patchesPerTileW
+        let totalPatchesH = resizedHeight / patchSize
+        let totalPatchesW = resizedWidth / patchSize
 
         // Convert to MLXArray and extract patches
         let normalizedImage = resizedImage.normalized(
@@ -774,16 +808,13 @@ public struct LFM2VLProcessor: UserInputProcessor {
 
         // Calculate how many image tokens we need per image
         let downsampleFactor = config.downsampleFactor
-        var totalImageTokens = 0
-        for shape in allSpatialShapes {
-            let h = shape.0 / downsampleFactor
-            let w = shape.1 / downsampleFactor
-            totalImageTokens += h * w
-        }
-
         // Replace image placeholder tokens with the correct count
-        // image_token_id is 396 for LFM2 VL models
-        let imageTokenId = 396
+        // LFM2 uses 396; LFM2.5's expanded vocabulary uses 124907.
+        guard let imageTokenId = tokenizer.convertTokenToId("<image>") else {
+            throw LFM2VLInputError.missingImageToken
+        }
+        let imageStartTokenId = tokenizer.convertTokenToId("<|image_start|>")
+        let imageEndTokenId = tokenizer.convertTokenToId("<|image_end|>")
         var newPromptTokens = [Int]()
         var imageIdx = 0
         var i = 0
@@ -795,21 +826,39 @@ public struct LFM2VLProcessor: UserInputProcessor {
                     count += 1
                 }
                 // Replace with correct number for this image
-                if imageIdx < allSpatialShapes.count {
-                    let shape = allSpatialShapes[imageIdx]
-                    let h = shape.0 / downsampleFactor
-                    let w = shape.1 / downsampleFactor
-                    let numTokens = h * w
-                    for _ in 0 ..< numTokens {
-                        newPromptTokens.append(imageTokenId)
-                    }
-                    imageIdx += 1
+                guard imageIdx < allSpatialShapes.count else {
+                    throw LFM2VLInputError.imageCountMismatch(
+                        expected: allSpatialShapes.count, actual: imageIdx + 1)
                 }
+                let shape = allSpatialShapes[imageIdx]
+                let h = shape.0 / downsampleFactor
+                let w = shape.1 / downsampleFactor
+                let numTokens = h * w
+                // The checkpoint chat template emits only <image>; the processor
+                // supplies the image boundary tokens, as in Transformers.
+                if let start = imageStartTokenId, imageEndTokenId != nil,
+                    newPromptTokens.last != start
+                {
+                    newPromptTokens.append(start)
+                }
+                for _ in 0 ..< numTokens {
+                    newPromptTokens.append(imageTokenId)
+                }
+                if imageStartTokenId != nil, let end = imageEndTokenId,
+                    i + count == promptTokens.count || promptTokens[i + count] != end
+                {
+                    newPromptTokens.append(end)
+                }
+                imageIdx += 1
                 i += count
             } else {
                 newPromptTokens.append(promptTokens[i])
                 i += 1
             }
+        }
+        guard imageIdx == allSpatialShapes.count else {
+            throw LFM2VLInputError.imageCountMismatch(
+                expected: allSpatialShapes.count, actual: imageIdx)
         }
         promptTokens = newPromptTokens
 
@@ -875,7 +924,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         pixelValues: MLXArray?,
         spatialShapes: MLXArray?,
         pixelAttentionMask: MLXArray?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Ensure inputIds has batch dimension
         var batchedInputIds = inputIds
         if inputIds.ndim == 1 {
@@ -933,7 +982,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         let concatenatedImageFeatures = concatenated(imageFeatures, axis: 0)
 
         // Merge image features with text embeddings
-        return mergeInputIdsWithImageFeatures(
+        return try mergeInputIdsWithImageFeatures(
             imageFeatures: concatenatedImageFeatures,
             inputsEmbeds: inputsEmbeds,
             inputIds: inputIds,
@@ -946,7 +995,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray,
         imageTokenIndex: Int
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Find image token positions
         var imageIndices = [Int]()
         for (i, v) in inputIds.flattened().asArray(Int.self).enumerated() {
@@ -957,9 +1006,8 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let nImageFeatures = imageFeatures.dim(0)
         if imageIndices.count != nImageFeatures {
-            fatalError(
-                "Image features and image tokens do not match: tokens: \(imageIndices.count), features \(nImageFeatures)"
-            )
+            throw LFM2VLInputError.featureCountMismatch(
+                tokens: imageIndices.count, features: nImageFeatures)
         }
 
         // Make sure shapes match before assignment
@@ -1027,7 +1075,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask = MLXArray.ones([1, numPatches]).asType(.int32)
         }
 
-        let inputEmbeddings = getInputEmbeddings(
+        let inputEmbeddings = try getInputEmbeddings(
             inputIds: input.text.tokens,
             pixelValues: pixelValues,
             spatialShapes: spatialShapes,
@@ -1264,25 +1312,69 @@ public struct LFM2VLConfiguration: Codable, Sendable {
 
 /// Configuration for ``LFM2VLProcessor``
 public struct LFM2VLProcessorConfiguration: Codable, Sendable {
-    // Fields at top level (matching typical preprocessor_config.json structure)
-    private let _imageMean: [CGFloat]?
-    private let _imageStd: [CGFloat]?
-    private let _tileSize: Int?
-    private let _encoderPatchSize: Int?
-    private let _maxTiles: Int?
-    private let _downsampleFactor: Int?
+    private struct Fields: Codable, Sendable {
+        let imageMean: [CGFloat]?
+        let imageStd: [CGFloat]?
+        let tileSize: Int?
+        let encoderPatchSize: Int?
+        let maxTiles: Int?
+        let downsampleFactor: Int?
+        let doImageSplitting: Bool?
+        let minImageTokens: Int?
+        let maxImageTokens: Int?
+        let maxNumPatches: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case imageMean = "image_mean"
+            case imageStd = "image_std"
+            case tileSize = "tile_size"
+            case encoderPatchSize = "encoder_patch_size"
+            case maxTiles = "max_tiles"
+            case downsampleFactor = "downsample_factor"
+            case doImageSplitting = "do_image_splitting"
+            case minImageTokens = "min_image_tokens"
+            case maxImageTokens = "max_image_tokens"
+            case maxNumPatches = "max_num_patches"
+        }
+    }
+
+    private let fields: Fields
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        fields = try container.decodeIfPresent(Fields.self, forKey: .imageProcessor)
+            ?? Fields(from: decoder)
+        guard imageMean.count == 3, imageStd.count == 3,
+            imageStd.allSatisfy({ $0 > 0 }), encoderPatchSize > 0,
+            downsampleFactor > 0, tileSize > 0, maxTiles > 0,
+            tileSize % (encoderPatchSize * downsampleFactor) == 0,
+            minImageTokens > 0, maxImageTokens >= minImageTokens,
+            maxNumPatches >= minImageTokens * downsampleFactor * downsampleFactor
+        else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: decoder.codingPath, debugDescription: "Invalid LFM image processor dimensions or normalization."))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try fields.encode(to: encoder)
+    }
 
     // Default values matching LFM2 VL models
     public var imageMean: [CGFloat] {
-        _imageMean ?? [0.5, 0.5, 0.5]
+        fields.imageMean ?? [0.5, 0.5, 0.5]
     }
     public var imageStd: [CGFloat] {
-        _imageStd ?? [0.5, 0.5, 0.5]
+        fields.imageStd ?? [0.5, 0.5, 0.5]
     }
-    public var tileSize: Int { _tileSize ?? 512 }
-    public var encoderPatchSize: Int { _encoderPatchSize ?? 16 }
-    public var maxTiles: Int { _maxTiles ?? 10 }
-    public var downsampleFactor: Int { _downsampleFactor ?? 2 }
+    public var tileSize: Int { fields.tileSize ?? 512 }
+    public var encoderPatchSize: Int { fields.encoderPatchSize ?? 16 }
+    public var maxTiles: Int { fields.maxTiles ?? 10 }
+    public var downsampleFactor: Int { fields.downsampleFactor ?? 2 }
+    public var doImageSplitting: Bool? { fields.doImageSplitting }
+    public var minImageTokens: Int { fields.minImageTokens ?? 64 }
+    public var maxImageTokens: Int { fields.maxImageTokens ?? 256 }
+    public var maxNumPatches: Int { fields.maxNumPatches ?? 1024 }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
         (imageMean[0], imageMean[1], imageMean[2])
@@ -1292,11 +1384,6 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case _imageMean = "image_mean"
-        case _imageStd = "image_std"
-        case _tileSize = "tile_size"
-        case _encoderPatchSize = "encoder_patch_size"
-        case _maxTiles = "max_tiles"
-        case _downsampleFactor = "downsample_factor"
+        case imageProcessor = "image_processor"
     }
 }

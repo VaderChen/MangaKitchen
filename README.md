@@ -10,6 +10,12 @@ MangaKitchen is a native macOS workspace for translating comics. Its frontend re
 
 [Download the latest notarized DMG](https://github.com/VaderChen/MangaKitchen/releases/latest) · Requires macOS 14 or later
 
+## Latest Release: 1.26.1003 (build 2100)
+
+This release reduces allocation and copying in PSD export, output saving, mask refinement, bubble postprocessing, and batch snapshots while preserving the UI, workflow, and output semantics. The documented PSD benchmark reduced peak process RSS from 806.5 MiB to 176.4 MiB; this is a specific export workload, not a whole-app memory claim.
+
+See the [release notes](Documentation/RELEASE_NOTES_1.26.1003-build-2100.md), [output benchmarks](Documentation/PERFORMANCE_AUDIT_2026-10-03.md), and [function-level measurements](Documentation/FUNCTION_OPTIMIZATION_2026-10-03.md). [Recent-model research](Documentation/MODEL_RESEARCH_2026-10-03.md) and [local evaluation](Documentation/MODEL_EVALUATION_2026-10-03.md) explain why LFM2.5-VL-3B and Granite 4.2 3B were not added to the download catalog; current defaults are unchanged.
+
 ## Copyright and Lawful Use
 
 All imported comic pages, characters, text, artwork, trademarks, and other content remain the property of their respective authors, publishers, licensed platforms, and other lawful rights holders. Using MangaKitchen does not transfer those rights or grant permission to reproduce, translate, publicly transmit, distribute, or sell a work.
@@ -20,9 +26,9 @@ Do not use MangaKitchen to create or distribute pirated copies, unauthorized sca
 
 ## Software Licensing
 
-MangaKitchen uses a dual-licensing model. Code in this repository that is owned by the MangaKitchen copyright holder and does not state otherwise is offered by default under the [GNU General Public License version 3 only](LICENSE) (`GPL-3.0-only`). A separate [commercial license](COMMERCIAL-LICENSE.md) is available for closed-source integration, proprietary distribution, or different contractual terms.
+MangaKitchen is provided under the [MangaKitchen Source-Available License — No Commercial Sales, version 1.1](LICENSE.en.md). Subject to its terms, you may obtain, run, inspect, modify, and distribute the software free of charge, including for internal company use. Commercial sales and the paid services described in the license require a separate written agreement; see [commercial licensing](COMMERCIAL-LICENSE.md).
 
-GPLv3 itself permits commercial use and paid distribution, subject to its source-code and copyleft obligations. Commercial licensing is an alternative and does not restrict rights already received under GPLv3. Third-party packages, models and weights, fonts, and comic content are outside MangaKitchen's dual license and remain subject to their own terms.
+This is a source-available license, not an OSI-approved open-source license. The [Traditional Chinese text](LICENSE.md) governs. Third-party packages, models and weights, fonts, and comic content remain subject to their own terms.
 
 ## Current Features
 
@@ -72,7 +78,7 @@ Both translation modes follow these four steps:
 
 1. **Project and pages**: choose a source directory, scan images recursively, and build a multi-selectable, batch-processable page list.
 2. **Text, masks, and clean background**: locate dialogue BBOX candidates and bubble shapes with the bundled Core ML segmentation model, refine the original-image pixels into glyph masks, apply manual strokes, and produce the confirmed text-free background.
-3. **OCR, translation, and typesetting preview**: the GUI extracts source text with bundled OCR or the selected VLM path, then translates with the selected multimodal model. Optional second-pass review and semantic QA use that same translation path. MCP instead gives a multimodal Agent an App-generated page bundle. The App preserves stage-two artifacts, optionally applies SR, and renders the complete HTML/CSS translation preview.
+3. **OCR, translation, and typesetting preview**: the GUI extracts source text with bundled OCR or the selected VLM path, then translates with the selected text-only or multimodal model. Optional second-pass review and semantic QA use that same translation path. MCP instead gives a multimodal Agent an App-generated page bundle. The App preserves stage-two artifacts, optionally applies SR, and renders the complete HTML/CSS translation preview.
 4. **Output**: copy the confirmed stage-three preview to the project's output directory. This stage does not rerun detection, masking, cleanup, transcription, translation, SR, or typesetting.
 
 The four steps define resumable states, artifacts, and dependencies; they are not a mandatory checklist that restarts at step 1 every time. Both the GUI and MCP should inspect the App-provided page state and work package first, then begin at any step whose prerequisites already exist. Existing masks can go directly to translation, existing translations can go directly to typesetting or composition, and a single region can be edited without reprocessing the page. Completed region detection, masks, translations, and manual edits are not overwritten unless a user or Agent explicitly requests that stage again.
@@ -88,11 +94,11 @@ Before starting at any stage, each page must be validated against its actual art
 
 Colorization has its own four steps: select pages and prefer an existing translated output, build and edit the anti-dialogue mask, create a preview with downloaded DDColor Tiny or an external multimodal Agent, then save that existing preview as final output. Its mask uses white for pixels that may be colorized and black for protected dialogue or manually erased areas. Colorization requires the App-confirmed dialogue regions and mask data first, but its progress, preview, reset action, and output do not overwrite translation state.
 
-### Mode A: Download Multimodal Models and Work Fully Offline
+### Mode A: Download Models and Work Fully Offline
 
-Download a multimodal translation model and, when needed, DDColor Tiny under Settings → Models. Region detection, source extraction, translation, background restoration, composition, and local colorization run on the Mac. Once model files have been downloaded, comic content does not need to be sent to an external AI service.
+Download a text-only or multimodal translation model and, when needed, DDColor Tiny under Settings → Models. Region detection, source extraction, translation, background restoration, composition, and local colorization run on the Mac. Once model files have been downloaded, comic content does not need to be sent to an external AI service.
 
-- Translation always uses `imageToText`; PP-OCR **Re-extract text** can run without the VLM, but translation, review, and semantic QA require the multimodal model. The app never falls back to Apple Vision OCR; an MCP Agent can provide source text and translations instead. Sound effects remain outside the current workflow.
+- Translation supports `textToText` for OCR or confirmed source text, and `imageToText` for page image context. PP-OCR **Re-extract text** can run without a VLM. The app never falls back to Apple Vision OCR; an MCP Agent can provide source text and translations instead. Sound effects remain outside the current workflow.
 - In the translation step, “Re-extract text” refreshes source text and clears dependent translations, while “Re-translate” reuses the current source text. A region-level refresh updates only the selected region and then rerenders the page preview.
 - Background restoration belongs to step 2 and uses the configured Metal GPU neighborhood repair or CPU dominant-color speech-area repair; GPU failures automatically fall back to CPU. Later steps consume this clean background and never regenerate it.
 - The GUI can run each step separately or use “Process Selected/All.” One-click processing still executes steps 2–4 in order and preserves their intermediate data.
@@ -135,6 +141,8 @@ swift run MangaKitchen --mcp=on
 The GUI always starts. When `--mcp` is omitted, the saved Settings value is used; `--mcp=on|off` overrides it for the current launch. The listener binds to `0.0.0.0`, uses port `12080` by default, and only accepts the actual source IP/CIDR entries in the allowlist. The default allowlist contains only `127.0.0.1`. The local MCP URL is `http://127.0.0.1:12080/mcp`; `--mcp-port=<port>` overrides the port for the current launch. Closing the main window does not terminate the app, which can be reopened from the menu bar.
 
 Data-location changes take effect after restart. Image-to-text, image-colorization, and super-resolution model changes are applied immediately. Changing the MCP switch, port, or allowlist restarts the listener.
+
+For a local `.app` bundle, run `./build.command --release`; the default output is `Dist/MangaKitchen.app`. `APP_VERSION`, `APP_BUILD_VERSION`, and `OUTPUT_DIRECTORY` override its version and destination. The script includes Metal resources and license notices and applies an ad-hoc signature. Official downloadable DMGs separately receive Developer ID signing and Apple notarization.
 
 ### SwiftPM and Metal build troubleshooting
 
@@ -199,7 +207,7 @@ For text-only translation, choose the Qwen3 4B or 8B entry in Settings → Model
 
 ### DFlash speculative decoding
 
-The Translation and Multimodal model settings can enable DFlash for compatible Qwen3／Qwen3.5 targets. The app automatically discovers the Draft in the same model root as the selected target, so no separate Draft path is stored. The native Swift／MLX implementation runs on the same Metal runtime as the target model; it does not replace Safetensors／MLX checkpoint or GGUF loading. Qwen3-VL and Qwen3.5-VL perform a vision-aware prefill before entering the same speculative decoding loop; other VLM architectures safely fall back to standard generation. If the draft is missing, incompatible, invalid, or encounters an unsupported generation configuration, the App logs the reason and falls back to standard generation. The Draft weights are not bundled with the App.
+The Translation and Multimodal model settings can enable DFlash for compatible Qwen3／Qwen3.5 targets. The app automatically discovers the Draft in the same model root as the selected target, so no separate Draft path is stored. The native Swift／MLX implementation runs on the same Metal runtime as the target model; it does not replace Safetensors／MLX checkpoint or GGUF loading. Qwen3-VL and Qwen3.5-VL perform a vision-aware prefill before entering the same speculative decoding loop; other VLM architectures safely fall back to standard generation. If the draft is missing, incompatible, invalid, or encounters an unsupported generation configuration, the App logs the reason and falls back to standard generation. The Draft weights are not bundled with the App. Managed downloads automatically fetch a compatible Draft into `DFlashDraftModel` beside the main model. Draft download failures do not block the main installation, and existing models can download a missing Draft without reinstalling the main weights.
 
 The `mlx-swift-lm` factory selects architecture from `config.json`, so a single safetensors file is not enough. Keep the tokenizer, chat template, and config files together. Other multimodal models should also retain their processor configuration; for Qwen3.5 checkpoints with `vision_config`, the factory derives a compatible Qwen3VLProcessor configuration when `processor_config.json` and `preprocessor_config.json` are absent.
 
@@ -291,7 +299,7 @@ MangaKitchenApp/MCP
 
 See [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md) for architectural decisions and data flow.
 See [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md) for the versioned translation/colorization Swift, JavaScript, and MCP contract.
-See [the build 0052 release notes](Documentation/RELEASE_NOTES_1.26.0829-build-0052.md) for the latest packaged changes, Developer ID signature, notarization status, and verified download checksum.
+See [the build 2100 release notes](Documentation/RELEASE_NOTES_1.26.1003-build-2100.md) for the latest packaged changes, Developer ID signature, notarization status, and verified download checksum.
 See [the current development release notes](Documentation/RELEASE_NOTES_UNRELEASED.md) for changes after the latest package.
 
 ## Known Boundaries

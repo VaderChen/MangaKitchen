@@ -1417,7 +1417,7 @@ actor MCPWorkflowService {
             at: outputURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try Data(contentsOf: previewURL).write(to: outputURL, options: .atomic)
+        try AtomicFileWriter.copy(from: previewURL, to: outputURL)
         try Task.checkCancellation()
         guard let updatedIndex = pages.firstIndex(where: { $0.id == pageID }) else {
             throw MCPServiceError.pageNotFound
@@ -1772,8 +1772,7 @@ actor MCPWorkflowService {
             at: paths.outputURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let previewData = try Data(contentsOf: previewURL)
-        try previewData.write(to: paths.outputURL, options: .atomic)
+        try AtomicFileWriter.copy(from: previewURL, to: paths.outputURL)
         progress(.completed, 1)
         pages[index].outputURL = paths.outputURL
         invalidateColorization(pageIndex: index)

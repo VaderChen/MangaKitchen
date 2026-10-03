@@ -89,6 +89,7 @@ enum MLXProtocolTokenGenerator {
             var protocolWindow = ""
             var sawFinalChannel = startsInFinalChannel
             var firstTokenLatency: Double?
+            let unknownTokenID = context.tokenizer.unknownTokenId
 
             defer { Stream().synchronize() }
 
@@ -104,10 +105,12 @@ enum MLXProtocolTokenGenerator {
                     )
                 }
 
-                if let tokenText = context.tokenizer.convertIdToToken(token) {
+                let tokenText = context.tokenizer.convertIdToToken(token) ?? ""
+                if generationProtocol == .harmony {
                     protocolWindow += tokenText
-                    if protocolWindow.count > 256 {
-                        protocolWindow.removeFirst(protocolWindow.count - 256)
+                    let windowCount = protocolWindow.count
+                    if windowCount > 256 {
+                        protocolWindow.removeFirst(windowCount - 256)
                     }
                 }
                 switch generationProtocol {
@@ -119,14 +122,13 @@ enum MLXProtocolTokenGenerator {
                     break
                 }
 
-                let tokenText = context.tokenizer.convertIdToToken(token) ?? ""
                 let isProtocolStop = protocolStopTokenIDs.contains(token)
                     || (generationProtocol == .harmony && tokenText == "<|return|>")
                     || (generationProtocol == .gemma4 && tokenText == "<turn|>")
                 let isHarmonyEnd = harmonyEndTokenIDs.contains(token)
                     || tokenText == "<|end|>"
                 let isConfiguredStop = configuredStopTokenIDs.contains(token)
-                    || token == context.tokenizer.unknownTokenId
+                    || token == unknownTokenID
                 let shouldStop: Bool
                 switch generationProtocol {
                 case .standard:

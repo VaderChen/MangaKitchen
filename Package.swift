@@ -88,7 +88,9 @@ let package = Package(
             dependencies: [
                 "MangaKitchenCore",
                 "MangaKitchenRuntime",
-                .product(name: "MLX", package: "mlx-swift")
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm")
             ]
         )
     ]

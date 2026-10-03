@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import MangaKitchenCore
 
 struct PSDLayer {
     let name: String
@@ -17,11 +18,10 @@ struct PSDExporter {
             throw PSDExportError.inconsistentDimensions
         }
 
-        let layerInfo = makeLayerInfo(layers: layers, width: width, height: height)
-        var layerAndMask = Data()
-        appendUInt32(UInt32(layerInfo.count), to: &layerAndMask)
-        layerAndMask.append(layerInfo)
-        appendUInt32(0, to: &layerAndMask)
+        let records = makeLayerRecords(layers: layers, width: width, height: height)
+        let pixelCount = width * height
+        let unpaddedLayerInfoSize = 2 + records.count + layers.count * 4 * (pixelCount + 2)
+        let layerInfoSize = unpaddedLayerInfoSize + unpaddedLayerInfoSize % 2
 
         var data = Data()
         appendASCII("8BPS", to: &data)
@@ -34,17 +34,38 @@ struct PSDExporter {
         appendUInt16(3, to: &data)
         appendUInt32(0, to: &data)
         appendUInt32(0, to: &data)
-        appendUInt32(UInt32(layerAndMask.count), to: &data)
-        data.append(layerAndMask)
-        data.append(mergedImageData(mergedImage, width: width, height: height))
-        try data.write(to: url, options: .atomic)
+        appendUInt32(UInt32(layerInfoSize + 8), to: &data)
+        appendUInt32(UInt32(layerInfoSize), to: &data)
+        appendInt16(Int16(layers.count), to: &data)
+        data.append(records)
+
+        try AtomicFileWriter.write(to: url) { staged in
+            try data.write(to: staged, options: .withoutOverwriting)
+            let output = try FileHandle(forWritingTo: staged)
+            defer { try? output.close() }
+            try output.seekToEnd()
+            // 只保留目前圖層的 RGBA 與 64 KiB 通道緩衝，不組裝整份 PSD。
+            var channelBuffer = Data(count: min(pixelCount, 65_536))
+            for layer in layers.reversed() {
+                try autoreleasepool {
+                    try writeChannels(layer.image, width: width, height: height,
+                        layerCompression: true, buffer: &channelBuffer, to: output)
+                }
+            }
+            if unpaddedLayerInfoSize != layerInfoSize {
+                try output.write(contentsOf: Data([0]))
+            }
+            // 空的 global layer mask，以及 merged image 的 raw compression 標記。
+            try output.write(contentsOf: Data(repeating: 0, count: 6))
+            try writeChannels(mergedImage, width: width, height: height,
+                layerCompression: false, buffer: &channelBuffer, to: output)
+            try output.close()
+        }
     }
 
-    private func makeLayerInfo(layers: [PSDLayer], width: Int, height: Int) -> Data {
+    private func makeLayerRecords(layers: [PSDLayer], width: Int, height: Int) -> Data {
         var records = Data()
-        var channels = Data()
         for layer in layers.reversed() {
-            let pixels = rgbaBytes(layer.image, width: width, height: height)
             appendInt32(0, to: &records)
             appendInt32(0, to: &records)
             appendInt32(Int32(height), to: &records)
@@ -70,50 +91,58 @@ struct PSDExporter {
             while extra.count % 4 != 0 { extra.append(0) }
             appendUInt32(UInt32(extra.count), to: &records)
             records.append(extra)
-
-            for channel in [0, 1, 2, 3] {
-                appendUInt16(0, to: &channels)
-                channels.append(contentsOf: channelBytes(pixels, channel: channel))
-            }
         }
-        var output = Data()
-        appendInt16(Int16(layers.count), to: &output)
-        output.append(records)
-        output.append(channels)
-        if output.count % 2 != 0 { output.append(0) }
-        return output
+        return records
     }
 
-    private func mergedImageData(_ image: CGImage, width: Int, height: Int) -> Data {
+    private func writeChannels(
+        _ image: CGImage,
+        width: Int,
+        height: Int,
+        layerCompression: Bool,
+        buffer: inout Data,
+        to output: FileHandle
+    ) throws {
+        try Task.checkCancellation()
         let pixels = rgbaBytes(image, width: width, height: height)
-        var data = Data()
-        appendUInt16(0, to: &data)
-        for channel in [0, 1, 2, 3] {
-            data.append(contentsOf: channelBytes(pixels, channel: channel))
+        let pixelCount = width * height
+        try pixels.withUnsafeBufferPointer { source in
+            for channel in 0..<4 {
+                if layerCompression { try output.write(contentsOf: Data([0, 0])) }
+                var start = 0
+                while start < pixelCount {
+                    try Task.checkCancellation()
+                    let count = min(buffer.count, pixelCount - start)
+                    buffer.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
+                        for index in 0..<count {
+                            destination[index] = source[(start + index) * 4 + channel]
+                        }
+                    }
+                    try output.write(contentsOf: buffer.prefix(count))
+                    start += count
+                }
+            }
         }
-        return data
     }
 
     private func rgbaBytes(_ image: CGImage, width: Int, height: Int) -> [UInt8] {
         var pixels = Array(repeating: UInt8(0), count: width * height * 4)
         let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
-        guard let context = CGContext(
-            data: &pixels,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo
-        ) else { return pixels }
-        context.translateBy(x: 0, y: CGFloat(height))
-        context.scaleBy(x: 1, y: -1)
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        pixels.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: bitmapInfo
+            ) else { return }
+            context.translateBy(x: 0, y: CGFloat(height))
+            context.scaleBy(x: 1, y: -1)
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
         return pixels
-    }
-
-    private func channelBytes(_ pixels: [UInt8], channel: Int) -> [UInt8] {
-        stride(from: channel, to: pixels.count, by: 4).map { pixels[$0] }
     }
 
     private func appendASCII(_ value: String, to data: inout Data) {

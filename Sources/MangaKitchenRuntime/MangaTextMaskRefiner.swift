@@ -268,13 +268,13 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
         }
         // 膨脹必須在像素層做。過去是把每一條 run rectangle 各自向量描邊再聯集，
         // 斜筆畫拆出的一堆 1px 高矩形分別鼓起來，遮罩邊界就變成扇貝狀毛邊。
-        let maskPixels = grownMaskPixels(
+        let maskRectangles = grownMaskRectangles(
             components: filtered,
             raster: raster,
             bounds: searchBounds,
             bubbleMask: bubbleMask
         )
-        let polygons = mergedPixelRectangles(for: maskPixels).map { pixelRectangle -> [NormalizedPoint] in
+        let polygons = maskRectangles.map { pixelRectangle -> [NormalizedPoint] in
             let bounds = pixelRectangle
                 .expanded(by: componentPaddingPixels)
                 .intersection(clippingBounds)
@@ -319,12 +319,12 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
     /// 先做遲滯擴張：只吃仍然偏暗的鄰接像素，把抗鋸齒過渡帶整圈收進遮罩，
     /// 網點與留白因為夠亮不會被捲進來。再無條件外擴固定像素，覆蓋 JPEG 在
     /// 高對比邊緣留下的 ringing —— 那圈殘留常常已經亮過遲滯門檻。
-    private func grownMaskPixels(
+    private func grownMaskRectangles(
         components: [PixelComponent],
         raster: GrayscaleRaster,
         bounds: PixelBounds,
         bubbleMask: BubbleMask?
-    ) -> [PixelCoordinate] {
+    ) -> [PixelBounds] {
         let width = bounds.width
         let height = bounds.height
         guard width > 0, height > 0 else { return [] }
@@ -374,18 +374,27 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
             if !grew { break }
         }
 
-        var pixels: [PixelCoordinate] = []
-        pixels.reserveCapacity(marked.lazy.filter { $0 }.count)
+        // The mask is already in row order. Emit runs directly instead of building
+        // one coordinate per pixel and then grouping and sorting them again.
+        var rectangles = PixelRectangleAccumulator()
         for localY in 0..<height {
-            for localX in 0..<width where marked[localY * width + localX] {
+            var spans: [PixelSpan] = []
+            var runStart: Int?
+            let y = bounds.minY + localY
+            for localX in 0...width {
                 let x = bounds.minX + localX
-                let y = bounds.minY + localY
                 // 膨脹餘裕同樣不得越過氣泡形狀，否則邊緣的字又會把外框吃進來。
-                if let bubbleMask, !bubbleMask.contains(x: x, y: y) { continue }
-                pixels.append(PixelCoordinate(x: x, y: y))
+                let included = localX < width && marked[localY * width + localX]
+                    && (bubbleMask?.contains(x: x, y: y) ?? true)
+                if included, runStart == nil { runStart = x }
+                if !included, let start = runStart {
+                    spans.append(PixelSpan(minX: start, maxX: x))
+                    runStart = nil
+                }
             }
+            rectangles.append(spans: spans, row: y)
         }
-        return pixels
+        return rectangles.values
     }
 
     private func hasMarkedNeighbour(
@@ -433,7 +442,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
 
                 var queue = [localIndex]
                 var cursor = 0
-                var pixels: [PixelCoordinate] = []
+                var columnsByRow: [Int: [Int]] = [:]
                 var minX = imageX
                 var minY = imageY
                 var maxX = imageX + 1
@@ -446,7 +455,7 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
                     let currentLocalY = current / localWidth
                     let currentX = bounds.minX + currentLocalX
                     let currentY = bounds.minY + currentLocalY
-                    pixels.append(PixelCoordinate(x: currentX, y: currentY))
+                    columnsByRow[currentY, default: []].append(currentX)
                     minX = min(minX, currentX)
                     minY = min(minY, currentY)
                     maxX = max(maxX, currentX + 1)
@@ -468,22 +477,16 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
                 components.append(PixelComponent(
                     id: components.count,
                     bounds: PixelBounds(minX: minX, minY: minY, maxX: maxX, maxY: maxY),
-                    area: pixels.count,
-                    pixelRectangles: mergedPixelRectangles(for: pixels)
+                    area: queue.count,
+                    pixelRectangles: mergedPixelRectangles(in: columnsByRow)
                 ))
             }
         }
         return components
     }
 
-    private func mergedPixelRectangles(for pixels: [PixelCoordinate]) -> [PixelBounds] {
-        var columnsByRow: [Int: [Int]] = [:]
-        for pixel in pixels {
-            columnsByRow[pixel.y, default: []].append(pixel.x)
-        }
-
-        var rectangles: [PixelBounds] = []
-        var activeRectangles: [PixelSpan: Int] = [:]
+    private func mergedPixelRectangles(in columnsByRow: [Int: [Int]]) -> [PixelBounds] {
+        var rectangles = PixelRectangleAccumulator()
         for row in columnsByRow.keys.sorted() {
             let columns = (columnsByRow[row] ?? []).sorted()
             var spans: [PixelSpan] = []
@@ -495,24 +498,9 @@ public actor MangaTextMaskRefiner: DialogueMaskRefining {
                 }
             }
 
-            var nextActiveRectangles: [PixelSpan: Int] = [:]
-            for span in spans {
-                if let index = activeRectangles[span], rectangles[index].maxY == row {
-                    rectangles[index].maxY = row + 1
-                    nextActiveRectangles[span] = index
-                } else {
-                    rectangles.append(PixelBounds(
-                        minX: span.minX,
-                        minY: row,
-                        maxX: span.maxX,
-                        maxY: row + 1
-                    ))
-                    nextActiveRectangles[span] = rectangles.count - 1
-                }
-            }
-            activeRectangles = nextActiveRectangles
+            rectangles.append(spans: spans, row: row)
         }
-        return rectangles
+        return rectangles.values
     }
 
     private func pixelBounds(for rect: NormalizedRect, width: Int, height: Int) -> PixelBounds {
@@ -669,14 +657,31 @@ private struct PixelComponent {
     var pixelRectangles: [PixelBounds]
 }
 
-private struct PixelCoordinate {
-    var x: Int
-    var y: Int
-}
-
 private struct PixelSpan: Hashable {
     var minX: Int
     var maxX: Int
+}
+
+/// Merge equal runs on adjacent rows while preserving the original polygon order.
+private struct PixelRectangleAccumulator {
+    var values: [PixelBounds] = []
+    private var active: [PixelSpan: Int] = [:]
+
+    mutating func append(spans: [PixelSpan], row: Int) {
+        var next: [PixelSpan: Int] = [:]
+        next.reserveCapacity(spans.count)
+        for span in spans {
+            if let index = active[span], values[index].maxY == row {
+                values[index].maxY = row + 1
+                next[span] = index
+            } else {
+                values.append(PixelBounds(
+                    minX: span.minX, minY: row, maxX: span.maxX, maxY: row + 1))
+                next[span] = values.count - 1
+            }
+        }
+        active = next
+    }
 }
 
 private struct PixelMaskRefinement {

@@ -777,8 +777,10 @@ public actor VLMRegionTranslationService: DraftRegionTranslating {
         return flags
     }
 
+    private static let numberExpression = try? NSRegularExpression(pattern: #"\d+(?:[.,]\d+)*"#)
+
     private static func numberTokens(in text: String) -> [String] {
-        guard let expression = try? NSRegularExpression(pattern: #"\d+(?:[.,]\d+)*"#) else {
+        guard let expression = numberExpression else {
             return []
         }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)

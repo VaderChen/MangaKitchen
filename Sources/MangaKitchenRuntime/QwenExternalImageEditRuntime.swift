@@ -156,7 +156,7 @@ actor QwenExternalImageEditRuntime: ImageToImageGenerating {
                 outputURL: outputURL
             )
         } else {
-            try Data(contentsOf: candidateURL).write(to: outputURL, options: .atomic)
+            try AtomicFileWriter.copy(from: candidateURL, to: outputURL)
         }
         progress(1)
     }

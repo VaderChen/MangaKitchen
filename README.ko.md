@@ -10,6 +10,12 @@
 
 [최신 공증 DMG 다운로드](https://github.com/VaderChen/MangaKitchen/releases/latest) · macOS 14 이상 필요
 
+## 최신 버전: 1.26.1003 (build 2100)
+
+PSD 내보내기, 출력 저장, 마스크 정밀화, 말풍선 후처리 및 일괄 상태에서 메모리 할당과 복사를 줄이면서 UI, 조작 흐름 및 출력 의미를 유지합니다. 기록된 PSD 벤치마크의 프로세스 최대 RSS는 806.5 MiB에서 176.4 MiB로 감소했습니다. 이는 특정 내보내기 조건의 결과이며 App 전체의 메모리 감소율이 아닙니다.
+
+[릴리스 노트](Documentation/RELEASE_NOTES_1.26.1003-build-2100.md), [출력 성능 측정](Documentation/PERFORMANCE_AUDIT_2026-10-03.md), [함수 단위 최적화](Documentation/FUNCTION_OPTIMIZATION_2026-10-03.md)를 참조하세요. [최근 모델 조사](Documentation/MODEL_RESEARCH_2026-10-03.md)와 [로컬 평가](Documentation/MODEL_EVALUATION_2026-10-03.md)에는 LFM2.5-VL-3B와 Granite 4.2 3B를 다운로드 목록에 추가하지 않은 이유가 담겨 있습니다. 기본 모델은 변경하지 않았습니다.
+
 ## 저작권 및 적법한 사용
 
 MangaKitchen으로 가져오는 만화 원고, 등장인물, 문구, 그림, 상표 및 기타 콘텐츠의 저작권과 관련 권리는 원작자, 출판사, 정식 라이선스 플랫폼 및 각 적법한 권리자에게 있습니다. 이 도구를 사용한다고 해서 해당 권리가 이전되거나 작품의 복제, 번역, 공개 전송, 배포 또는 판매 권한이 부여되는 것은 아닙니다.
@@ -20,9 +26,9 @@ MangaKitchen을 해적판, 무단 번역·스캔본, 크랙된 콘텐츠를 제�
 
 ## 소프트웨어 라이선스
 
-MangaKitchen은 듀얼 라이선스 방식을 사용합니다. 이 repository에서 MangaKitchen 저작권자가 소유하고 별도 표시가 없는 코드는 기본적으로 [GNU General Public License version 3 only](LICENSE)(`GPL-3.0-only`)로 제공됩니다. 비공개 소스 제품 통합, 독점 배포 또는 다른 계약 조건이 필요한 경우 별도의 [상업용 라이선스](COMMERCIAL-LICENSE.md)를 협의할 수 있습니다.
+MangaKitchen은 [소스 공개・상업적 판매 금지 라이선스 v1.1](LICENSE.ko.md)로 제공됩니다. 조건을 준수하면 무료로 취득, 실행, 열람, 수정 및 무상 배포할 수 있으며 기업 내부 사용도 허용됩니다. 상업적 판매와 라이선스에 명시된 유료 서비스에는 별도의 서면 계약이 필요합니다. [상업용 라이선스](COMMERCIAL-LICENSE.md)를 참조하세요.
 
-GPLv3 자체도 상업적 사용과 유료 배포를 허용하지만 소스 코드 제공 및 copyleft 의무를 준수해야 합니다. 상업용 라이선스는 대안이며 GPLv3로 이미 받은 권리를 제한하지 않습니다. 타사 package, 모델과 weight, 글꼴 및 만화 콘텐츠는 MangaKitchen 듀얼 라이선스 대상이 아니며 각각의 조건을 따릅니다.
+이는 소스 공개 라이선스이며 OSI가 승인한 오픈 소스 라이선스가 아닙니다. [번체 중국어 원문](LICENSE.md)이 우선합니다. 타사 package, 모델과 weight, 글꼴 및 만화 콘텐츠에는 각각의 조건이 적용됩니다.
 
 ## 구현된 기능
 
@@ -42,7 +48,7 @@ GPLv3 자체도 상업적 사용과 유료 배포를 허용하지만 소스 코�
 - 원본 이미지의 픽셀 레이어에서 팽창하여 안티앨리어싱 가장자리를 포함한 뒤 정규화 브러시로 마스크를 추가·삭제·영역별 실행 취소하고 이진 PNG를 생성합니다. 각 run 사각형을 벡터 선으로 그리는 방식은 제거하여 회색 가장자리를 방지합니다. 2단계 완료 후 이미지→이미지 모델을 시작하지 않고 원문을 제거한 CPU／GPU 마스크 확인 미리보기를 즉시 표시합니다.
 - 내장된 manga109 말풍선 분할 Core ML 모델이 Apple Neural Engine을 우선 사용하여 흑백 만화의 대화 BBOX와 말풍선 형상을 만듭니다. 2단계는 항상 확인된 말풍선을 원본 이미지 픽셀에서 글자 마스크로 정밀화하며 OCR／VLM 선택은 이 마스크 경로를 바꾸지 않습니다. Apple Vision OCR은 사용하지 않습니다. 효과음, 페이지 번호, 하단 정보, 인물 및 빈 영역은 주 처리 흐름에서 제외합니다.
 - 2단계는 PP-OCR 텍스트 검출이나 `imageToText` VLM을 필요로 하지 않습니다. Medium Det와 VLM 위치 검출 runtime은 마스크 생성과 분리되어 모델 전환으로 기존 말풍선／픽셀 마스크 기능이 퇴화하지 않습니다. 3단계 OCR은 PP-OCRv6 Medium recognizer를 기본으로 사용하며 Small을 fallback으로 유지합니다. `sourceText`가 비어 있으면 기본 OCR 결과를 번역 원문으로 사용하지만, 확인된 원문과 좌표·마스크는 덮어쓰지 않습니다.
-- GUI 번역은 다운로드한 멀티모달 모델만 사용하여 페이지 전체 이미지 문맥을 유지합니다. 원문 추출은 PP-OCR 영역별 인식 또는 VLM 전사를 선택할 수 있으며, 기존 프로젝트의 텍스트 생성 설정은 `imageToText`로 이전됩니다.
+- GUI 번역에서는 텍스트 전용 또는 멀티모달 모델을 선택할 수 있습니다. 텍스트 전용 경로는 PP-OCR／확인된 원문을 사용하며 멀티모달 경로는 VLM 전사와 페이지 이미지 문맥도 활용합니다.
 - 승인된 영역은 대화 BBOX를 검색 범위로 사용하여 원본 이미지 픽셀에서 글자 픽셀 마스크로 정밀화하고, 텍스트 영역도 팽창 전 실제 glyph 경계로 축소합니다. 자동 조판 방향은 실제 글자 배열 감지 결과를 우선합니다. 각 후보를 독립적으로 처리하므로 한 영역의 분류·전사·번역이 실패해도 해당 영역을 보존하고 나머지 영역을 계속 처리합니다. 취소할 때만 전체 작업을 중지합니다.
 - 이미지→텍스트 모델용 페이지 문맥 프롬프트와 엄격한 JSON 응답 분석.
 - Apple Silicon／Metal에서 `mlx-swift-lm`을 사용하는 로컬 Hugging Face MLX VLM 로드.
@@ -73,7 +79,7 @@ MangaKitchen 번역은 로컬 GUI 또는 MCP 멀티모달 Agent 교정으로 실
 
 1. **프로젝트와 페이지**: 원본 폴더를 선택하고 이미지를 재귀 스캔하여 다중 선택 및 일괄 처리 가능한 페이지 목록을 만듭니다.
 2. **텍스트, 마스크, 글자 제거 배경**: 내장 Core ML 분할 모델로 대화 BBOX와 말풍선 형상을 감지하고 원본 픽셀에서 글자 마스크로 정밀화해 배경을 복원합니다. 이 단계에서는 VLM을 호출하지 않으며 MCP Agent가 영역이나 마스크를 재구축할 수 없습니다.
-3. **번역과 조판**: GUI는 내장 OCR 또는 선택한 VLM 경로로 원문을 추출하고 멀티모달 모델로 번역과 선택적 2차 교정 및 의미 QA를 수행합니다. MCP는 App이 만든 단일 페이지 작업 패키지를 멀티모달 Agent에 전달하고 결과를 App 프로젝트 상태에 반영합니다.
+3. **번역과 조판**: GUI는 내장 OCR 또는 선택한 VLM 경로로 원문을 추출하고 선택한 텍스트 전용 또는 멀티모달 모델로 번역과 선택적 2차 교정 및 의미 QA를 수행합니다. MCP는 App이 만든 단일 페이지 작업 패키지를 멀티모달 Agent에 전달하고 결과를 App 프로젝트 상태에 반영합니다.
 4. **출력 저장**: 확인된 3단계 미리보기만 출력 폴더에 저장하며 마스크, 복원, 번역, 초해상도 또는 조판을 다시 실행하지 않습니다.
 
 4단계는 재개 가능한 상태, 산출물 및 의존 관계를 정의하며 매번 1단계부터 다시 실행하는 고정 체크리스트가 아닙니다. GUI와 MCP는 App이 제공하는 페이지 상태와 작업 패키지를 먼저 확인하고 선행 자료가 있는 임의 단계부터 시작할 수 있습니다. 마스크가 있으면 바로 번역하고, 번역문이 있으면 바로 조판 또는 합성하며, 한 영역만 수정할 수도 있습니다. 사용자나 Agent가 명시적으로 재실행하지 않는 한 완료된 영역 인식, 마스크, 번역문 및 수동 편집을 덮어쓰지 않습니다.
@@ -91,9 +97,9 @@ MangaKitchen 번역은 로컬 GUI 또는 MCP 멀티모달 Agent 교정으로 실
 
 ### 방식 A: 모델을 다운로드하여 완전한 오프라인으로 실행
 
-“설정 → 모델”에서 멀티모달 번역 모델을 다운로드하고 로컬 컬러화가 필요하면 DDColor Tiny도 다운로드합니다. 영역 인식, 번역, 배경 복원, 합성 및 로컬 컬러화는 Mac에서 실행됩니다.
+“설정 → 모델”에서 텍스트 전용 또는 멀티모달 번역 모델을 다운로드하고 로컬 컬러화가 필요하면 DDColor Tiny도 다운로드합니다. 영역 인식, 번역, 배경 복원, 합성 및 로컬 컬러화는 Mac에서 실행됩니다.
 
-- 번역은 항상 `imageToText`를 사용합니다. PP-OCR ‘원문 다시 추출’ 자체는 VLM 없이 동작하지만 번역, 2차 교정 및 의미 QA에는 멀티모달 모델이 필요합니다.
+- 번역은 OCR／확인된 원문을 사용하는 `textToText` 또는 페이지 이미지 문맥도 사용하는 `imageToText` 중에서 선택합니다. PP-OCR ‘원문 다시 추출’ 자체는 VLM 없이 동작합니다.
 - `imageToImage` 모델은 2단계 배경 복원을 담당하는 선택 사항입니다. 설정하지 않으면 설정 → 고급에서 Metal GPU 근방 복원 또는 CPU 말풍선 주요 색상 복원을 선택하며, GPU 실패 시 CPU로 자동 전환됩니다.
 - GUI에서 각 단계를 따로 실행하거나 “선택／모든 페이지 전체 처리”를 사용할 수 있습니다. 원클릭 처리도 내부적으로 2~4단계를 순서대로 실행하고 중간 자료를 보존합니다.
 - 로컬 컬러화는 3단계에서 `imageColorization` 모델을 지연 로드해 즉시 미리보기를 만들고 4단계는 해당 미리보기만 저장합니다.
@@ -135,6 +141,8 @@ swift run MangaKitchen --mcp=on
 GUI는 항상 시작됩니다. `--mcp`를 생략하면 저장된 설정을 사용하고 `--mcp=on|off`는 이번 실행만 재정의합니다. listener는`0.0.0.0`에 bind하고 기본 포트는`12080`이며 허용 목록의 실제 원본 IP/CIDR request만 받습니다. 기본 허용 목록은`127.0.0.1`뿐입니다. 로컬 MCP URL은`http://127.0.0.1:12080/mcp`이고`--mcp-port=<port>`로 이번 실행 포트를 바꿀 수 있습니다. 메인 창을 닫아도 App은 종료되지 않으며 메뉴 막대에서 다시 열 수 있습니다.
 
 데이터 저장 위치 변경은 다시 시작한 뒤 적용됩니다. `imageToText`, `imageColorization`, `superResolution` 모델 변경은 즉시 적용되며 MCP 스위치, 포트 또는 허용 목록 변경 시 listener를 재시작합니다.
+
+로컬 `.app`은 `./build.command --release`로 만들며 기본 출력은 `Dist/MangaKitchen.app`입니다. `APP_VERSION`, `APP_BUILD_VERSION`, `OUTPUT_DIRECTORY`로 버전과 위치를 지정할 수 있습니다. Metal 리소스와 라이선스 고지를 포함하고 ad-hoc 서명을 적용합니다. 공식 다운로드 DMG는 별도로 Developer ID 서명과 Apple 공증을 거칩니다.
 
 ### SwiftPM 및 Metal 빌드 문제 해결
 
@@ -196,7 +204,7 @@ App은 텍스트 전용 번역을 `MLXTextRuntime`으로, `mlx-swift-lm`이 지�
 
 ### DFlash speculative decoding
 
-번역 및 멀티모달 모델 설정에서 호환되는 Qwen3／Qwen3.5 대상에 DFlash를 켤 수 있습니다. App은 선택한 대상 모델과 같은 모델 루트에서 Draft를 자동으로 찾으므로 Draft 경로를 따로 저장하지 않습니다. 네이티브 Swift／MLX 구현은 대상 모델과 같은 Metal runtime을 사용하며 기존 Safetensors／MLX checkpoint 또는 GGUF 로딩을 대체하지 않습니다. Qwen3-VL과 Qwen3.5-VL은 vision-aware prefill 후 같은 speculative decoding loop에 들어가고, 다른 VLM 아키텍처는 표준 생성으로 안전하게 fallback합니다. Draft가 없거나 호환되지 않거나 유효하지 않거나 지원하지 않는 생성 설정을 만나면 이유를 LOG에 기록하고 표준 생성으로 돌아갑니다. Draft 가중치는 App에 포함되지 않습니다.
+번역 및 멀티모달 모델 설정에서 호환되는 Qwen3／Qwen3.5 대상에 DFlash를 켤 수 있습니다. App은 선택한 대상 모델과 같은 모델 루트에서 Draft를 자동으로 찾으므로 Draft 경로를 따로 저장하지 않습니다. 네이티브 Swift／MLX 구현은 대상 모델과 같은 Metal runtime을 사용하며 기존 Safetensors／MLX checkpoint 또는 GGUF 로딩을 대체하지 않습니다. Qwen3-VL과 Qwen3.5-VL은 vision-aware prefill 후 같은 speculative decoding loop에 들어가고, 다른 VLM 아키텍처는 표준 생성으로 안전하게 fallback합니다. Draft가 없거나 호환되지 않거나 유효하지 않거나 지원하지 않는 생성 설정을 만나면 이유를 LOG에 기록하고 표준 생성으로 돌아갑니다. Draft 가중치는 App에 포함되지 않습니다. 관리 다운로드는 호환되는 Draft를 주 모델 옆의 `DFlashDraftModel`에 자동으로 저장합니다. Draft 다운로드 실패는 주 모델 설치를 막지 않으며 기존 모델도 주 가중치를 다시 받지 않고 Draft를 추가할 수 있습니다.
 
 ### GGUF 가중치
 
@@ -281,4 +289,4 @@ MangaKitchenApp/MCP    GUI process 안의 MCP Streamable HTTP adapter와 수명 
 - 대화 BBOX는 말풍선 형상으로 범위를 제한한 뒤 원본 밝기, 연결 요소 및 픽셀 팽창으로 정밀화합니다. 어둡거나 컬러인 작품은 App에서 수동 마스크 보정이 필요할 수 있습니다. 표준 Agent 작업 패키지는 영역이나 마스크를 바꿀 수 없으며 효과음은 의도적으로 번역 주 처리 흐름에서 제외합니다.
 - Metal 인접 복원은 대체 수단입니다. 복잡한 망점이나 선화를 가로지르는 글자는 inpainting model을 권장합니다.
 - Qwen Image Edit INT4는 약 25GB급 추론 메모리와 페이지마다 전체 diffusion 실행이 필요합니다.
-- App Sandbox security-scoped bookmark, 서명, notarization 및 정식 `.app` packaging은 아직 구현되지 않았습니다.
+- App Sandbox security-scoped bookmark는 아직 구현되지 않았습니다. 배포 DMG는 서명 및 공증을 거치지만 Swift Package에서 직접 실행할 때는 이러한 배포 처리가 포함되지 않습니다.

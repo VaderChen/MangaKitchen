@@ -14,7 +14,7 @@ decoding、Qwen3／Qwen3.5 target 中間層輸出與相容性驗證。
 - 執行範圍：DFlash 可套用純文字 `textToText` runtime；Qwen3-VL／Qwen3.5-VL 的 `imageToText` 會先完成視覺 prefill 後啟用，其他 VLM 不相容時回退標準生成
 - 相容性：Draft 載入或 target 驗證失敗時，App 保留標準 MLX 生成，不會阻斷模型載入
 
-DFlash draft 權重不隨 App 預先發佈，也不屬於主模型權重。使用者可在「設定 → 模型 →
+DFlash draft 權重不隨 App 預先發佈，也不屬於主模型權重。管理下載會把相容 Draft 下載到主模型旁的 `DFlashDraftModel`；選用 Draft 失敗不會阻擋主模型安裝，既有模型也可補下載 Draft。使用者可在「設定 → 模型 →
 翻譯」或「多模態」開啟 DFlash；App 不保存 Draft 路徑，而是在目標模型第一次載入時，
 從主模型同一個模型根目錄自動尋找並驗證 Qwen3／Qwen3.5 target、相容的
 Qwen3-VL／Qwen3.5-VL target、draft 版本與 block size。這些模型權重仍受其 Hugging Face
@@ -32,7 +32,7 @@ MangaKitchen 的模型下載頁可取得
 - 使用內容：`DDColor_Tiny.mlpackage`，512×512 灰階 RGB 輸入與 Lab `ab_channels` 輸出
 - 執行方式：Core ML `computeUnits = .all`；輸出色度會縮放回原頁，再以反對話框遮罩限制可改寫像素
 
-下載模型及其衍生檔仍受上游 Apache-2.0 條款約束；MangaKitchen 的 GPL／商業雙授權不會取代模型本身的授權。
+下載模型及其衍生檔仍受上游 Apache-2.0 條款約束；MangaKitchen 的原始碼公開・禁止商業販售授權不會取代模型本身的授權。
 
 ## Medium 模型轉換工具
 

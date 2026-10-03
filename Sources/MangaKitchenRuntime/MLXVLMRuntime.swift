@@ -246,6 +246,8 @@ actor MLXVLMRuntime: ImageToTextGenerating {
             }
         }
 
+        // Cancellation can end AsyncStream without yielding another event.
+        try Task.checkCancellation()
         var output = result.trimmingCharacters(in: .whitespacesAndNewlines)
         if let reasoningID {
             reasoningStream(.finished(id: reasoningID))
@@ -330,6 +332,7 @@ actor MLXVLMRuntime: ImageToTextGenerating {
             }
             output = output.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        try Task.checkCancellation()
         guard !output.isEmpty else { throw MLXVLMRuntimeError.emptyResponse }
         progress(1)
         return output

@@ -248,6 +248,9 @@ actor MLXTextRuntime: TextGenerating {
                 log(.warning, "Text Model", "Stopped a repeating output loop and repaired the JSON tail.")
             }
         }
+        // AsyncStream can finish without another event when its consumer is cancelled.
+        // Do not return the partial translation as a successful result in that case.
+        try Task.checkCancellation()
         output = output.trimmingCharacters(in: .whitespacesAndNewlines)
         if let reasoningID {
             reasoningStream(.finished(id: reasoningID))
@@ -329,6 +332,7 @@ actor MLXTextRuntime: TextGenerating {
             }
             output = output.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        try Task.checkCancellation()
         guard !output.isEmpty else {
             log(.error, "Text Model", "The model returned an empty response.")
             throw MLXTextRuntimeError.emptyResponse

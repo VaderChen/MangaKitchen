@@ -209,8 +209,18 @@ struct WebBatchJob: Encodable {
     var progress: Double
     var failures: [WebBatchFailure]
 
+    static func snapshots(jobs: [BatchJob], pages: [ComicPage]) -> [WebBatchJob] {
+        guard !jobs.isEmpty else { return [] }
+        let pageNames = Dictionary(uniqueKeysWithValues: pages.map { ($0.id, $0.title) })
+        return jobs.map { WebBatchJob(job: $0, pageNames: pageNames) }
+    }
+
     init(job: BatchJob, pages: [ComicPage]) {
         let pageNames = Dictionary(uniqueKeysWithValues: pages.map { ($0.id, $0.title) })
+        self.init(job: job, pageNames: pageNames)
+    }
+
+    init(job: BatchJob, pageNames: [UUID: String]) {
         id = job.id
         projectID = job.projectID
         projectName = job.projectName
@@ -551,16 +561,15 @@ struct WebAppState: Encodable {
         selectedPageID = store.selectedPageID
         selectedPageIDs = store.pages.lazy.map(\.id).filter(store.selectedPageIDs.contains)
         options = store.options
-        availableFontFamilies = FontFamilyCatalog.compatibleFamilies(
-            for: store.options.resolvedTargetLanguageCode
-        )
+        let targetLanguageCode = store.options.resolvedTargetLanguageCode
+        availableFontFamilies = FontFamilyCatalog.compatibleFamilies(for: targetLanguageCode)
         loadedModels = store.loadedModels
         modelLoadingState = store.modelLoadingState
         modelReasoningStream = store.modelReasoningStream.snapshot
         glossary = store.glossary.entries.map {
-            WebGlossaryEntry(entry: $0, targetLanguageCode: store.options.resolvedTargetLanguageCode)
+            WebGlossaryEntry(entry: $0, targetLanguageCode: targetLanguageCode)
         }
-        batchJobs = store.batchJobs.map { WebBatchJob(job: $0, pages: store.pages) }
+        batchJobs = WebBatchJob.snapshots(jobs: store.batchJobs, pages: store.pages)
         sourceDirectoryPath = store.sourceDirectoryURL?.path
         outputDirectoryPath = store.outputDirectoryURL?.path
         isProcessing = store.isProcessing

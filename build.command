@@ -241,6 +241,27 @@ for resource_bundle in "$binary_directory"/*.bundle(N); do
     "$temporary_app/Contents/Resources/${resource_bundle:t}"
 done
 
+license_directory="$temporary_app/Contents/Resources/Licenses"
+mkdir -p "$license_directory"
+for license_file in LICENSE.md LICENSE.en.md LICENSE.ja.md LICENSE.ko.md COMMERCIAL-LICENSE.md; do
+  ditto --norsrc --noqtn "$PROJECT_ROOT/$license_file" "$license_directory/$license_file"
+done
+ditto --norsrc --noqtn "$PROJECT_ROOT/Documentation/THIRD_PARTY_NOTICES.md" \
+  "$license_directory/THIRD_PARTY_NOTICES.md"
+
+# Preserve upstream license/notice paths, including embedded C/C++ dependencies.
+# Prefer the vendored implementation if an older checkout has the same name.
+for dependency_directory in "$PROJECT_ROOT"/Vendor/*(N/) "$PROJECT_ROOT"/.build/checkouts/*(N/); do
+  dependency_licenses="$license_directory/ThirdParty/${dependency_directory:t}"
+  [[ -d "$dependency_licenses" ]] && continue
+  for license_file in "$dependency_directory"/**/(LICENSE|LICENSE.*|NOTICE|NOTICE.*|COPYING|COPYING.*)(N.); do
+    relative_license="${license_file#$dependency_directory/}"
+    license_destination="$dependency_licenses/$relative_license"
+    mkdir -p "${license_destination:h}"
+    ditto --norsrc --noqtn "$license_file" "$license_destination"
+  done
+done
+
 if [[ -d "$PROJECT_ROOT/Samples" ]]; then
   ditto --norsrc --noqtn \
     "$PROJECT_ROOT/Samples" \

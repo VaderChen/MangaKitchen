@@ -98,7 +98,7 @@ Project
 - 不依賴 AppKit、Metal 或 WebKit。
 - 定義 `ComicPage`、`DialogueRegion`、`ProcessingOptions`、`ColorizationPageState`、`ProjectGlossary` 與 `GlossaryEntry`。
 - 定義推論、區域偵測、翻譯、上色、遮罩、修補與排版 protocol。
-- `RecoverableFile` 統一可復原檔案交易；`AtomicFileWriter` 讓 ImageIO 先完成暫存檔再原子替換；`FilePathBoundary` 逐段解析符號連結，包含尚未存在的輸出檔。
+- `RecoverableFile` 統一可復原檔案交易；`AtomicFileWriter` 讓 ImageIO 先完成暫存檔再原子替換，並以 1 MiB 緩衝複製已確認的翻譯／上色結果，避免整檔讀入記憶體；`FilePathBoundary` 逐段解析符號連結，包含尚未存在的輸出檔。
 - 不支援的 schema 透過 `NonRecoverableFileError` 與損壞 JSON 區分；先讀版本 header，再解碼完整資料，禁止以舊備份掩蓋新版主檔，也禁止自動覆寫新版主檔。取消的保存工作不得輪替備份。
 - `RecoverableDirectoryInstaller` 安裝前後驗證候選目錄，舊版本保留至提交成功；一般錯誤或取消會回復原位置。若復原也失敗，保留檔案並回報備份位置；此機制不宣稱涵蓋程序被強制終止／斷電時的目錄交易復原。
 - `AsyncOperationGate` 提供跨 `await` 的 FIFO 操作互斥，等待者可以取消；不得在已取得 permit 的操作內再次取得同一個 gate。
@@ -142,6 +142,7 @@ Project
 - `AppModelLifecycleCoordinator`：管理 capability 偏好路徑、延遲載入、模型身分重用、Think Mode runtime 更新與 unified-memory 壓力卸載；下載進度與專案模型路徑持久化仍由 `AppStore` 負責。
 - `ApplicationLogStore`／`ModelReasoningStreamStore`：分開保存一般診斷與 transient reasoning。前者只存在記憶體且可清除；後者不進 LOG、不持久化，透過 `HybridBridgeController` 的 transient state 單獨更新 THINK 節點。
 - `SystemMetricsReader`：週期讀取 GPU 與 unified-memory 使用率；和畫布解析度／倍率一起只更新狀態列節點，不觸發 `AppStore.objectWillChange` 或重建編輯器 DOM。
+- `WebBatchJob.snapshots`：同一份畫面快照的批次工作共用一次建立的頁名索引，避免每個工作重掃所有頁面；索引不跨快照保存，改名與移除會立即反映。
 - `AppPreferencesController`：保存全域介面、色系、畫布框選顏色、資料位置、預設輸出根目錄、`imageToText`／`imageColorization`／`superResolution` 偏好模型與 MCP 網路設定；不寫入個別漫畫專案。
 - `WorkspaceRepository`／`ProjectLibraryRepository`：分別保存專案快照與專案索引；以原子寫入更新並保留 `.bak`。
 - `ManagedImportService`：把圖片、資料夾、ZIP／CBZ、RAR／CBR 與 PDF 正規化到受管理來源目錄；PDF 先點陣化，壓縮檔先解包，再交給同一掃描器建立頁面。
@@ -150,7 +151,7 @@ Project
 - 每個遠端 repository 以首筆 metadata 的 commit 固定版本，後續 metadata 與下載都使用同一 commit；分段回應須符合起點、終點與檔案總長度。主模型與選用附件皆使用可回復的目錄安裝器，避免先刪除舊版本才搬移候選。
 - `FontFamilyCatalog`：列出系統已安裝字型並提供 WebUI 預覽；專案預設字型變更時只同步仍使用舊預設值的區域，不覆蓋人工選字。
 - `GitHubReleaseChecker`：啟動時與「關於」頁手動檢查共用同一個 GitHub latest stable release 查詢與版本比較。對外開啟只允許官方 repository 根路徑與 Releases 子路徑，不自動下載或安裝。
-- `HTMLDialogueTypesetter`／`PSDExporter`：以相同 HTML/CSS 分別產生合併圖與透明文字 Raster Layer，再封裝為 PSD；SR 頁面依放大後實際尺寸渲染。
+- `HTMLDialogueTypesetter`／`PSDExporter`：以相同 HTML/CSS 分別產生合併圖與透明文字 Raster Layer，再封裝為 PSD；SR 頁面依放大後實際尺寸渲染。PSD 寫入逐圖層解出 RGBA，再以 64 KiB 通道緩衝串流到暫存檔，最後原子替換；圖層順序、像素、透明度、可見性與檔案格式保持一致。
 - `HybridBridgeController`：負責 WebKit 狀態推送、生命週期與以 `WebBridgeMethod` 白名單分派命令；未知字串不會進入業務處理。
 - `WebBridgeCommandHandler`：擁有完整 `WebBridgeMethod` 白名單 switch，將命令分派至 `AppStore` 或控制器提供的原生能力；`HybridBridgeController` 不再同時負責 JSON-RPC transport 與業務命令路由。
 - `WebBridgeParameterDecoder`／`WebBridgePanelService`：前者統一把 JavaScript 弱型別參數轉成領域型別並檢查正規化座標，後者集中建立原生檔案／目錄選擇器；兩者都不執行 AppStore 業務流程。

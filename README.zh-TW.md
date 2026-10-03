@@ -10,6 +10,12 @@
 
 [下載最新的公證 DMG](https://github.com/VaderChen/MangaKitchen/releases/latest) · 需要 macOS 14 或更新版本
 
+## 最新版本：1.26.1003（build 2100）
+
+本版降低 PSD 匯出、輸出儲存、遮罩精修、氣泡後處理及批次快照的配置與複製成本，保留既有 UI、操作流程及輸出語意。文件中的 PSD 基準案例，程序峰值 RSS 由 806.5 MiB 降至 176.4 MiB；此為特定匯出案例，不代表整個 App 的記憶體降幅。
+
+詳見[版本更新紀錄](Documentation/RELEASE_NOTES_1.26.1003-build-2100.md)、[輸出效能實測](Documentation/PERFORMANCE_AUDIT_2026-10-03.md)及[函式級最佳化報告](Documentation/FUNCTION_OPTIMIZATION_2026-10-03.md)。[近期模型研究](Documentation/MODEL_RESEARCH_2026-10-03.md)與[本機模型實測](Documentation/MODEL_EVALUATION_2026-10-03.md)記錄 LFM2.5-VL-3B、Granite 4.2 3B 未納入下載清單的原因；現有預設模型不變。
+
 ## 著作權與合法使用
 
 所有匯入 MangaKitchen 的漫畫原稿、角色、文字、美術、商標及其他內容，其著作權與相關權利均屬原作者、出版社、授權平台或各自的合法權利人。使用本工具不會移轉這些權利，也不代表使用者取得重製、翻譯、公開傳輸、散布或販售作品的授權。
@@ -20,9 +26,9 @@ MangaKitchen 的目的，是輔助已取得授權的翻譯人員、在地化團�
 
 ## 軟體授權
 
-MangaKitchen 採雙軌授權。此 repository 中由 MangaKitchen 著作權人擁有且未另行標示的程式碼，預設依 [GNU General Public License version 3 only](LICENSE)（`GPL-3.0-only`）提供；需要閉源整合、專有散布或其他條款者，可另行洽談[商業授權](COMMERCIAL-LICENSE.md)。
+MangaKitchen 依[《MangaKitchen 原始碼公開・禁止商業販售授權》v1.1](LICENSE.md) 提供。遵守條款時，可免費取得、執行、檢視、修改及免費散布，也允許公司內部使用；商業販售及授權列明的收費服務須另行取得書面協議，詳見[商業授權](COMMERCIAL-LICENSE.md)。
 
-GPLv3 本身允許商業使用及收費散布，但必須履行其原始碼與 copyleft 義務。商業授權是另一個可選方案，不會限制已依 GPLv3 取得的權利。第三方套件、模型與權重、字型及漫畫內容不包含在 MangaKitchen 的雙軌授權內，仍適用各自的授權條款。
+這是原始碼公開授權，並非 OSI 認可的開源授權，以繁體中文授權全文為準。第三方套件、模型與權重、字型及漫畫內容仍適用各自的授權條款。
 
 ## 目前完成
 
@@ -36,13 +42,13 @@ GPLv3 本身允許商業使用及收費散布，但必須履行其原始碼與 c
 - 頁面列表支援 Command／Shift 複選、搜尋與狀態篩選；遮罩、翻譯、合成都可針對選取頁面批次執行。
 - 批次工作使用單一循序佇列，顯示目前頁面、成功／失敗數量，並支援取消、清除紀錄與重試失敗頁面；逐區翻譯時同步顯示目前區域／總區域與實際進度。
 - 每個專案擁有獨立的多語專有名詞表；一個原詞可保存多個 BCP-47 譯詞，翻譯時依目前目標語言自動套用。
-- 四階段工作流：掃描、文字／遮罩、翻譯／排版設定、背景修補／合成；同時保留一鍵完整頁與全部頁面。
+- 四階段工作流：專案／頁面、文字／遮罩與去字背景、翻譯／排版預覽、儲存既有預覽輸出；同時保留一鍵完整頁與全部頁面。
 - 每張圖片對應版本化 `.str` JSON，保存文字、位置、字型、固定／自動字級與遮罩筆劃。
 - 遮罩以原圖像素層膨脹收進抗鋸齒邊緣，再由正規化畫筆支援添加、擦除、復原與重做，最後輸出二值 PNG；不再對逐條向量矩形描邊，避免灰階毛邊。步驟二完成後立即顯示已清除原文字的 CPU／GPU 遮罩校對圖，不提前啟動圖生圖模型；Metal 修補會累積完整方向樣本並採亮度第 90 百分位背景色階，降低字緣或框線被填回遮罩的零碎殘留。
 - 內建由 [huyvux3005/manga109-segmentation-bubble](https://huggingface.co/huyvux3005/manga109-segmentation-bubble)（Apache-2.0）匯出的 manga109 氣泡分割 Core ML 模型，優先使用 Apple Neural Engine 在本機推論產生對話框 BBOX 與氣泡形狀；形狀會裁切遮罩搜尋範圍，並計算供 HTML 排版使用的氣泡內接矩形。步驟二固定以原圖像素將這些氣泡內縮成字形遮罩；切換 OCR／VLM 偏好不會取代或改變這條遮罩流程。不使用 Apple Vision OCR，主流程也排除擬聲字、頁碼、頁尾資訊、人物與空白區。
 - 步驟二不需要 PP-OCR 文字偵測或 `imageToText` VLM。Medium Det 與 VLM 定位 runtime 與遮罩產生隔離，避免切換模型導致既有氣泡與像素遮罩功能退化。
 - 翻譯步驟預設使用原生 Swift／Core ML PP-OCRv6 Medium OCR，並保留已驗證的 Small recognizer 作為 fallback。各 OCR 模型的原文、信心、行框與方向仍分開保存。當 `sourceText` 空白時會採用預設 OCR 結果作為翻譯原文，但不改動座標或遮罩，也不覆寫已由 VLM、Agent 或人工確認的原文。
-- GUI 翻譯固定使用已下載的多模態模型，確保可利用整頁畫面語境；原文仍可由 PP-OCR 逐區抽取或由 VLM 整區轉錄。舊專案的文生文設定會自動遷移為 `imageToText`。
+- GUI 翻譯可選純文字或多模態模型。純文字路徑使用 PP-OCR／已確認原文；多模態路徑可使用 VLM 轉錄及整頁畫面語境。
 - 翻譯步驟提供整頁「重新抽字」與「重新翻譯」，也可在單一文字區域旁重新抽取並翻譯；這些操作不會重建步驟二遮罩或去字背景。所有等待 DLG 都會顯示累計讀秒（`MM:SS`）。
 - VLM 接受的對話框 BBOX 會以原圖像素連通元件收斂成字形遮罩，同步把文字定位框縮到未膨脹的實際字形外框；自動排版方向優先採用字形實際排列偵測結果。每個候選會獨立處理，單一候選的分類、轉錄或翻譯失敗時保留原區域並繼續其他區域；只有取消工作才會停止整體流程。
 - 多模態模型的翻譯 Prompt 與嚴格 JSON 回傳解析。
@@ -76,7 +82,7 @@ MangaKitchen 的翻譯可由本機 GUI 或 MCP 多模態 Agent 校稿。兩者�
 
 1. **專案與頁面**：選取來源目錄、遞迴掃描圖片，建立可複選與批次處理的頁面列表。
 2. **文字、遮罩與去字背景**：以內建 Core ML 氣泡分割模型定位對話框 BBOX 與形狀，再依原圖像素精修成字形遮罩並建立去字背景；此步驟不呼叫 VLM，也不允許 MCP Agent 重建區域或遮罩。使用者可在 App 添加、擦除與修正遮罩。
-3. **翻譯與排版**：GUI 以內建 OCR 或所選 VLM 路徑抽取原文，再固定由多模態模型執行翻譯；可選二次校稿與語意 QA 沿用同一翻譯路徑。MCP 則由多模態 Agent 依 App 提供的工作包完成原文、翻譯與排版，結果由 App 回寫專案狀態。
+3. **翻譯與排版**：GUI 以內建 OCR 或所選 VLM 路徑抽取原文，再由所選純文字或多模態模型執行翻譯；可選二次校稿與語意 QA 沿用同一翻譯路徑。MCP 則由多模態 Agent 依 App 提供的工作包完成原文、翻譯與排版，結果由 App 回寫專案狀態。
 4. **儲存輸出**：只把已確認的步驟三完整預覽寫入專案指定目錄，不重新執行遮罩、去字、翻譯、超高解析度或排版。
 
 四步驟是可續作的狀態與產物契約，不是每次都要從步驟一重新執行的固定清單。GUI 與 MCP 都應先讀取 App 提供的頁面狀態與工作包，再從目前需要的任意步驟開始：已有遮罩可直接翻譯，已有譯文可直接調整排版或合成，只有某個區域需要修改時也只需更新該區域。除非使用者或 Agent 明確要求重做，已完成的區域辨識、遮罩、譯文與人工編修不應被覆蓋。
@@ -140,6 +146,8 @@ swift run MangaKitchen --mcp=on
 GUI 無論 MCP 開關都會啟動；省略 `--mcp` 時使用設定 DLG 中保存的開關，`--mcp=on|off` 可覆寫本次啟動。MCP listener 綁定 `0.0.0.0`，預設連接埠為 `12080`，只接受白名單中的實際來源 IP／CIDR；預設白名單只有 `127.0.0.1`。本機 MCP 網址為 `http://127.0.0.1:12080/mcp`，也可用 `--mcp-port=<port>` 覆寫本次啟動。關閉主視窗不會結束 App，可從 menu bar 重新顯示漫畫廚房。
 
 資料儲存位置在重新啟動後生效；`imageToText`、`imageColorization` 與 `superResolution` 模型位置選取後立即切換。MCP 開關、連接埠與白名單變更時會重新啟動 listener。
+
+建立本機 `.app` 可執行 `./build.command --release`，預設輸出為 `Dist/MangaKitchen.app`。可用 `APP_VERSION`、`APP_BUILD_VERSION` 與 `OUTPUT_DIRECTORY` 指定版本及位置。腳本會封裝 Metal 資源、授權聲明並套用臨時簽章；官方下載 DMG 另經 Developer ID 簽署及 Apple 公證。
 
 ### SwiftPM 與 Metal 建置疑難排解
 
@@ -210,7 +218,7 @@ App 以 `MLXTextRuntime` 提供純文字翻譯，並以 `MLXVLMRuntime` 提供 `
 
 ### DFlash 推測解碼
 
-「設定 → 模型 → 翻譯」或「多模態」可開啟相容 Qwen3／Qwen3.5 的 DFlash。App 會從所選主模型同一個模型根目錄自動尋找 Draft，讓文字與多模態模型在相同的 Metal runtime 上執行原生 Swift／MLX DFlash 1／2 推測解碼；不需要額外選取或保存 Draft 路徑。Qwen3-VL 與 Qwen3.5-VL 會先完成視覺 prefill，再進入相同的 speculative decoding；其他 VLM 架構會安全回退標準生成。這不會取代既有 Safetensors／MLX checkpoint 或 GGUF 載入。Draft 遺失、不相容、格式錯誤、生成設定不支援或初始化失敗時，App 會記錄原因並安全回退標準生成。Draft 權重不隨 App 內建發佈。
+「設定 → 模型 → 翻譯」或「多模態」可開啟相容 Qwen3／Qwen3.5 的 DFlash。App 會從所選主模型同一個模型根目錄自動尋找 Draft，讓文字與多模態模型在相同的 Metal runtime 上執行原生 Swift／MLX DFlash 1／2 推測解碼；不需要額外選取或保存 Draft 路徑。Qwen3-VL 與 Qwen3.5-VL 會先完成視覺 prefill，再進入相同的 speculative decoding；其他 VLM 架構會安全回退標準生成。這不會取代既有 Safetensors／MLX checkpoint 或 GGUF 載入。Draft 遺失、不相容、格式錯誤、生成設定不支援或初始化失敗時，App 會記錄原因並安全回退標準生成。Draft 權重不隨 App 內建發佈。管理下載會自動把相容 Draft 下載到主模型旁的 `DFlashDraftModel`；Draft 下載失敗不會阻擋主模型安裝，既有模型也可補下載 Draft，無須重裝主模型。
 
 ### GGUF 權重
 
@@ -300,7 +308,7 @@ MangaKitchenApp/MCP
 
 詳細決策與資料流請見 [Documentation/ARCHITECTURE.md](Documentation/ARCHITECTURE.md)。
 版本化的翻譯／上色 Swift、JavaScript 與 MCP 契約請見 [Documentation/WORKFLOW_API.md](Documentation/WORKFLOW_API.md)。
-已封裝版本的英文更新紀錄請見 [MangaKitchen 1.26.0829 build 0052 Release Notes](Documentation/RELEASE_NOTES_1.26.0829-build-0052.md)；封裝後的新變更請見 [Development Release Notes](Documentation/RELEASE_NOTES_UNRELEASED.md)。
+已封裝版本的英文更新紀錄請見 [MangaKitchen 1.26.1003 build 2100 Release Notes](Documentation/RELEASE_NOTES_1.26.1003-build-2100.md)；封裝後的新變更請見 [Development Release Notes](Documentation/RELEASE_NOTES_UNRELEASED.md)。
 
 ## 已知邊界
 

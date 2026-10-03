@@ -61,12 +61,12 @@ public actor CPUBubbleCleaner {
         } ?? originalMask
         // 取樣時要避開的範圍：遮罩本身再往外幾像素。緊貼遮罩那一圈是抗鋸齒殘留，
         // 比紙面暗，取到它就會依每個字的筆畫量得到不同深淺的底色。
-        let excluded = MaskDilation.dilated(
+        let excluded = configuredFill == nil ? MaskDilation.dilated(
             masked,
             width: width,
             height: height,
             radius: Self.sampleInset
-        )
+        ) : []
         let components = groupedComponents(
             try connectedComponents(masked: masked, width: width, height: height),
             regions: regions,
@@ -167,7 +167,6 @@ public actor CPUBubbleCleaner {
             if result.count.isMultiple(of: 8) { try Task.checkCancellation() }
             var queue = [start]
             var cursor = 0
-            var pixels: [Int] = []
             var minX = start % width
             var maxX = minX
             var minY = start / width
@@ -177,7 +176,6 @@ public actor CPUBubbleCleaner {
             while cursor < queue.count {
                 let current = queue[cursor]
                 cursor += 1
-                pixels.append(current)
                 let x = current % width
                 let y = current / width
                 minX = min(minX, x)
@@ -191,7 +189,8 @@ public actor CPUBubbleCleaner {
                 if y + 1 < height { enqueue(current + width, masked: masked, visited: &visited, queue: &queue) }
             }
             result.append(Component(
-                pixels: pixels,
+                // The completed BFS queue already contains every pixel in traversal order.
+                pixels: queue,
                 minX: minX,
                 minY: minY,
                 maxX: maxX,
@@ -253,15 +252,16 @@ public actor CPUBubbleCleaner {
         }
         let merged = regions.compactMap { region -> Component? in
             guard let values = grouped[region.id], let first = values.first else { return nil }
-            return values.dropFirst().reduce(first) { partial, component in
-                Component(
-                    pixels: partial.pixels + component.pixels,
-                    minX: min(partial.minX, component.minX),
-                    minY: min(partial.minY, component.minY),
-                    maxX: max(partial.maxX, component.maxX),
-                    maxY: max(partial.maxY, component.maxY)
-                )
+            var merged = first
+            merged.pixels.reserveCapacity(values.reduce(0) { $0 + $1.pixels.count })
+            for component in values.dropFirst() {
+                merged.pixels.append(contentsOf: component.pixels)
+                merged.minX = min(merged.minX, component.minX)
+                merged.minY = min(merged.minY, component.minY)
+                merged.maxX = max(merged.maxX, component.maxX)
+                merged.maxY = max(merged.maxY, component.maxY)
             }
+            return merged
         }
         return merged + unassigned
     }

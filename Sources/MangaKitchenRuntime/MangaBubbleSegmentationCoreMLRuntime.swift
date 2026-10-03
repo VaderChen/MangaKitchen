@@ -247,6 +247,7 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         letterboxed: LetterboxedImage
     ) -> [Candidate] {
         let dimensions = predictions.shape.map(\.intValue)
+        let reader = SegmentationTensorReader(predictions)
         let featureCount = dimensions[1]
         let candidateCount = dimensions[2]
         guard featureCount >= 5 else { return [] }
@@ -254,18 +255,17 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         var candidates: [Candidate] = []
         candidates.reserveCapacity(min(candidateCount, maximumCandidates * 4))
         for candidateIndex in 0..<candidateCount {
-            let confidence = Double(value(
-                in: predictions,
+            let confidence = Double(reader.value(
                 batch: 0,
                 feature: 4,
                 candidate: candidateIndex
             ))
             guard confidence >= confidenceThreshold else { continue }
 
-            let centerX = Double(value(in: predictions, batch: 0, feature: 0, candidate: candidateIndex))
-            let centerY = Double(value(in: predictions, batch: 0, feature: 1, candidate: candidateIndex))
-            let width = Double(value(in: predictions, batch: 0, feature: 2, candidate: candidateIndex))
-            let height = Double(value(in: predictions, batch: 0, feature: 3, candidate: candidateIndex))
+            let centerX = Double(reader.value(batch: 0, feature: 0, candidate: candidateIndex))
+            let centerY = Double(reader.value(batch: 0, feature: 1, candidate: candidateIndex))
+            let width = Double(reader.value(batch: 0, feature: 2, candidate: candidateIndex))
+            let height = Double(reader.value(batch: 0, feature: 3, candidate: candidateIndex))
             guard width > 0, height > 0 else { continue }
 
             let left = (centerX - width / 2 - letterboxed.horizontalPadding) / letterboxed.scale
@@ -283,8 +283,7 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
             if featureCount > 5 {
                 maskCoefficients.reserveCapacity(featureCount - 5)
                 for featureIndex in 5..<featureCount {
-                    maskCoefficients.append(value(
-                        in: predictions,
+                    maskCoefficients.append(reader.value(
                         batch: 0,
                         feature: featureIndex,
                         candidate: candidateIndex
@@ -352,7 +351,8 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         let maxY = min(prototypeHeight, Int((candidate.letterboxBounds.maxY * scaleToPrototype).rounded(.up)))
         guard maxX > minX, maxY > minY else { return ([], nil) }
 
-        let strides = prototypes.strides.map(\.intValue)
+        let reader = SegmentationTensorReader(prototypes)
+        let strides = reader.strides
         let localWidth = maxX - minX
         let localHeight = maxY - minY
         var inside = [Bool](repeating: false, count: localWidth * localHeight)
@@ -361,7 +361,7 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
                 var total: Float = 0
                 for channel in 0..<usableCount {
                     let offset = channel * strides[1] + y * strides[2] + x * strides[3]
-                    total += candidate.maskCoefficients[channel] * prototypeValue(prototypes, at: offset)
+                    total += candidate.maskCoefficients[channel] * reader.value(at: offset)
                 }
                 // sigmoid > 0.5 等價於線性組合 > 0，省掉一次 exp。
                 inside[(y - minY) * localWidth + (x - minX)] = total > 0
@@ -479,15 +479,6 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
         return best
     }
 
-    private func prototypeValue(_ array: MLMultiArray, at offset: Int) -> Float {
-        switch array.dataType {
-        case .float32: array.dataPointer.assumingMemoryBound(to: Float.self)[offset]
-        case .double: Float(array.dataPointer.assumingMemoryBound(to: Double.self)[offset])
-        case .float16: Float(array.dataPointer.assumingMemoryBound(to: Float16.self)[offset])
-        default: 0
-        }
-    }
-
     private func eroded(_ mask: [Bool], width: Int, height: Int) -> [Bool] {
         var result = [Bool](repeating: false, count: mask.count)
         for y in 0..<height {
@@ -547,27 +538,6 @@ public final class MangaBubbleSegmentationCoreMLRuntime: @unchecked Sendable {
             }
         }
         return rectangles
-    }
-
-    private func value(
-        in array: MLMultiArray,
-        batch: Int,
-        feature: Int,
-        candidate: Int
-    ) -> Float {
-        let offset = batch * array.strides[0].intValue
-            + feature * array.strides[1].intValue
-            + candidate * array.strides[2].intValue
-        switch array.dataType {
-        case .float32:
-            return array.dataPointer.assumingMemoryBound(to: Float.self)[offset]
-        case .double:
-            return Float(array.dataPointer.assumingMemoryBound(to: Double.self)[offset])
-        case .float16:
-            return Float(array.dataPointer.assumingMemoryBound(to: Float16.self)[offset])
-        default:
-            return array[[NSNumber(value: batch), NSNumber(value: feature), NSNumber(value: candidate)]].floatValue
-        }
     }
 
     private func intersectionOverUnion(_ lhs: NormalizedRect, _ rhs: NormalizedRect) -> Double {
