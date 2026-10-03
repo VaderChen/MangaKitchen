@@ -5,7 +5,7 @@
 만화 주방(MangaKitchen)은 macOS 네이티브 만화 번역 작업 공간입니다. 프런트엔드는 HTML + JavaScript로 유지하고, Swift Package 백엔드는 도메인 코어, Metal/Core ML Runtime, WKWebView App의 세 계층으로 분리합니다. 코어는 특정 UI 레이아웃에 종속되지 않고 모델 경계, 페이지별 워크플로, 대화 영역, 마스크 및 조판을 처리합니다.
 
 <p align="center">
-  <img src="AppPic/screen01.jpg" alt="MangaKitchen 애플리케이션 화면" width="800">
+  <img src="AppPic/workflow-demo.gif" alt="MangaKitchen 사용 데모: 원클릭 자동 번역, 조판 및 내보내기" width="800">
 </p>
 
 [최신 공증 DMG 다운로드](https://github.com/VaderChen/MangaKitchen/releases/latest) · macOS 14 이상 필요

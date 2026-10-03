@@ -5,7 +5,7 @@
 漫画キッチン（MangaKitchen）は、macOSネイティブの漫画翻訳ワークスペースです。フロントエンドはHTML + JavaScript、Swift Packageのバックエンドはドメインコア、Metal/Core ML Runtime、WKWebView Appの3層に分かれています。コアは特定のUIレイアウトに依存せず、モデル境界、ページ単位のワークフロー、台詞領域、マスク、組版を扱います。
 
 <p align="center">
-  <img src="AppPic/screen01.jpg" alt="MangaKitchen アプリケーション画面" width="800">
+  <img src="AppPic/workflow-demo.gif" alt="MangaKitchen 操作デモ：ワンクリックで自動翻訳、組版、書き出し" width="800">
 </p>
 
 [最新の公証済み DMG をダウンロード](https://github.com/VaderChen/MangaKitchen/releases/latest) · macOS 14以降が必要です

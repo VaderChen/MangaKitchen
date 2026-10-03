@@ -5,7 +5,7 @@
 MangaKitchen is a native macOS workspace for translating comics. Its frontend remains HTML + JavaScript, while the Swift Package backend is separated into a domain core, a Metal/Core ML runtime, and a WKWebView app. The core focuses on model boundaries, page-by-page workflows, dialogue regions, masks, and typesetting without coupling them to a particular UI layout.
 
 <p align="center">
-  <img src="AppPic/screen01.jpg" alt="MangaKitchen application window" width="800">
+  <img src="AppPic/workflow-demo.gif" alt="MangaKitchen workflow demo: one-click automatic translation, typesetting, and export" width="800">
 </p>
 
 [Download the latest notarized DMG](https://github.com/VaderChen/MangaKitchen/releases/latest) · Requires macOS 14 or later
